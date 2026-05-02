@@ -7,6 +7,12 @@ contextBridge.exposeInMainWorld('lanRemote', {
   refreshDevices: () => ipcRenderer.invoke('refresh-devices'),
   openRemoteWindow: (device) => ipcRenderer.invoke('open-remote-window', device),
   getRemoteConfig: () => ipcRenderer.invoke('remote-config'),
+  getNativeV2Status: () => ipcRenderer.invoke('native-v2-status'),
+  startNativeV2Client: (options) => ipcRenderer.invoke('native-v2-start-client', options),
+  stopNativeV2Client: () => ipcRenderer.invoke('native-v2-stop-client'),
+  startNativeV2Host: (options) => ipcRenderer.invoke('native-v2-start-host', options),
+  requestNativeV2RemoteHost: (device, options) => ipcRenderer.invoke('native-v2-request-remote-host', { device, options }),
+  stopNativeV2Host: () => ipcRenderer.invoke('native-v2-stop-host'),
   saveDevicePreview: (id, dataUrl) => ipcRenderer.invoke('save-device-preview', id, dataUrl),
   setWindowFullscreen: (fullScreen) => ipcRenderer.invoke('set-window-fullscreen', fullScreen),
   windowAction: (action) => ipcRenderer.invoke('window-action', action),
@@ -21,4 +27,5 @@ contextBridge.exposeInMainWorld('lanRemote', {
   onClientDisconnected: (callback) => ipcRenderer.on('client-disconnected', (_event, payload) => callback(payload)),
   onDevicesUpdated: (callback) => ipcRenderer.on('devices-updated', (_event, payload) => callback(payload)),
   onHostLog: (callback) => ipcRenderer.on('host-log', (_event, payload) => callback(payload)),
+  onNativeV2Status: (callback) => ipcRenderer.on('native-v2-status', (_event, payload) => callback(payload)),
 });

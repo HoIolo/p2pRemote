@@ -258,6 +258,29 @@ body[data-platform="win32"] .topbar { padding-right: 154px; }
   line-height: 1;
   letter-spacing: 0;
 }
+.modeSwitch {
+  -webkit-app-region: no-drag;
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  height: 36px;
+  padding: 0 10px;
+  border-radius: 10px;
+  background: #eeeeec;
+  color: #4b4f53;
+  font-size: 13px;
+  font-weight: 800;
+}
+.modeSwitch select {
+  -webkit-app-region: no-drag;
+  border: 0;
+  outline: 0;
+  border-radius: 8px;
+  padding: 5px 26px 5px 8px;
+  background: #fff;
+  color: #1f2937;
+  font-weight: 800;
+}
 .iconBtn {
   width: 34px;
   height: 34px;
@@ -380,7 +403,10 @@ body[data-platform="win32"] .topbar { padding-right: 154px; }
   border: 1px dashed #d4d4d2;
   border-radius: 8px;
   display: grid;
-  place-items: center;
+  grid-template-columns: 140px minmax(0, 1fr);
+  align-items: center;
+  gap: 18px;
+  padding: 24px;
 }
 .quickAdd {
   width: 112px;
@@ -396,6 +422,32 @@ body[data-platform="win32"] .topbar { padding-right: 154px; }
 .quickAdd span {
   font-size: 14px;
   font-weight: 700;
+}
+.nativeHint {
+  display: grid;
+  gap: 7px;
+  min-width: 0;
+  color: #444;
+  font-size: 14px;
+}
+.nativeHint b {
+  color: #111827;
+  font-size: 16px;
+}
+.nativeHint span {
+  color: #5b6270;
+  line-height: 1.45;
+}
+.nativeHint code {
+  width: fit-content;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  border-radius: 8px;
+  padding: 5px 8px;
+  background: #eeeeec;
+  color: #374151;
+  font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 .diagnostics {
   margin-top: 22px;
@@ -564,4 +616,7 @@ body.fullscreenMode[data-platform="win32"] .settingsMenu {
   .appFrame { grid-template-columns: 1fr; }
   .sidebar { display: none; }
   .content { padding: 28px 18px; }
+  .quickGrid { grid-template-columns: 1fr; justify-items: center; text-align: center; }
+  .nativeHint { justify-items: center; }
+  .modeSwitch span { display: none; }
 }

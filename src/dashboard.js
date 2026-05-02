@@ -13,11 +13,15 @@ const refreshTopBtn = $('refreshTop');
 const openScreenSettingsBtn = $('openScreenSettings');
 const resetScreenPermissionBtn = $('resetScreenPermission');
 const manualAddBtn = $('manualAdd');
+const connectionModeEl = $('connectionMode');
+const nativeV2StatusTextEl = $('nativeV2StatusText');
 const logEl = $('log');
 
 let devices = [];
 let selectedId = null;
 let localStream = null;
+let nativeV2Status = null;
+let appInfo = null;
 const peers = new Map();
 
 function iconSvg(name, className = 'icon') {
@@ -62,6 +66,90 @@ function selectedDevice() {
   return devices.find((device) => device.id === selectedId) || devices[0] || null;
 }
 
+function connectionMode() {
+  return connectionModeEl?.value || 'webrtc';
+}
+
+function updateNativeV2Status(status) {
+  nativeV2Status = status || nativeV2Status;
+  if (!nativeV2StatusTextEl || !nativeV2Status) return;
+
+  const isWindows = nativeV2Status.platform === 'win32';
+  const isMac = nativeV2Status.platform === 'darwin';
+  const winClient = nativeV2Status.winClient || {};
+  const macHost = nativeV2Status.macHost || {};
+
+  if (isWindows) {
+    if (winClient.running) {
+      nativeV2StatusTextEl.textContent = `Windows Native v2 客户端运行中，pid=${winClient.pid}`;
+    } else if (winClient.available) {
+      nativeV2StatusTextEl.textContent = 'Windows Native v2 客户端已就绪；Mac 端先启动 Host 后可一键进入极限模式。';
+    } else {
+      nativeV2StatusTextEl.textContent = 'Windows Native v2 客户端未构建；先执行 npm run v2:win:build，当前可继续使用 WebRTC。';
+    }
+    return;
+  }
+
+  if (isMac) {
+    if (macHost.running) {
+      nativeV2StatusTextEl.textContent = `macOS Native v2 Host 运行中，pid=${macHost.pid}`;
+    } else if (macHost.available) {
+      nativeV2StatusTextEl.textContent = 'macOS Native v2 Host 已构建；输入 Windows IP 后可启动极限 Host。';
+    } else {
+      nativeV2StatusTextEl.textContent = 'macOS Native v2 Host 未构建；先执行 npm run v2:mac:build。';
+    }
+    return;
+  }
+
+  nativeV2StatusTextEl.textContent = 'Native v2 当前仅支持 Windows 控制端和 macOS Host。';
+}
+
+async function refreshNativeV2Status() {
+  if (!window.lanRemote.getNativeV2Status) return;
+  try {
+    updateNativeV2Status(await window.lanRemote.getNativeV2Status());
+  } catch (err) {
+    if (nativeV2StatusTextEl) nativeV2StatusTextEl.textContent = `Native v2 状态检测失败：${err.message}`;
+  }
+}
+
+function nativeV2ClientOptions(device) {
+  const defaults = nativeV2Status?.defaults || {};
+  return {
+    hostIp: device.address,
+    videoPort: defaults.videoPort || 45000,
+    inputPort: defaults.inputPort || 45001,
+    width: defaults.width || 1920,
+    height: defaults.height || 1080,
+    fps: defaults.fps || 120,
+    fullscreen: true,
+  };
+}
+
+function nativeV2HostOptions(device) {
+  const defaults = nativeV2Status?.defaults || {};
+  const clientIp = appInfo?.device?.addresses?.[0] || '';
+  return {
+    clientIp: nativeV2Status?.platform === 'win32' ? clientIp : device.address,
+    videoPort: defaults.videoPort || 45000,
+    inputPort: defaults.inputPort || 45001,
+    width: defaults.width || 1920,
+    height: defaults.height || 1080,
+    fps: defaults.fps || 120,
+    bitrate: defaults.bitrate || 45_000_000,
+    keyint: defaults.keyint || 1,
+  };
+}
+
+function nativeV2MacHostCommand(device) {
+  const defaults = nativeV2Status?.defaults || {};
+  const clientIp = appInfo?.device?.addresses?.[0] || '<Windows_IP>';
+  return [
+    'cd native-v2/mac-host',
+    `CLIENT_IP=${clientIp} VIDEO_PORT=${defaults.videoPort || 45000} INPUT_PORT=${defaults.inputPort || 45001} WIDTH=${defaults.width || 1920} HEIGHT=${defaults.height || 1080} FPS=${defaults.fps || 120} BITRATE=${defaults.bitrate || 45000000} ./run-ultra.sh`,
+  ].join('\n');
+}
+
 function renderDevices() {
   if (!selectedId && devices.length) selectedId = devices[0].id;
   const selected = selectedDevice();
@@ -87,6 +175,11 @@ function renderDevices() {
   previewImageEl.src = selected ? (selected.preview || defaultPreview(selected.platform)) : defaultPreview('win32');
   enterDesktopBtn.disabled = !selected;
   connectSelectedBtn.disabled = !selected;
+  const actionLabel = connectionMode() === 'native-v2' ? 'Native v2 极限' : '远程桌面';
+  const enterText = enterDesktopBtn.querySelector('span');
+  const connectText = connectSelectedBtn.querySelector('span');
+  if (enterText) enterText.textContent = selected ? actionLabel : '进入桌面';
+  if (connectText) connectText.textContent = actionLabel;
 
   for (const item of deviceListEl.querySelectorAll('.sideItem[data-id]')) {
     item.addEventListener('click', () => {
@@ -104,11 +197,73 @@ async function refreshDevices() {
 async function openSelected() {
   const device = selectedDevice();
   if (!device) return;
+  if (connectionMode() === 'native-v2') {
+    await openNativeV2Device(device);
+    return;
+  }
   await window.lanRemote.openRemoteWindow(device);
+}
+
+async function openNativeV2Device(device) {
+  try {
+    await refreshNativeV2Status();
+    if (nativeV2Status?.platform === 'win32') {
+      if (!nativeV2Status?.winClient?.available) {
+        const message = 'Native v2 Windows 客户端还没构建。请先执行 npm run v2:win:build；现在可切回“稳定 WebRTC”。';
+        log(message);
+        window.alert(message);
+        return;
+      }
+      const options = nativeV2ClientOptions(device);
+      const hostOptions = nativeV2HostOptions(device);
+      if (device.pin && device.port) {
+        log(`requesting Mac native-v2 host ${device.address}:${device.port} -> client ${hostOptions.clientIp}:${hostOptions.videoPort}`);
+        await window.lanRemote.requestNativeV2RemoteHost(device, hostOptions);
+        log('Mac native-v2 host accepted start request');
+      } else {
+        log(`manual native-v2: 请先在 Mac 端启动 Host：\n${nativeV2MacHostCommand(device)}`);
+      }
+      const result = await window.lanRemote.startNativeV2Client(options);
+      log(`native-v2 client started pid=${result.pid}; host=${options.hostIp}:${options.videoPort}; ${options.width}x${options.height}@${options.fps}`);
+      return;
+    }
+
+    if (nativeV2Status?.platform === 'darwin') {
+      if (!nativeV2Status?.macHost?.available) {
+        const message = 'Native v2 macOS Host 还没构建。请先在 Mac 上执行 npm run v2:mac:build；现在可继续使用 WebRTC。';
+        log(message);
+        window.alert(message);
+        return;
+      }
+      const options = nativeV2HostOptions(device);
+      const result = await window.lanRemote.startNativeV2Host(options);
+      log(`native-v2 host started pid=${result.pid}; client=${options.clientIp}:${options.videoPort}; ${options.width}x${options.height}@${options.fps}`);
+      return;
+    }
+
+    log('Native v2 当前仅支持 Windows 控制端和 macOS Host。');
+    window.alert('Native v2 当前仅支持 Windows 控制端和 macOS Host。');
+  } catch (err) {
+    log(`native-v2 start failed: ${err.message}`);
+    window.alert(`Native v2 启动失败：${err.message}`);
+  }
+}
+
+async function manualNativeV2Connect(address) {
+  const device = {
+    id: `manual-native-v2-${address}-${Date.now()}`,
+    name: address,
+    platform: nativeV2Status?.platform === 'darwin' ? 'win32' : 'darwin',
+    address,
+    port: 0,
+    pin: '',
+  };
+  await openNativeV2Device(device);
 }
 
 async function initApp() {
   const info = await window.lanRemote.getAppInfo();
+  appInfo = info;
   document.body.dataset.platform = info.device.platform;
   localPinEl.textContent = info.device.pin;
   localAddrEl.textContent = info.device.addresses.length
@@ -118,6 +273,7 @@ async function initApp() {
   if (info.screenCaptureStatus && info.screenCaptureStatus !== 'unknown') {
     log(`macOS screen permission=${info.screenCaptureStatus}`);
   }
+  await refreshNativeV2Status();
   await refreshDevices();
 }
 
@@ -279,17 +435,25 @@ enterDesktopBtn.addEventListener('click', openSelected);
 connectSelectedBtn.addEventListener('click', openSelected);
 refreshDevicesBtn.addEventListener('click', refreshDevices);
 refreshTopBtn.addEventListener('click', refreshDevices);
+connectionModeEl?.addEventListener('change', () => {
+  renderDevices();
+  log(`connection mode=${connectionMode()}`);
+});
 openScreenSettingsBtn.addEventListener('click', () => window.lanRemote.openScreenCaptureSettings());
 resetScreenPermissionBtn.addEventListener('click', async () => {
   await window.lanRemote.resetScreenCapturePermission();
   log('screen permission record reset; enable this app again, then fully quit and reopen it');
 });
 manualAddBtn.addEventListener('click', async () => {
-  const endpoint = window.prompt('输入设备 IP 或 IP:端口', '');
+  const endpoint = window.prompt(connectionMode() === 'native-v2' ? '输入 Mac IP（Native v2 不使用 PIN）' : '输入设备 IP 或 IP:端口', '');
   if (!endpoint) return;
+  const [address, portText] = endpoint.trim().split(':');
+  if (connectionMode() === 'native-v2') {
+    await manualNativeV2Connect(address);
+    return;
+  }
   const pin = window.prompt('输入对方 PIN', '');
   if (!pin) return;
-  const [address, portText] = endpoint.trim().split(':');
   await window.lanRemote.openRemoteWindow({
     id: `manual-${address}-${Date.now()}`,
     name: address,
@@ -315,6 +479,9 @@ window.lanRemote.onClientDisconnected(({ clientId }) => {
   log(`incoming disconnected: ${clientId.slice(0, 8)}`);
 });
 window.lanRemote.onHostLog((entry) => log(`${entry.level || 'info'}: ${entry.message}`));
+window.lanRemote.onNativeV2Status?.((status) => {
+  updateNativeV2Status(status);
+});
 
 wireWindowControls();
 window.lanRemote.hostRendererReady?.();

@@ -1,107 +1,118 @@
 {
-    "name":  "p2p-remote-lan",
-    "version":  "0.1.0",
-    "description":  "LAN-only low-latency remote control MVP: Windows controller -\u003e macOS host",
-    "main":  "src/main.js",
-    "private":  true,
-    "license":  "MIT",
-    "author":  "",
-    "scripts":  {
-                    "host":  "electron . -- --host",
-                    "client":  "electron . -- --client",
-                    "start":  "electron .",
-                    "build:mac-helper":  "cd native/macos-input-helper \u0026\u0026 swift build -c release --arch arm64 --arch x86_64",
-                    "dist:win":  "electron-builder --win",
-                    "dist:mac":  "electron-builder --mac",
-                    "pack:win":  "electron-builder --win --dir",
-                    "pack:mac":  "electron-builder --mac --dir",
-                    "v2:win:build":  "powershell -ExecutionPolicy Bypass -File native-v2/win-client/build.ps1",
-                    "v2:mac:build":  "cd native-v2/mac-host \u0026\u0026 swift build -c release"
-                },
-    "dependencies":  {
-                         "ws":  "^8.20.0"
-                     },
-    "devDependencies":  {
-                            "electron":  "^41.5.0",
-                            "electron-builder":  "^26.0.12"
-                        },
-    "build":  {
-                  "appId":  "com.p2premotelan.app",
-                  "productName":  "P2P Remote LAN",
-                  "copyright":  "Copyright (c) 2026",
-                  "directories":  {
-                                      "output":  "dist",
-                                      "buildResources":  "build"
-                                  },
-                  "files":  [
-                                "src/**/*",
-                                "package.json"
-                            ],
-                  "asar":  true,
-                  "compression":  "maximum",
-                  "win":  {
-                              "target":  [
-                                             {
-                                                 "target":  "nsis",
-                                                 "arch":  [
-                                                              "x64"
-                                                          ]
-                                             },
-                                             {
-                                                 "target":  "portable",
-                                                 "arch":  [
-                                                              "x64"
-                                                          ]
-                                             }
-                                         ],
-                              "requestedExecutionLevel":  "asInvoker",
-                              "icon":  "build/icon.ico"
-                          },
-                  "nsis":  {
-                               "artifactName":  "${productName}-${version}-Setup-${arch}.${ext}",
-                               "oneClick":  false,
-                               "perMachine":  false,
-                               "allowToChangeInstallationDirectory":  true,
-                               "createDesktopShortcut":  true,
-                               "createStartMenuShortcut":  true,
-                               "shortcutName":  "P2P Remote LAN"
-                           },
-                  "portable":  {
-                                   "artifactName":  "${productName}-${version}-Portable-${arch}.${ext}"
-                               },
-                  "mac":  {
-                              "artifactName":  "${productName}-${version}-${os}-${arch}.${ext}",
-                              "category":  "public.app-category.utilities",
-                              "target":  [
-                                             {
-                                                 "target":  "dmg",
-                                                 "arch":  [
-                                                              "x64",
-                                                              "arm64"
-                                                          ]
-                                             },
-                                             {
-                                                 "target":  "zip",
-                                                 "arch":  [
-                                                              "x64",
-                                                              "arm64"
-                                                          ]
-                                             }
-                                         ],
-                              "extraResources":  [
-                                                     {
-                                                         "from":  "native/macos-input-helper/.build/apple/Products/Release/macos-input-helper",
-                                                         "to":  "macos-input-helper"
-                                                     }
-                                                 ],
-                              "extendInfo":  {
-                                                 "NSHumanReadableCopyright":  "Copyright (c) 2026",
-                                                 "NSScreenCaptureUsageDescription":  "P2P Remote LAN needs screen recording permission when you explicitly share this Mac.",
-                                                 "NSAudioCaptureUsageDescription":  "P2P Remote LAN does not capture system audio.",
-                                                 "NSAppleEventsUsageDescription":  "P2P Remote LAN needs local automation permission only when you explicitly control this Mac.",
-                                                 "NSCameraUsageDescription":  "P2P Remote LAN does not use the camera.",
-                                                 "NSMicrophoneUsageDescription":  "P2P Remote LAN does not use the microphone."
-                                             }
-                          }
-              }
+  "name": "p2p-remote-lan",
+  "version": "0.1.0",
+  "description": "LAN-only low-latency remote control MVP: Windows controller -> macOS host",
+  "main": "src/main.js",
+  "private": true,
+  "license": "MIT",
+  "author": "",
+  "scripts": {
+    "host": "electron . -- --host",
+    "client": "electron . -- --client",
+    "start": "electron .",
+    "build:mac-helper": "cd native/macos-input-helper && swift build -c release --arch arm64 --arch x86_64",
+    "dist:win": "npm run stage:native-v2 && electron-builder --win",
+    "dist:mac": "npm run stage:native-v2 && electron-builder --mac",
+    "pack:win": "npm run stage:native-v2 && electron-builder --win --dir",
+    "pack:mac": "npm run stage:native-v2 && electron-builder --mac --dir",
+    "v2:win:build": "powershell -ExecutionPolicy Bypass -File native-v2/win-client/build.ps1",
+    "v2:mac:build": "cd native-v2/mac-host && swift build -c release",
+    "stage:native-v2": "node scripts/stage-native-v2.js"
+  },
+  "dependencies": {
+    "ws": "^8.20.0"
+  },
+  "devDependencies": {
+    "electron": "^41.5.0",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "com.p2premotelan.app",
+    "productName": "P2P Remote LAN",
+    "copyright": "Copyright (c) 2026",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "src/**/*",
+      "package.json",
+      "scripts/**/*"
+    ],
+    "asar": true,
+    "compression": "maximum",
+    "win": {
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "requestedExecutionLevel": "asInvoker",
+      "icon": "build/icon.ico"
+    },
+    "nsis": {
+      "artifactName": "${productName}-${version}-Setup-${arch}.${ext}",
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "P2P Remote LAN"
+    },
+    "portable": {
+      "artifactName": "${productName}-${version}-Portable-${arch}.${ext}"
+    },
+    "mac": {
+      "artifactName": "${productName}-${version}-${os}-${arch}.${ext}",
+      "category": "public.app-category.utilities",
+      "target": [
+        {
+          "target": "dmg",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        },
+        {
+          "target": "zip",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
+        }
+      ],
+      "extraResources": [
+        {
+          "from": "native/macos-input-helper/.build/apple/Products/Release/macos-input-helper",
+          "to": "macos-input-helper"
+        }
+      ],
+      "extendInfo": {
+        "NSHumanReadableCopyright": "Copyright (c) 2026",
+        "NSScreenCaptureUsageDescription": "P2P Remote LAN needs screen recording permission when you explicitly share this Mac.",
+        "NSAudioCaptureUsageDescription": "P2P Remote LAN does not capture system audio.",
+        "NSAppleEventsUsageDescription": "P2P Remote LAN needs local automation permission only when you explicitly control this Mac.",
+        "NSCameraUsageDescription": "P2P Remote LAN does not use the camera.",
+        "NSMicrophoneUsageDescription": "P2P Remote LAN does not use the microphone."
+      }
+    },
+    "extraResources": [
+      {
+        "from": "build/native-v2",
+        "to": "native-v2",
+        "filter": [
+          "**/*"
+        ]
+      }
+    ]
+  }
 }

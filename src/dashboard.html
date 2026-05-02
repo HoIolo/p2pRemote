@@ -49,6 +49,13 @@
           <h1 id="selectedName">P2P Remote LAN</h1>
         </div>
         <div class="topActions">
+          <label class="modeSwitch" title="Native v2 极限模式需要先在 Mac 端运行 native-v2 Host">
+            <span>连接模式</span>
+            <select id="connectionMode">
+              <option value="webrtc">稳定 WebRTC</option>
+              <option value="native-v2">Native v2 极限</option>
+            </select>
+          </label>
           <button id="refreshTop" class="iconBtn" title="刷新" aria-label="刷新"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-refresh"></use></svg></button>
           <button id="openScreenSettings" class="iconBtn" title="屏幕录制权限" aria-label="屏幕录制权限"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-record"></use></svg></button>
           <button id="resetScreenPermission" class="iconBtn" title="重置屏幕录制权限" aria-label="重置屏幕录制权限"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-reset"></use></svg></button>
@@ -71,6 +78,11 @@
         <h2>快速启动</h2>
         <div id="quickGrid" class="quickGrid">
           <button id="manualAdd" class="quickAdd"><svg class="quickIcon" aria-hidden="true"><use href="assets/icons.svg#icon-plus"></use></svg><span>手动连接</span></button>
+          <div class="nativeHint">
+            <b>Native v2 极限链路</b>
+            <span id="nativeV2StatusText">正在检测 native-v2...</span>
+            <code>UDP 45000 视频 / 45001 输入，推荐 1080p120</code>
+          </div>
         </div>
 
         <details class="diagnostics">

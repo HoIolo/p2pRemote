@@ -15,7 +15,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const WebSocket = require('ws');
-const { execFile } = require('child_process');
+const { execFile, spawn } = require('child_process');
 const { injectInput } = require('./injector');
 
 // Latency-oriented Chromium defaults. This is a LAN-only consent-based app;
@@ -52,6 +52,8 @@ const remoteConfigs = new Map();
 const devicePreviews = new Map();
 let signalRendererReady = false;
 const pendingSignalMessages = [];
+let nativeV2ClientProcess = null;
+let nativeV2HostProcess = null;
 
 function mainWindow() {
   if (win && !win.isDestroyed()) return win;
@@ -251,6 +253,318 @@ function createRemoteWindow(device) {
   return remoteWindow;
 }
 
+function findFirstExistingPath(candidates) {
+  return candidates.find((candidate) => {
+    try {
+      return fs.existsSync(candidate);
+    } catch {
+      return false;
+    }
+  }) || null;
+}
+
+function nativeV2WinClientCandidates() {
+  return [
+    path.join(process.resourcesPath || '', 'native-v2', 'win-client', 'p2p-native-win-client.exe'),
+    path.join(__dirname, '..', 'native-v2', 'win-client', 'build', 'Release', 'p2p-native-win-client.exe'),
+    path.join(__dirname, '..', 'native-v2', 'win-client', 'build', 'RelWithDebInfo', 'p2p-native-win-client.exe'),
+    path.join(__dirname, '..', 'native-v2', 'win-client', 'build', 'Debug', 'p2p-native-win-client.exe'),
+  ];
+}
+
+function nativeV2MacHostCandidates() {
+  return [
+    path.join(process.resourcesPath || '', 'native-v2', 'mac-host', 'p2p-native-mac-host'),
+    path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'release', 'p2p-native-mac-host'),
+    path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'arm64-apple-macosx', 'release', 'p2p-native-mac-host'),
+    path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'x86_64-apple-macosx', 'release', 'p2p-native-mac-host'),
+  ];
+}
+
+function nativeV2StatusPayload() {
+  return {
+    platform: process.platform,
+    winClient: {
+      available: Boolean(findFirstExistingPath(nativeV2WinClientCandidates())),
+      path: findFirstExistingPath(nativeV2WinClientCandidates()),
+      running: Boolean(nativeV2ClientProcess && !nativeV2ClientProcess.killed),
+      pid: nativeV2ClientProcess?.pid || null,
+    },
+    macHost: {
+      available: Boolean(findFirstExistingPath(nativeV2MacHostCandidates())),
+      path: findFirstExistingPath(nativeV2MacHostCandidates()),
+      running: Boolean(nativeV2HostProcess && !nativeV2HostProcess.killed),
+      pid: nativeV2HostProcess?.pid || null,
+    },
+    defaults: {
+      videoPort: 45000,
+      inputPort: 45001,
+      width: 1920,
+      height: 1080,
+      fps: 120,
+      bitrate: 45_000_000,
+      keyint: 1,
+    },
+  };
+}
+
+function broadcastNativeV2Status(extra = {}) {
+  sendToMainWindow('native-v2-status', {
+    ...nativeV2StatusPayload(),
+    ...extra,
+  });
+}
+
+function stopNativeV2Process(kind) {
+  const proc = kind === 'host' ? nativeV2HostProcess : nativeV2ClientProcess;
+  if (!proc || proc.killed) return false;
+  try {
+    proc.kill();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function normalizeNativeV2Number(value, fallback, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(number)));
+}
+
+function startNativeV2Client(options = {}) {
+  if (process.platform !== 'win32') {
+    throw new Error('Native v2 Windows client can only run on Windows');
+  }
+  if (!options.hostIp) {
+    throw new Error('Native v2 needs the Mac host IP address');
+  }
+  if (nativeV2ClientProcess && !nativeV2ClientProcess.killed) {
+    stopNativeV2Process('client');
+  }
+
+  const exePath = findFirstExistingPath(nativeV2WinClientCandidates());
+  if (!exePath) {
+    throw new Error('Native v2 Windows 客户端还没有构建。请先在本机安装 Visual Studio Build Tools + CMake 后执行 npm run v2:win:build，或使用包含 native-v2 的安装包。');
+  }
+
+  const videoPort = normalizeNativeV2Number(options.videoPort, 45000, 1, 65535);
+  const inputPort = normalizeNativeV2Number(options.inputPort, 45001, 1, 65535);
+  const width = normalizeNativeV2Number(options.width, 1920, 640, 7680);
+  const height = normalizeNativeV2Number(options.height, 1080, 360, 4320);
+  const fps = normalizeNativeV2Number(options.fps, 120, 30, 240);
+  const args = [
+    '--host-ip', String(options.hostIp),
+    '--video-port', String(videoPort),
+    '--input-port', String(inputPort),
+    '--width', String(width),
+    '--height', String(height),
+    '--fps', String(fps),
+  ];
+  if (options.fullscreen !== false) args.push('--fullscreen');
+
+  nativeV2ClientProcess = spawn(exePath, args, {
+    cwd: path.dirname(exePath),
+    windowsHide: false,
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  const proc = nativeV2ClientProcess;
+  const pid = nativeV2ClientProcess.pid;
+  sendToMainWindow('host-log', {
+    level: 'info',
+    message: `native-v2 client started pid=${pid} host=${options.hostIp}:${videoPort}`,
+  });
+
+  proc.stdout?.on('data', (chunk) => {
+    sendToMainWindow('host-log', { level: 'native-v2', message: chunk.toString('utf8').trim() });
+  });
+  proc.stderr?.on('data', (chunk) => {
+    sendToMainWindow('host-log', { level: 'native-v2', message: chunk.toString('utf8').trim() });
+  });
+  proc.once('exit', (code, signal) => {
+    sendToMainWindow('host-log', { level: 'info', message: `native-v2 client exited code=${code ?? ''} signal=${signal ?? ''}` });
+    if (nativeV2ClientProcess === proc) nativeV2ClientProcess = null;
+    broadcastNativeV2Status();
+  });
+  proc.once('error', (err) => {
+    sendToMainWindow('host-log', { level: 'error', message: `native-v2 client failed: ${err.message}` });
+    if (nativeV2ClientProcess === proc) nativeV2ClientProcess = null;
+    broadcastNativeV2Status({ error: err.message });
+  });
+
+  broadcastNativeV2Status();
+  return {
+    ok: true,
+    pid,
+    exePath,
+    args,
+    hostIp: String(options.hostIp),
+    videoPort,
+    inputPort,
+    width,
+    height,
+    fps,
+    fullscreen: options.fullscreen !== false,
+  };
+}
+
+function startNativeV2Host(options = {}) {
+  if (process.platform !== 'darwin') {
+    throw new Error('Native v2 macOS host can only run on macOS');
+  }
+  if (!options.clientIp) {
+    throw new Error('Native v2 host needs the Windows client IP address');
+  }
+  if (nativeV2HostProcess && !nativeV2HostProcess.killed) {
+    stopNativeV2Process('host');
+  }
+
+  const exePath = findFirstExistingPath(nativeV2MacHostCandidates());
+  if (!exePath) {
+    throw new Error('Native v2 macOS Host 还没有构建。请在 Mac 上执行 npm run v2:mac:build，或使用包含 native-v2 host 的安装包。');
+  }
+
+  const videoPort = normalizeNativeV2Number(options.videoPort, 45000, 1, 65535);
+  const inputPort = normalizeNativeV2Number(options.inputPort, 45001, 1, 65535);
+  const width = normalizeNativeV2Number(options.width, 1920, 640, 7680);
+  const height = normalizeNativeV2Number(options.height, 1080, 360, 4320);
+  const fps = normalizeNativeV2Number(options.fps, 120, 30, 240);
+  const bitrate = normalizeNativeV2Number(options.bitrate, 45_000_000, 1_000_000, 200_000_000);
+  const keyint = normalizeNativeV2Number(options.keyint, 1, 1, 300);
+  const args = [
+    '--client-ip', String(options.clientIp),
+    '--video-port', String(videoPort),
+    '--input-port', String(inputPort),
+    '--width', String(width),
+    '--height', String(height),
+    '--fps', String(fps),
+    '--bitrate', String(bitrate),
+    '--keyint', String(keyint),
+  ];
+
+  nativeV2HostProcess = spawn(exePath, args, {
+    cwd: path.dirname(exePath),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+
+  const proc = nativeV2HostProcess;
+  const pid = nativeV2HostProcess.pid;
+  sendToMainWindow('host-log', {
+    level: 'info',
+    message: `native-v2 host started pid=${pid} client=${options.clientIp}:${videoPort}`,
+  });
+
+  proc.stdout?.on('data', (chunk) => {
+    sendToMainWindow('host-log', { level: 'native-v2', message: chunk.toString('utf8').trim() });
+  });
+  proc.stderr?.on('data', (chunk) => {
+    sendToMainWindow('host-log', { level: 'native-v2', message: chunk.toString('utf8').trim() });
+  });
+  proc.once('exit', (code, signal) => {
+    sendToMainWindow('host-log', { level: 'info', message: `native-v2 host exited code=${code ?? ''} signal=${signal ?? ''}` });
+    if (nativeV2HostProcess === proc) nativeV2HostProcess = null;
+    broadcastNativeV2Status();
+  });
+  proc.once('error', (err) => {
+    sendToMainWindow('host-log', { level: 'error', message: `native-v2 host failed: ${err.message}` });
+    if (nativeV2HostProcess === proc) nativeV2HostProcess = null;
+    broadcastNativeV2Status({ error: err.message });
+  });
+
+  broadcastNativeV2Status();
+  return {
+    ok: true,
+    pid,
+    exePath,
+    args,
+    clientIp: String(options.clientIp),
+    videoPort,
+    inputPort,
+    width,
+    height,
+    fps,
+    bitrate,
+    keyint,
+  };
+}
+
+function requestNativeV2RemoteHost(device, options = {}) {
+  return new Promise((resolve, reject) => {
+    if (!device || !device.address || !device.port || !device.pin) {
+      reject(new Error('Native v2 remote host request needs discovered Mac address, port and PIN'));
+      return;
+    }
+
+    const requestId = crypto.randomUUID();
+    const url = `ws://${device.address}:${device.port}`;
+    const socket = new WebSocket(url);
+    let settled = false;
+
+    const finish = (err, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        socket.close();
+      } catch {
+        // ignore close errors
+      }
+      if (err) reject(err);
+      else resolve(result);
+    };
+
+    const timer = setTimeout(() => {
+      finish(new Error(`Native v2 remote host request timed out: ${url}`));
+    }, 10_000);
+
+    socket.on('open', () => {
+      socket.send(JSON.stringify({ type: 'hello', pin: String(device.pin) }));
+    });
+
+    socket.on('message', (buf) => {
+      let message;
+      try {
+        message = JSON.parse(buf.toString('utf8'));
+      } catch {
+        finish(new Error('Native v2 remote host returned invalid JSON'));
+        return;
+      }
+
+      if (message.type === 'hello-ok') {
+        socket.send(JSON.stringify({
+          type: 'native-v2-start-host',
+          requestId,
+          options,
+        }));
+        return;
+      }
+
+      if (message.type === 'native-v2-host-started' && message.requestId === requestId) {
+        finish(null, message.result || { ok: true });
+        return;
+      }
+
+      if (message.type === 'native-v2-host-error' && message.requestId === requestId) {
+        finish(new Error(message.error || 'Native v2 remote host failed'));
+        return;
+      }
+
+      if (message.type === 'error') {
+        finish(new Error(message.error || 'Native v2 remote host request failed'));
+      }
+    });
+
+    socket.on('error', (err) => {
+      finish(new Error(`Native v2 remote host connection failed: ${err.message}`));
+    });
+
+    socket.on('close', () => {
+      if (!settled) finish(new Error('Native v2 remote host connection closed before response'));
+    });
+  });
+}
+
 function getScreenCaptureStatus() {
   if (process.platform !== 'darwin') return 'unknown';
   try {
@@ -347,6 +661,23 @@ function startSignalServer() {
         socket.send(JSON.stringify({ type: 'hello-ok', clientId }));
         sendToMainWindow('client-connected', { clientId, remoteAddress });
         sendToMainWindow('host-log', { level: 'info', message: `paired client ${clientId.slice(0, 8)} from ${remoteAddress}` });
+        return;
+      }
+
+      if (msg.type === 'native-v2-start-host') {
+        const requestId = msg.requestId || null;
+        Promise.resolve()
+          .then(() => startNativeV2Host(msg.options || {}))
+          .then((result) => {
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({ type: 'native-v2-host-started', requestId, result }));
+            }
+          })
+          .catch((err) => {
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({ type: 'native-v2-host-error', requestId, error: err.message || String(err) }));
+            }
+          });
         return;
       }
 
@@ -482,6 +813,28 @@ ipcMain.handle('remote-config', (event) => {
   return remoteConfigs.get(event.sender.id) || null;
 });
 
+ipcMain.handle('native-v2-status', () => nativeV2StatusPayload());
+
+ipcMain.handle('native-v2-start-client', (_event, options) => startNativeV2Client(options));
+
+ipcMain.handle('native-v2-stop-client', () => {
+  const stopped = stopNativeV2Process('client');
+  broadcastNativeV2Status();
+  return { ok: true, stopped };
+});
+
+ipcMain.handle('native-v2-start-host', (_event, options) => startNativeV2Host(options));
+
+ipcMain.handle('native-v2-request-remote-host', (_event, payload = {}) => {
+  return requestNativeV2RemoteHost(payload.device, payload.options);
+});
+
+ipcMain.handle('native-v2-stop-host', () => {
+  const stopped = stopNativeV2Process('host');
+  broadcastNativeV2Status();
+  return { ok: true, stopped };
+});
+
 ipcMain.handle('save-device-preview', (_event, id, dataUrl) => {
   if (!id || typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/')) return false;
   devicePreviews.set(String(id), dataUrl);
@@ -583,5 +936,12 @@ app.on('window-all-closed', () => {
     discoverySocket.close();
     discoverySocket = null;
   }
+  stopNativeV2Process('client');
+  stopNativeV2Process('host');
   if (process.platform !== 'darwin') app.quit();
+});
+
+app.on('before-quit', () => {
+  stopNativeV2Process('client');
+  stopNativeV2Process('host');
 });
