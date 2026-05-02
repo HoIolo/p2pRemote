@@ -25,11 +25,14 @@ app.commandLine.appendSwitch('disable-background-timer-throttling');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns');
 
+const isPackagedOnMac = app.isPackaged && process.platform === 'darwin';
+
 function resolveRole() {
   if (process.argv.includes('--host')) return 'host';
   if (process.argv.includes('--client')) return 'client';
   if (process.env.P2P_REMOTE_ROLE === 'host') return 'host';
   if (process.env.P2P_REMOTE_ROLE === 'client') return 'client';
+  if (isPackagedOnMac) return 'host';
 
   return 'dashboard';
 }
@@ -51,11 +54,34 @@ const devices = new Map();
 const remoteConfigs = new Map();
 const devicePreviews = new Map();
 
+function mainWindow() {
+  if (win && !win.isDestroyed()) return win;
+  const focused = BrowserWindow.getFocusedWindow();
+  if (focused && !focused.isDestroyed()) return focused;
+  return BrowserWindow.getAllWindows().find((browserWindow) => !browserWindow.isDestroyed()) || null;
+}
+
+function sendToWindow(browserWindow, channel, payload) {
+  try {
+    if (!browserWindow || browserWindow.isDestroyed()) return false;
+    const contents = browserWindow.webContents;
+    if (!contents || contents.isDestroyed()) return false;
+    contents.send(channel, payload);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function sendToMainWindow(channel, payload) {
+  return sendToWindow(mainWindow(), channel, payload);
+}
+
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) app.quit();
 else {
   app.on('second-instance', () => {
-    if (!win) return;
+    if (!win || win.isDestroyed()) return;
     if (win.isMinimized()) win.restore();
     win.focus();
   });
@@ -143,7 +169,7 @@ function sendDeviceList() {
     .filter((device) => now - device.lastSeen < 15_000)
     .map(serializeDevice)
     .sort((a, b) => a.name.localeCompare(b.name));
-  win?.webContents.send('devices-updated', list);
+  sendToMainWindow('devices-updated', list);
 }
 
 function windowChromeOptions(options) {
@@ -199,9 +225,10 @@ function createRemoteWindow(device) {
     title: `${device.name || device.address} - P2P Remote LAN`,
     titleBarHeight: 54,
   });
-  remoteConfigs.set(remoteWindow.webContents.id, serializeDevice(device));
-  remoteWindow.on('closed', () => {
-    remoteConfigs.delete(remoteWindow.webContents.id);
+  const webContentsId = remoteWindow.webContents.id;
+  remoteConfigs.set(webContentsId, serializeDevice(device));
+  remoteWindow.once('closed', () => {
+    remoteConfigs.delete(webContentsId);
   });
   return remoteWindow;
 }
@@ -232,7 +259,7 @@ function registerDisplayMediaHandler() {
       const source = primarySource || sources[0];
 
       if (!source) {
-        win?.webContents.send('host-log', {
+        sendToMainWindow('host-log', {
           level: 'error',
           message: `no screen capture source found; macOS screen permission=${getScreenCaptureStatus()}`,
         });
@@ -240,20 +267,35 @@ function registerDisplayMediaHandler() {
         return;
       }
 
-      callback({ video: source });
+      sendToMainWindow('host-log', {
+        level: 'info',
+        message: `screen source selected: ${source.name || source.id}`,
+      });
+      callback({ video: source, audio: false });
     } catch (err) {
-      win?.webContents.send('host-log', {
+      sendToMainWindow('host-log', {
         level: 'error',
         message: `screen source selection failed: ${err && err.message ? err.message : String(err)}; macOS screen permission=${getScreenCaptureStatus()}`,
       });
       callback({});
     }
-  }, { useSystemPicker: true });
+  }, {
+    // For the LAN remote-desktop flow we already have an explicit app UI + PIN
+    // pairing. Using the macOS system picker can leave getDisplayMedia()
+    // pending in the background, so the Windows side can stay on "connecting
+    // video stream" forever. Always use our handler and pick the primary
+    // display directly.
+    useSystemPicker: false,
+  });
 }
 
 function startSignalServer() {
   if (wss) return;
   wss = new WebSocket.Server({ port: SIGNAL_PORT, host: '0.0.0.0' });
+
+  wss.on('listening', () => {
+    sendToMainWindow('host-log', { level: 'info', message: `signal server listening on ${SIGNAL_PORT}` });
+  });
 
   wss.on('connection', (socket, req) => {
     const clientId = crypto.randomUUID();
@@ -285,18 +327,21 @@ function startSignalServer() {
         clearTimeout(helloTimer);
         clients.set(clientId, socket);
         socket.send(JSON.stringify({ type: 'hello-ok', clientId }));
-        win?.webContents.send('client-connected', { clientId, remoteAddress });
+        sendToMainWindow('client-connected', { clientId, remoteAddress });
+        sendToMainWindow('host-log', { level: 'info', message: `paired client ${clientId.slice(0, 8)} from ${remoteAddress}` });
         return;
       }
 
       // Relay WebRTC offer/ICE from paired client to the macOS host renderer.
-      win?.webContents.send('signal-message', { clientId, message: msg });
+      sendToMainWindow('host-log', { level: 'debug', message: `signal ${msg.type || 'unknown'} from ${clientId.slice(0, 8)}` });
+      sendToMainWindow('signal-message', { clientId, message: msg });
     });
 
-    socket.on('close', () => {
+    socket.on('close', (code, reason) => {
       clearTimeout(helloTimer);
       clients.delete(clientId);
-      win?.webContents.send('client-disconnected', { clientId, remoteAddress });
+      sendToMainWindow('client-disconnected', { clientId, remoteAddress });
+      sendToMainWindow('host-log', { level: 'info', message: `client ${clientId.slice(0, 8)} disconnected code=${code} reason=${reason || ''}` });
     });
   });
 
@@ -335,7 +380,7 @@ function startDiscovery() {
   });
 
   discoverySocket.on('error', (err) => {
-    win?.webContents.send('host-log', { level: 'error', message: `discovery failed: ${err.message}` });
+    sendToMainWindow('host-log', { level: 'error', message: `discovery failed: ${err.message}` });
   });
 
   discoverySocket.bind(DISCOVERY_PORT, () => {
@@ -349,6 +394,7 @@ function startDiscovery() {
 
 async function startHost() {
   startSignalServer();
+  startDiscovery();
   win = createWindow('host.html', { title: 'P2P Remote LAN - macOS Host', frame: true });
 }
 
@@ -392,7 +438,7 @@ ipcMain.handle('devices-list', () => {
     .filter((device) => now - device.lastSeen < 15_000)
     .map(serializeDevice)
     .sort((a, b) => a.name.localeCompare(b.name));
-  win?.webContents.send('devices-updated', list);
+  sendToMainWindow('devices-updated', list);
   return list;
 });
 
@@ -473,7 +519,7 @@ ipcMain.on('input-event', async (_event, event) => {
     const bounds = screen.getPrimaryDisplay().bounds;
     await injectInput(event, bounds);
   } catch (err) {
-    win?.webContents.send('host-log', {
+    sendToMainWindow('host-log', {
       level: 'error',
       message: `input injection failed: ${err && err.message ? err.message : String(err)}`,
     });

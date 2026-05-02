@@ -41,6 +41,17 @@ async function initInfo() {
   }
 }
 
+async function waitForLiveTrack(track, timeoutMs = 1500) {
+  if (track.readyState === 'live' && !track.muted) return;
+  await new Promise((resolve) => {
+    const timer = setTimeout(resolve, timeoutMs);
+    track.addEventListener('unmute', () => {
+      clearTimeout(timer);
+      resolve();
+    }, { once: true });
+  });
+}
+
 async function tuneCaptureTrack(track) {
   try {
     const maxFps = Number(localStorage.getItem('maxFps') || 60);
@@ -72,6 +83,11 @@ async function startCapture() {
   for (const track of videoTracks) {
     track.contentHint = 'motion';
     await tuneCaptureTrack(track);
+    await waitForLiveTrack(track);
+    const settings = track.getSettings?.() || {};
+    log(`screen track ready: ${settings.width || '?'}x${settings.height || '?'} muted=${track.muted} state=${track.readyState}`);
+    track.addEventListener('mute', () => log('screen track muted'));
+    track.addEventListener('unmute', () => log('screen track unmuted'));
     track.addEventListener('ended', () => {
       log('screen capture stopped');
       setStatus('warn', '共享已停止');

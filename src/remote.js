@@ -5,6 +5,11 @@ const statusDot = $('statusDot');
 const statusText = $('statusText');
 const reconnectBtn = $('reconnect');
 const fullscreenBtn = $('fullscreen');
+const settingsBtn = $('settings');
+const settingsMenu = $('settingsMenu');
+const toggleLogBtn = $('toggleLog');
+const logStateEl = $('logState');
+const topRevealZone = $('topRevealZone');
 const video = $('remoteVideo');
 const overlay = $('overlay');
 const logEl = $('log');
@@ -19,15 +24,99 @@ let pendingMove = null;
 let moveRaf = 0;
 let fullScreen = false;
 let previewSaved = false;
+let sawRemoteTrack = false;
+let isClosing = false;
+let logVisible = localStorage.getItem('remoteLogVisible') === '1';
+let topbarPinned = true;
+let topbarHideTimer = 0;
+let topbarRevealTimer = 0;
 
 function log(message) {
   const line = `[${new Date().toLocaleTimeString()}] ${message}`;
   logEl.textContent = `${line}\n${logEl.textContent}`;
+  const lines = logEl.textContent.split('\n');
+  if (lines.length > 260) logEl.textContent = lines.slice(0, 260).join('\n');
 }
 
 function setStatus(kind, text) {
   statusDot.className = `dot ${kind || ''}`;
   statusText.textContent = text;
+}
+
+function applyLogVisibility() {
+  logEl.hidden = !logVisible;
+  document.body.classList.toggle('logVisible', logVisible);
+  if (logStateEl) logStateEl.textContent = logVisible ? '\u6253\u5f00' : '\u5173\u95ed';
+  localStorage.setItem('remoteLogVisible', logVisible ? '1' : '0');
+}
+
+function setSettingsOpen(open) {
+  settingsMenu.hidden = !open;
+  settingsBtn?.setAttribute('aria-expanded', open ? 'true' : 'false');
+}
+
+function setTopbarVisible(visible) {
+  document.body.classList.toggle('topbarHidden', fullScreen && !visible);
+}
+
+function scheduleTopbarHide(delay = 1600) {
+  clearTimeout(topbarHideTimer);
+  if (!fullScreen || topbarPinned) {
+    setTopbarVisible(true);
+    return;
+  }
+  topbarHideTimer = setTimeout(() => setTopbarVisible(false), delay);
+}
+
+function revealTopbarTemporarily() {
+  if (!fullScreen) return;
+  setTopbarVisible(true);
+  scheduleTopbarHide(1600);
+}
+
+function wireRemoteUi() {
+  applyLogVisibility();
+  settingsBtn?.addEventListener('click', (event) => {
+    event.stopPropagation();
+    setSettingsOpen(settingsMenu.hidden);
+    revealTopbarTemporarily();
+  });
+  toggleLogBtn?.addEventListener('click', (event) => {
+    event.stopPropagation();
+    logVisible = !logVisible;
+    applyLogVisibility();
+  });
+  document.addEventListener('click', (event) => {
+    if (event.target.closest('#settings') || event.target.closest('#settingsMenu')) return;
+    setSettingsOpen(false);
+  });
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') setSettingsOpen(false);
+    if ((event.ctrlKey || event.metaKey) && event.shiftKey && event.code === 'KeyL') {
+      logVisible = !logVisible;
+      applyLogVisibility();
+      event.preventDefault();
+    }
+  });
+
+  topRevealZone?.addEventListener('mouseenter', () => {
+    if (!fullScreen) return;
+    clearTimeout(topbarRevealTimer);
+    topbarRevealTimer = setTimeout(() => revealTopbarTemporarily(), 260);
+  });
+  topRevealZone?.addEventListener('mouseleave', () => clearTimeout(topbarRevealTimer));
+  document.querySelector('.remoteTopbar')?.addEventListener('mouseenter', () => {
+    topbarPinned = true;
+    setTopbarVisible(true);
+  });
+  document.querySelector('.remoteTopbar')?.addEventListener('mouseleave', () => {
+    topbarPinned = false;
+    scheduleTopbarHide(700);
+  });
+  video.addEventListener('mousemove', (event) => {
+    if (!fullScreen) return;
+    if (event.clientY <= 4) revealTopbarTemporarily();
+  });
 }
 
 function wireWindowControls() {
@@ -52,16 +141,48 @@ function endpoint() {
 }
 
 function sendSignal(message) {
+  if (isClosing) return;
   if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
 }
 
 function sendInput(event) {
+  if (isClosing) return;
   if (inputChannel?.readyState !== 'open') return;
   if (inputChannel.bufferedAmount > 8_192) return;
   inputChannel.send(JSON.stringify({ ...event, t: performance.now() }));
 }
 
+function cleanupConnection() {
+  isClosing = true;
+  if (moveRaf) cancelAnimationFrame(moveRaf);
+  moveRaf = 0;
+  pendingMove = null;
+  pressedKeys.clear();
+  pointerDown = false;
+  try {
+    inputChannel?.close();
+  } catch {}
+  inputChannel = null;
+  try {
+    pc?.getSenders?.().forEach((sender) => sender.track?.stop?.());
+    pc?.getReceivers?.().forEach((receiver) => receiver.track?.stop?.());
+    pc?.close();
+  } catch {}
+  pc = null;
+  try {
+    if (ws?.readyState === WebSocket.OPEN || ws?.readyState === WebSocket.CONNECTING) ws.close(1000, 'remote window closed');
+  } catch {}
+  ws = null;
+  try {
+    const stream = video.srcObject;
+    if (stream?.getTracks) stream.getTracks().forEach((track) => track.stop());
+    video.pause();
+    video.srcObject = null;
+  } catch {}
+}
+
 function makePeer() {
+  sawRemoteTrack = false;
   pc = new RTCPeerConnection({
     iceServers: [],
     bundlePolicy: 'max-bundle',
@@ -79,12 +200,23 @@ function makePeer() {
   inputChannel.onclose = () => log('input data channel closed');
 
   pc.ontrack = (event) => {
+    sawRemoteTrack = true;
     const stream = event.streams[0] || new MediaStream([event.track]);
     video.srcObject = stream;
-    overlay.style.display = 'none';
-    video.play().catch((err) => log(`video play skipped: ${err.message}`));
+    overlay.style.display = 'grid';
+    overlay.textContent = '\u5df2\u6536\u5230\u89c6\u9891\u8f68\u9053\uff0c\u7b49\u5f85\u7b2c\u4e00\u5e27';
+    const playPromise = video.play();
+    if (playPromise) playPromise.catch((err) => log(`video play skipped: ${err.message}`));
     log(`remote track: ${event.track.kind}`);
-    event.track.onunmute = () => log('remote video unmuted');
+    event.track.onunmute = () => {
+      overlay.style.display = 'none';
+      log('remote video unmuted');
+    };
+    event.track.onmute = () => {
+      overlay.style.display = 'grid';
+      overlay.textContent = '\u89c6\u9891\u8f68\u9053\u6682\u65f6\u65e0\u753b\u9762';
+      log('remote video muted');
+    };
   };
 
   pc.onicecandidate = (event) => {
@@ -92,8 +224,12 @@ function makePeer() {
   };
   pc.onconnectionstatechange = () => {
     log(`peer state=${pc.connectionState}`);
-    if (pc.connectionState === 'connected') setStatus('ok', '已连接');
-    if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) setStatus('warn', pc.connectionState);
+    if (pc.connectionState === 'connected') setStatus('ok', sawRemoteTrack ? '\u5df2\u8fde\u63a5' : '\u5df2\u8fde\u63a5\uff0c\u7b49\u5f85\u89c6\u9891');
+    if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) {
+      setStatus('warn', pc.connectionState);
+      overlay.style.display = 'grid';
+      overlay.textContent = `\u8fde\u63a5\u72b6\u6001\uff1a${pc.connectionState}`;
+    }
   };
   pc.oniceconnectionstatechange = () => log(`ice=${pc.iceConnectionState}`);
 }
@@ -117,7 +253,7 @@ function saveFirstFrame() {
 }
 
 async function createOffer() {
-  const offer = await pc.createOffer();
+  const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: false });
   await pc.setLocalDescription(offer);
   sendSignal({ type: 'offer', sdp: pc.localDescription });
   log('offer sent');
@@ -125,8 +261,8 @@ async function createOffer() {
 
 async function connect() {
   if (!config) return;
-  if (ws) ws.close();
-  if (pc) pc.close();
+  cleanupConnection();
+  isClosing = false;
   pressedKeys.clear();
   pointerDown = false;
   overlay.style.display = 'grid';
@@ -148,6 +284,7 @@ async function connect() {
     log(`websocket closed code=${event.code} reason=${event.reason}`);
   };
   ws.onmessage = async (event) => {
+    if (isClosing || !pc) return;
     const message = JSON.parse(event.data);
     if (message.type === 'hello-ok') {
       setStatus('warn', '协商媒体');
@@ -157,6 +294,7 @@ async function connect() {
     }
     if (message.type === 'answer') {
       await pc.setRemoteDescription(message.sdp);
+      overlay.textContent = '\u5df2\u5b8c\u6210\u534f\u5546\uff0c\u7b49\u5f85\u89c6\u9891\u5e27';
       log('answer applied');
       return;
     }
@@ -170,7 +308,7 @@ async function connect() {
     }
     if (message.type === 'error') {
       setStatus('warn', message.error || 'remote error');
-      overlay.textContent = message.error || '远程端共享失败';
+      overlay.textContent = message.error || '\u8fdc\u7a0b\u7aef\u5171\u4eab\u5931\u8d25';
       log(`remote error: ${message.error}`);
     }
   };
@@ -208,7 +346,20 @@ function enqueueMove(event) {
 }
 
 video.addEventListener('loadedmetadata', () => log(`video metadata ${video.videoWidth}x${video.videoHeight}`));
-video.addEventListener('loadeddata', saveFirstFrame);
+video.addEventListener('loadeddata', () => {
+  overlay.style.display = 'none';
+  saveFirstFrame();
+});
+video.addEventListener('playing', () => {
+  overlay.style.display = 'none';
+  setStatus('ok', '\u5df2\u8fde\u63a5');
+  log('video playing');
+});
+video.addEventListener('waiting', () => {
+  if (!sawRemoteTrack) return;
+  overlay.style.display = 'grid';
+  overlay.textContent = '\u6b63\u5728\u7b49\u5f85\u4e0b\u4e00\u5e27';
+});
 video.addEventListener('contextmenu', (event) => event.preventDefault());
 video.addEventListener('mousedown', (event) => {
   event.preventDefault();
@@ -254,16 +405,27 @@ window.addEventListener('blur', () => {
   pressedKeys.clear();
   pointerDown = false;
 });
+window.addEventListener('beforeunload', cleanupConnection);
 
 reconnectBtn.addEventListener('click', () => connect().catch((err) => log(`connect failed: ${err.stack || err.message}`)));
 fullscreenBtn.addEventListener('click', async () => {
   fullScreen = !fullScreen;
-  await window.lanRemote.setWindowFullscreen(fullScreen);
+  fullScreen = await window.lanRemote.setWindowFullscreen(fullScreen);
+  document.body.classList.toggle('fullscreenMode', fullScreen);
   const label = fullscreenBtn.querySelector('span');
-  if (label) label.textContent = fullScreen ? '退出全屏' : '全屏';
+  if (label) label.textContent = fullScreen ? '\u9000\u51fa\u5168\u5c4f' : '\u5168\u5c4f';
+  setSettingsOpen(false);
+  if (fullScreen) {
+    topbarPinned = false;
+    scheduleTopbarHide(900);
+  } else {
+    topbarPinned = true;
+    setTopbarVisible(true);
+  }
 });
 
 wireWindowControls();
+wireRemoteUi();
 
 window.lanRemote.getAppInfo().then((info) => {
   document.body.dataset.platform = info.device.platform;
