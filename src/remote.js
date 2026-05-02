@@ -30,6 +30,8 @@ let logVisible = localStorage.getItem('remoteLogVisible') === '1';
 let topbarPinned = true;
 let topbarHideTimer = 0;
 let topbarRevealTimer = 0;
+let answerTimer = 0;
+let offerSentAt = 0;
 
 function log(message) {
   const line = `[${new Date().toLocaleTimeString()}] ${message}`;
@@ -41,6 +43,23 @@ function log(message) {
 function setStatus(kind, text) {
   statusDot.className = `dot ${kind || ''}`;
   statusText.textContent = text;
+}
+
+function clearAnswerTimer() {
+  clearTimeout(answerTimer);
+  answerTimer = 0;
+}
+
+function armAnswerTimer() {
+  clearAnswerTimer();
+  answerTimer = setTimeout(() => {
+    if (pc?.remoteDescription || isClosing) return;
+    const elapsed = offerSentAt ? Math.round((performance.now() - offerSentAt) / 1000) : 10;
+    setStatus('warn', '\u7b49\u5f85\u8fdc\u7a0b\u54cd\u5e94');
+    overlay.style.display = 'grid';
+    overlay.textContent = `\u5df2\u53d1\u9001 offer ${elapsed}s\uff0c\u4ecd\u672a\u6536\u5230 answer\u3002\u8bf7\u5728 Mac \u7aef\u67e5\u770b\u65e5\u5fd7\uff1a\u662f\u5426\u6536\u5230 offer / \u662f\u5426\u5c4f\u5e55\u5f55\u5236\u6743\u9650\u88ab\u62d2\u7edd\u3002`;
+    log('answer timeout: no answer from host after offer');
+  }, 10000);
 }
 
 function applyLogVisibility() {
@@ -154,6 +173,7 @@ function sendInput(event) {
 
 function cleanupConnection() {
   isClosing = true;
+  clearAnswerTimer();
   if (moveRaf) cancelAnimationFrame(moveRaf);
   moveRaf = 0;
   pendingMove = null;
@@ -256,6 +276,8 @@ async function createOffer() {
   const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: false });
   await pc.setLocalDescription(offer);
   sendSignal({ type: 'offer', sdp: pc.localDescription });
+  offerSentAt = performance.now();
+  armAnswerTimer();
   log('offer sent');
 }
 
@@ -278,7 +300,7 @@ async function connect() {
     ws.send(JSON.stringify({ type: 'hello', pin: config.pin }));
     log('pairing hello sent');
   };
-  ws.onerror = () => setStatus('warn', '信令错误');
+  ws.onerror = () => setStatus('warn', '\u4fe1\u4ee4\u9519\u8bef');
   ws.onclose = (event) => {
     setStatus('', `信令关闭 ${event.code || ''}`);
     log(`websocket closed code=${event.code} reason=${event.reason}`);
@@ -293,6 +315,7 @@ async function connect() {
       return;
     }
     if (message.type === 'answer') {
+      clearAnswerTimer();
       await pc.setRemoteDescription(message.sdp);
       overlay.textContent = '\u5df2\u5b8c\u6210\u534f\u5546\uff0c\u7b49\u5f85\u89c6\u9891\u5e27';
       log('answer applied');
@@ -307,6 +330,7 @@ async function connect() {
       return;
     }
     if (message.type === 'error') {
+      clearAnswerTimer();
       setStatus('warn', message.error || 'remote error');
       overlay.textContent = message.error || '\u8fdc\u7a0b\u7aef\u5171\u4eab\u5931\u8d25';
       log(`remote error: ${message.error}`);

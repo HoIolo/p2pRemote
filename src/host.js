@@ -13,6 +13,7 @@ const openScreenSettingsBtn = $('openScreenSettings');
 const resetScreenPermissionBtn = $('resetScreenPermission');
 
 let localStream = null;
+let capturePromise = null;
 const peers = new Map();
 
 function log(message) {
@@ -31,7 +32,7 @@ async function initInfo() {
   portEl.textContent = String(info.port);
   addressesEl.innerHTML = info.addresses.length
     ? info.addresses.map((a) => `<span class="code">${a.address}</span> <span class="small">${a.name}</span>`).join('<br />')
-    : '<span class="small">未找到非内网 IPv4 地址</span>';
+    : '<span class="small">\u672a\u627e\u5230\u975e\u5185\u7f51 IPv4 \u5730\u5740</span>';
   displayEl.textContent = `${info.display.x},${info.display.y} ${info.display.width}x${info.display.height} @${info.scaleFactor}x`;
   log(`host ready; port=${info.port}; pin=${info.pin}`);
 
@@ -70,38 +71,52 @@ async function tuneCaptureTrack(track) {
 
 async function startCapture() {
   if (localStream) return localStream;
+  if (capturePromise) return capturePromise;
 
-  setStatus('warn', '等待系统屏幕授权');
-  localStream = await navigator.mediaDevices.getDisplayMedia({
-    audio: false,
-    video: true,
-  });
-
-  const videoTracks = localStream.getVideoTracks();
-  if (videoTracks.length === 0) throw new Error('No screen video track returned');
-
-  for (const track of videoTracks) {
-    track.contentHint = 'motion';
-    await tuneCaptureTrack(track);
-    await waitForLiveTrack(track);
-    const settings = track.getSettings?.() || {};
-    log(`screen track ready: ${settings.width || '?'}x${settings.height || '?'} muted=${track.muted} state=${track.readyState}`);
-    track.addEventListener('mute', () => log('screen track muted'));
-    track.addEventListener('unmute', () => log('screen track unmuted'));
-    track.addEventListener('ended', () => {
-      log('screen capture stopped');
-      setStatus('warn', '共享已停止');
-      localStream = null;
-      startShareBtn.disabled = false;
-      for (const peer of peers.values()) peer.close();
-      peers.clear();
+  capturePromise = (async () => {
+    setStatus('warn', '\u7b49\u5f85\u7cfb\u7edf\u5c4f\u5e55\u6388\u6743');
+    const stream = await navigator.mediaDevices.getDisplayMedia({
+      audio: false,
+      video: true,
     });
-  }
 
-  startShareBtn.disabled = true;
-  setStatus('ok', '正在共享屏幕');
-  log('screen capture started');
-  return localStream;
+    const videoTracks = stream.getVideoTracks();
+    if (videoTracks.length === 0) throw new Error('No screen video track returned');
+
+    localStream = stream;
+    for (const track of videoTracks) {
+      track.contentHint = 'motion';
+      await tuneCaptureTrack(track);
+      await waitForLiveTrack(track);
+      const settings = track.getSettings?.() || {};
+      log(`screen track ready: ${settings.width || '?'}x${settings.height || '?'} muted=${track.muted} state=${track.readyState}`);
+      track.addEventListener('mute', () => log('screen track muted'));
+      track.addEventListener('unmute', () => log('screen track unmuted'));
+      track.addEventListener('ended', () => {
+        log('screen capture stopped');
+        setStatus('warn', '\u5171\u4eab\u5df2\u505c\u6b62');
+        localStream = null;
+        capturePromise = null;
+        startShareBtn.disabled = false;
+        for (const peer of peers.values()) peer.close();
+        peers.clear();
+      });
+    }
+
+    startShareBtn.disabled = true;
+    setStatus('ok', '\u6b63\u5728\u5171\u4eab\u5c4f\u5e55');
+    log('screen capture started');
+    return localStream;
+  })();
+
+  try {
+    return await capturePromise;
+  } catch (err) {
+    capturePromise = null;
+    localStream = null;
+    startShareBtn.disabled = false;
+    throw err;
+  }
 }
 
 function preferH264(pc, sender) {
@@ -177,28 +192,31 @@ async function handleSignal({ clientId, message }) {
 
   let pc = peers.get(clientId);
   if (message.type === 'offer') {
-    if (!localStream) {
-      log('client offered before screen sharing; click “开始共享屏幕” first');
-      window.lanRemote.sendSignal({ clientId, message: { type: 'error', error: 'host screen is not shared yet' } });
-      return;
-    }
+    try {
+      log(`offer received from ${clientId.slice(0, 8)}; preparing screen stream`);
+      const stream = await startCapture();
 
-    if (pc) pc.close();
-    pc = makePeer(clientId);
+      if (pc) pc.close();
+      pc = makePeer(clientId);
 
-    for (const track of localStream.getTracks()) {
-      const sender = pc.addTrack(track, localStream);
-      if (track.kind === 'video') {
-        preferH264(pc, sender);
-        await tuneSender(sender);
+      for (const track of stream.getTracks()) {
+        const sender = pc.addTrack(track, stream);
+        if (track.kind === 'video') {
+          preferH264(pc, sender);
+          await tuneSender(sender);
+        }
       }
-    }
 
-    await pc.setRemoteDescription(message.sdp);
-    const answer = await pc.createAnswer();
-    await pc.setLocalDescription(answer);
-    window.lanRemote.sendSignal({ clientId, message: { type: 'answer', sdp: pc.localDescription } });
-    log(`answered offer from ${clientId.slice(0, 8)}`);
+      await pc.setRemoteDescription(message.sdp);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      window.lanRemote.sendSignal({ clientId, message: { type: 'answer', sdp: pc.localDescription } });
+      log(`answered offer from ${clientId.slice(0, 8)}`);
+    } catch (err) {
+      const messageText = err?.message || String(err);
+      log(`screen share failed for ${clientId.slice(0, 8)}: ${messageText}`);
+      window.lanRemote.sendSignal({ clientId, message: { type: 'error', error: messageText } });
+    }
     return;
   }
 
@@ -250,4 +268,5 @@ window.lanRemote.onClientDisconnected(({ clientId }) => {
 });
 window.lanRemote.onHostLog((entry) => log(`${entry.level || 'info'}: ${entry.message}`));
 
+window.lanRemote.hostRendererReady?.();
 initInfo().catch((err) => log(`init failed: ${err.message}`));

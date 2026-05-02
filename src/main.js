@@ -50,6 +50,8 @@ const clients = new Map();
 const devices = new Map();
 const remoteConfigs = new Map();
 const devicePreviews = new Map();
+let signalRendererReady = false;
+const pendingSignalMessages = [];
 
 function mainWindow() {
   if (win && !win.isDestroyed()) return win;
@@ -72,6 +74,25 @@ function sendToWindow(browserWindow, channel, payload) {
 
 function sendToMainWindow(channel, payload) {
   return sendToWindow(mainWindow(), channel, payload);
+}
+
+function sendSignalToRenderer(payload) {
+  if (!signalRendererReady) {
+    pendingSignalMessages.push(payload);
+    sendToMainWindow('host-log', {
+      level: 'debug',
+      message: `queued signal ${payload.message?.type || 'unknown'} from ${payload.clientId?.slice?.(0, 8) || 'unknown'} until renderer is ready`,
+    });
+    return false;
+  }
+  return sendToMainWindow('signal-message', payload);
+}
+
+function markSignalRendererReady() {
+  signalRendererReady = true;
+  while (pendingSignalMessages.length) {
+    sendToMainWindow('signal-message', pendingSignalMessages.shift());
+  }
 }
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
@@ -331,7 +352,7 @@ function startSignalServer() {
 
       // Relay WebRTC offer/ICE from paired client to the macOS host renderer.
       sendToMainWindow('host-log', { level: 'debug', message: `signal ${msg.type || 'unknown'} from ${clientId.slice(0, 8)}` });
-      sendToMainWindow('signal-message', { clientId, message: msg });
+      sendSignalToRenderer({ clientId, message: msg });
     });
 
     socket.on('close', (code, reason) => {
@@ -390,9 +411,11 @@ function startDiscovery() {
 }
 
 async function startHost() {
+  signalRendererReady = false;
+  pendingSignalMessages.length = 0;
+  win = createWindow('host.html', { title: 'P2P Remote LAN - macOS Host', frame: true });
   startSignalServer();
   startDiscovery();
-  win = createWindow('host.html', { title: 'P2P Remote LAN - macOS Host', frame: true });
 }
 
 async function startClient() {
@@ -400,9 +423,11 @@ async function startClient() {
 }
 
 async function startDashboard() {
+  signalRendererReady = false;
+  pendingSignalMessages.length = 0;
+  win = createWindow('dashboard.html', { title: 'P2P Remote LAN' });
   startSignalServer();
   startDiscovery();
-  win = createWindow('dashboard.html', { title: 'P2P Remote LAN' });
 }
 
 ipcMain.handle('host-info', () => {
@@ -521,6 +546,12 @@ ipcMain.on('input-event', async (_event, event) => {
       message: `input injection failed: ${err && err.message ? err.message : String(err)}`,
     });
   }
+});
+
+
+ipcMain.on('host-renderer-ready', () => {
+  markSignalRendererReady();
+  sendToMainWindow('host-log', { level: 'debug', message: 'host renderer ready' });
 });
 
 app.whenReady().then(async () => {

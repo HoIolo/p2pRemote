@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('lanRemote', {
   getScreenCaptureStatus: () => ipcRenderer.invoke('screen-capture-status'),
   openScreenCaptureSettings: () => ipcRenderer.invoke('open-screen-capture-settings'),
   resetScreenCapturePermission: () => ipcRenderer.invoke('reset-screen-capture-permission'),
+  hostRendererReady: () => ipcRenderer.send('host-renderer-ready'),
   sendSignal: (payload) => ipcRenderer.send('signal-send', payload),
   sendInput: (payload) => ipcRenderer.send('input-event', payload),
   onSignalMessage: (callback) => ipcRenderer.on('signal-message', (_event, payload) => callback(payload)),

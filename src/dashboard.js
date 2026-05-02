@@ -317,4 +317,5 @@ window.lanRemote.onClientDisconnected(({ clientId }) => {
 window.lanRemote.onHostLog((entry) => log(`${entry.level || 'info'}: ${entry.message}`));
 
 wireWindowControls();
+window.lanRemote.hostRendererReady?.();
 initApp().catch((err) => log(`init failed: ${err.stack || err.message}`));
