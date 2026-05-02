@@ -1,4 +1,4 @@
-﻿// swift-tools-version: 5.9
+// swift-tools-version: 5.9
 import PackageDescription
 
 let package = Package(
@@ -11,6 +11,9 @@ let package = Package(
         .executableTarget(
             name: "MacHost",
             path: "Sources/MacHost",
+            swiftSettings: [
+                .unsafeFlags(["-parse-as-library"])
+            ],
             linkerSettings: [
                 .linkedFramework("ScreenCaptureKit"),
                 .linkedFramework("VideoToolbox"),

@@ -1,4 +1,4 @@
-﻿import Foundation
+import Foundation
 import VideoToolbox
 import CoreMedia
 import CoreVideo
@@ -124,7 +124,7 @@ final class H264LowLatencyEncoder {
             offset += 4
             if nalLength <= 0 || offset + nalLength > totalLength { break }
             out.append(contentsOf: [0, 0, 0, 1])
-            out.append(UnsafeRawBufferPointer(start: dataPointer + offset, count: nalLength))
+            out.append(contentsOf: UnsafeRawBufferPointer(start: dataPointer + offset, count: nalLength))
             offset += nalLength
         }
 

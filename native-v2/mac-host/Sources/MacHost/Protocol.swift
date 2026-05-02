@@ -1,4 +1,4 @@
-﻿import Foundation
+import Foundation
 import Darwin
 
 let p2VideoHeaderBytes = 36
@@ -42,15 +42,15 @@ extension Data {
     mutating func appendU8(_ value: UInt8) { append(value) }
     mutating func appendU16LE(_ value: UInt16) {
         var v = value.littleEndian
-        withUnsafeBytes(of: &v) { append(contentsOf: $0) }
+        Swift.withUnsafeBytes(of: &v) { append(contentsOf: $0) }
     }
     mutating func appendU32LE(_ value: UInt32) {
         var v = value.littleEndian
-        withUnsafeBytes(of: &v) { append(contentsOf: $0) }
+        Swift.withUnsafeBytes(of: &v) { append(contentsOf: $0) }
     }
     mutating func appendU64LE(_ value: UInt64) {
         var v = value.littleEndian
-        withUnsafeBytes(of: &v) { append(contentsOf: $0) }
+        Swift.withUnsafeBytes(of: &v) { append(contentsOf: $0) }
     }
 }
 

@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env bash
+#!/usr/bin/env bash
 set -euo pipefail
 CLIENT_IP="${CLIENT_IP:-192.168.1.50}"
 WIDTH="${WIDTH:-1920}"
