@@ -6,3 +6,5 @@ dist/
 native-v2/mac-host/.build/
 native-v2/win-client/build/
 native-v2/dist/
+
+.playwright-cli/
