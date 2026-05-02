@@ -25,14 +25,11 @@ app.commandLine.appendSwitch('disable-background-timer-throttling');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns');
 
-const isPackagedOnMac = app.isPackaged && process.platform === 'darwin';
-
 function resolveRole() {
   if (process.argv.includes('--host')) return 'host';
   if (process.argv.includes('--client')) return 'client';
   if (process.env.P2P_REMOTE_ROLE === 'host') return 'host';
   if (process.env.P2P_REMOTE_ROLE === 'client') return 'client';
-  if (isPackagedOnMac) return 'host';
 
   return 'dashboard';
 }
