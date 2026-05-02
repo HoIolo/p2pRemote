@@ -22,6 +22,7 @@ let selectedId = null;
 let localStream = null;
 let nativeV2Status = null;
 let appInfo = null;
+let nativeV2Connecting = false;
 const peers = new Map();
 
 function iconSvg(name, className = 'icon') {
@@ -31,6 +32,30 @@ function iconSvg(name, className = 'icon') {
 function log(message) {
   const line = `[${new Date().toLocaleTimeString()}] ${message}`;
   logEl.textContent = `${line}\n${logEl.textContent}`;
+}
+
+function setNativeV2StatusText(message) {
+  if (nativeV2StatusTextEl) nativeV2StatusTextEl.textContent = message;
+}
+
+function friendlyNativeV2Error(err, device) {
+  const raw = err?.message || String(err || 'Unknown error');
+  if (raw.includes('timed out') || raw.includes('closed before response')) {
+    return [
+      `Mac 端没有响应 Native v2 启动请求（${device?.address || 'unknown'}:7777）。`,
+      '请确认 Mac 上运行的是最新版本 App，并且 Mac 端已执行 npm run v2:mac:build；否则先切回“稳定 WebRTC”。',
+    ].join(' ');
+  }
+  if (raw.includes('还没有构建') || raw.includes('not built')) return raw;
+  if (raw.includes('bad pin')) return 'PIN 校验失败，请刷新设备后重试。';
+  return raw.replace(/^Error invoking remote method '[^']+': Error:\s*/i, '');
+}
+
+function setNativeV2Busy(busy, message) {
+  nativeV2Connecting = busy;
+  if (message) setNativeV2StatusText(message);
+  document.body.classList.toggle('nativeV2Connecting', busy);
+  renderDevices();
 }
 
 function platformIcon(platform) {
@@ -72,6 +97,7 @@ function connectionMode() {
 
 function updateNativeV2Status(status) {
   nativeV2Status = status || nativeV2Status;
+  if (nativeV2Connecting) return;
   if (!nativeV2StatusTextEl || !nativeV2Status) return;
 
   const isWindows = nativeV2Status.platform === 'win32';
@@ -173,13 +199,13 @@ function renderDevices() {
   selectedStatusEl.textContent = selected ? '在线' : '等待设备';
   selectedStatusEl.className = selected ? 'pill online' : 'pill muted';
   previewImageEl.src = selected ? (selected.preview || defaultPreview(selected.platform)) : defaultPreview('win32');
-  enterDesktopBtn.disabled = !selected;
-  connectSelectedBtn.disabled = !selected;
+  enterDesktopBtn.disabled = !selected || nativeV2Connecting;
+  connectSelectedBtn.disabled = !selected || nativeV2Connecting;
   const actionLabel = connectionMode() === 'native-v2' ? 'Native v2 极限' : '远程桌面';
   const enterText = enterDesktopBtn.querySelector('span');
   const connectText = connectSelectedBtn.querySelector('span');
-  if (enterText) enterText.textContent = selected ? actionLabel : '进入桌面';
-  if (connectText) connectText.textContent = actionLabel;
+  if (enterText) enterText.textContent = nativeV2Connecting ? '正在启动...' : (selected ? actionLabel : '进入桌面');
+  if (connectText) connectText.textContent = nativeV2Connecting ? '正在启动...' : actionLabel;
 
   for (const item of deviceListEl.querySelectorAll('.sideItem[data-id]')) {
     item.addEventListener('click', () => {
@@ -205,26 +231,34 @@ async function openSelected() {
 }
 
 async function openNativeV2Device(device) {
+  if (nativeV2Connecting) {
+    log('native-v2 start ignored: already connecting');
+    return;
+  }
+  setNativeV2Busy(true, `正在启动 Native v2：请求 ${device.address} 准备视频流...`);
   try {
     await refreshNativeV2Status();
     if (nativeV2Status?.platform === 'win32') {
       if (!nativeV2Status?.winClient?.available) {
         const message = 'Native v2 Windows 客户端还没构建。请先执行 npm run v2:win:build；现在可切回“稳定 WebRTC”。';
         log(message);
-        window.alert(message);
+        setNativeV2StatusText(message);
         return;
       }
       const options = nativeV2ClientOptions(device);
       const hostOptions = nativeV2HostOptions(device);
       if (device.pin && device.port) {
+        setNativeV2StatusText(`正在请求 Mac 启动 Native v2 Host：${device.address}:${device.port}`);
         log(`requesting Mac native-v2 host ${device.address}:${device.port} -> client ${hostOptions.clientIp}:${hostOptions.videoPort}`);
         await window.lanRemote.requestNativeV2RemoteHost(device, hostOptions);
         log('Mac native-v2 host accepted start request');
       } else {
         log(`manual native-v2: 请先在 Mac 端启动 Host：\n${nativeV2MacHostCommand(device)}`);
       }
+      setNativeV2StatusText('Mac 已准备好，正在启动 Windows Native v2 客户端...');
       const result = await window.lanRemote.startNativeV2Client(options);
       log(`native-v2 client started pid=${result.pid}; host=${options.hostIp}:${options.videoPort}; ${options.width}x${options.height}@${options.fps}`);
+      setNativeV2StatusText(`Native v2 客户端已启动，pid=${result.pid}`);
       return;
     }
 
@@ -232,20 +266,26 @@ async function openNativeV2Device(device) {
       if (!nativeV2Status?.macHost?.available) {
         const message = 'Native v2 macOS Host 还没构建。请先在 Mac 上执行 npm run v2:mac:build；现在可继续使用 WebRTC。';
         log(message);
-        window.alert(message);
+        setNativeV2StatusText(message);
         return;
       }
       const options = nativeV2HostOptions(device);
+      setNativeV2StatusText(`正在启动 macOS Native v2 Host，等待 Windows 客户端 ${options.clientIp}...`);
       const result = await window.lanRemote.startNativeV2Host(options);
       log(`native-v2 host started pid=${result.pid}; client=${options.clientIp}:${options.videoPort}; ${options.width}x${options.height}@${options.fps}`);
+      setNativeV2StatusText(`macOS Native v2 Host 已启动，pid=${result.pid}`);
       return;
     }
 
-    log('Native v2 当前仅支持 Windows 控制端和 macOS Host。');
-    window.alert('Native v2 当前仅支持 Windows 控制端和 macOS Host。');
+    const message = 'Native v2 当前仅支持 Windows 控制端和 macOS Host。';
+    log(message);
+    setNativeV2StatusText(message);
   } catch (err) {
-    log(`native-v2 start failed: ${err.message}`);
-    window.alert(`Native v2 启动失败：${err.message}`);
+    const message = friendlyNativeV2Error(err, device);
+    log(`native-v2 start failed: ${message}`);
+    setNativeV2StatusText(`Native v2 启动失败：${message}`);
+  } finally {
+    setNativeV2Busy(false);
   }
 }
 

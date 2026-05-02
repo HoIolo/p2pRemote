@@ -258,25 +258,25 @@ body[data-platform="win32"] .topbar { padding-right: 154px; }
   line-height: 1;
   letter-spacing: 0;
 }
-.modeSwitch {
+.sideSetting {
   -webkit-app-region: no-drag;
-  display: inline-flex;
-  align-items: center;
-  gap: 9px;
-  height: 36px;
-  padding: 0 10px;
-  border-radius: 10px;
-  background: #eeeeec;
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, .08);
+  background: rgba(255, 255, 255, .52);
   color: #4b4f53;
   font-size: 13px;
   font-weight: 800;
 }
-.modeSwitch select {
+.sideSetting select {
   -webkit-app-region: no-drag;
-  border: 0;
+  width: 100%;
+  border: 1px solid rgba(0, 0, 0, .08);
   outline: 0;
   border-radius: 8px;
-  padding: 5px 26px 5px 8px;
+  padding: 8px 10px;
   background: #fff;
   color: #1f2937;
   font-weight: 800;
@@ -438,6 +438,17 @@ body[data-platform="win32"] .topbar { padding-right: 154px; }
   color: #5b6270;
   line-height: 1.45;
 }
+body.nativeV2Connecting .nativeHint span::after {
+  content: "";
+  display: inline-block;
+  width: 9px;
+  height: 9px;
+  margin-left: 8px;
+  border-radius: 50%;
+  border: 2px solid #9ca3af;
+  border-top-color: #2563eb;
+  animation: spin .8s linear infinite;
+}
 .nativeHint code {
   width: fit-content;
   max-width: 100%;
@@ -449,6 +460,7 @@ body[data-platform="win32"] .topbar { padding-right: 154px; }
   color: #374151;
   font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
+@keyframes spin { to { transform: rotate(360deg); } }
 .diagnostics {
   margin-top: 22px;
   color: #555;
@@ -618,5 +630,4 @@ body.fullscreenMode[data-platform="win32"] .settingsMenu {
   .content { padding: 28px 18px; }
   .quickGrid { grid-template-columns: 1fr; justify-items: center; text-align: center; }
   .nativeHint { justify-items: center; }
-  .modeSwitch span { display: none; }
 }
