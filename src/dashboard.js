@@ -24,6 +24,7 @@ let nativeV2Status = null;
 let appInfo = null;
 let nativeV2Connecting = false;
 const peers = new Map();
+const pendingPeerCandidates = new Map();
 
 function iconSvg(name, className = 'icon') {
   return `<svg class="${className}" aria-hidden="true"><use href="assets/icons.svg#${name}"></use></svg>`;
@@ -379,6 +380,7 @@ async function startCapture() {
       localStream = null;
       for (const peer of peers.values()) peer.close();
       peers.clear();
+      pendingPeerCandidates.clear();
     });
   }
   log('local screen capture started');
@@ -440,6 +442,34 @@ function makeHostPeer(clientId) {
 
   peers.set(clientId, pc);
   return pc;
+}
+
+async function addPeerCandidate(clientId, pc, candidate) {
+  if (!candidate) return;
+  if (!pc || !pc.remoteDescription) {
+    const pending = pendingPeerCandidates.get(clientId) || [];
+    pending.push(candidate);
+    pendingPeerCandidates.set(clientId, pending);
+    log(`queued ICE candidate from ${clientId.slice(0, 8)} (${pending.length}) until peer/offer is ready`);
+    return;
+  }
+  try {
+    await pc.addIceCandidate(candidate);
+    log(`ICE candidate applied from ${clientId.slice(0, 8)}`);
+  } catch (err) {
+    log(`addIceCandidate failed from ${clientId.slice(0, 8)}: ${err.message}`);
+  }
+}
+
+async function flushPeerCandidates(clientId, pc) {
+  if (!pc?.remoteDescription) return;
+  const pending = pendingPeerCandidates.get(clientId) || [];
+  if (!pending.length) return;
+  pendingPeerCandidates.delete(clientId);
+  log(`applying ${pending.length} queued ICE candidates from ${clientId.slice(0, 8)}`);
+  for (const candidate of pending) {
+    await addPeerCandidate(clientId, pc, candidate);
+  }
 }
 
 function ensureVideoSender(pc) {
@@ -517,6 +547,7 @@ async function handleSignal({ clientId, message }) {
       pc = makeHostPeer(clientId);
 
       await pc.setRemoteDescription(message.sdp);
+      await flushPeerCandidates(clientId, pc);
       const videoTransceiver = ensureVideoSender(pc);
       const placeholderTrack = createPlaceholderTrack();
       if (placeholderTrack) await videoTransceiver.sender.replaceTrack(placeholderTrack);
@@ -539,12 +570,8 @@ async function handleSignal({ clientId, message }) {
     return;
   }
 
-  if (message.type === 'candidate' && pc && message.candidate) {
-    try {
-      await pc.addIceCandidate(message.candidate);
-    } catch (err) {
-      log(`addIceCandidate failed: ${err.message}`);
-    }
+  if (message.type === 'candidate' && message.candidate) {
+    await addPeerCandidate(clientId, pc, message.candidate);
   }
 }
 
@@ -608,6 +635,7 @@ window.lanRemote.onClientDisconnected(({ clientId }) => {
   const pc = peers.get(clientId);
   if (pc) pc.close();
   peers.delete(clientId);
+  pendingPeerCandidates.delete(clientId);
   log(`incoming disconnected: ${clientId.slice(0, 8)}`);
 });
 window.lanRemote.onHostLog((entry) => log(`${entry.level || 'info'}: ${entry.message}`));

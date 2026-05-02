@@ -33,6 +33,7 @@ let topbarRevealTimer = 0;
 let answerTimer = 0;
 let offerSentAt = 0;
 let lastHostProgress = '';
+let pendingRemoteCandidates = [];
 
 function log(message) {
   const line = `[${new Date().toLocaleTimeString()}] ${message}`;
@@ -188,6 +189,7 @@ function cleanupConnection() {
   if (moveRaf) cancelAnimationFrame(moveRaf);
   moveRaf = 0;
   pendingMove = null;
+  pendingRemoteCandidates = [];
   pressedKeys.clear();
   pointerDown = false;
   try {
@@ -214,6 +216,7 @@ function cleanupConnection() {
 
 function makePeer() {
   sawRemoteTrack = false;
+  pendingRemoteCandidates = [];
   pc = new RTCPeerConnection({
     iceServers: [],
     bundlePolicy: 'max-bundle',
@@ -265,6 +268,30 @@ function makePeer() {
   pc.oniceconnectionstatechange = () => log(`ice=${pc.iceConnectionState} gathering=${pc.iceGatheringState}`);
   pc.onicegatheringstatechange = () => log(`iceGathering=${pc.iceGatheringState}`);
   pc.onsignalingstatechange = () => log(`signaling=${pc.signalingState}`);
+}
+
+async function addRemoteCandidate(candidate) {
+  if (!pc || !candidate) return;
+  if (!pc.remoteDescription) {
+    pendingRemoteCandidates.push(candidate);
+    log(`queued remote ICE candidate (${pendingRemoteCandidates.length}) until answer is applied`);
+    return;
+  }
+  try {
+    await pc.addIceCandidate(candidate);
+    log('remote ICE candidate applied');
+  } catch (err) {
+    log(`addIceCandidate failed: ${err.message}`);
+  }
+}
+
+async function flushRemoteCandidates() {
+  if (!pc?.remoteDescription || pendingRemoteCandidates.length === 0) return;
+  const candidates = pendingRemoteCandidates.splice(0);
+  log(`applying ${candidates.length} queued ICE candidates`);
+  for (const candidate of candidates) {
+    await addRemoteCandidate(candidate);
+  }
 }
 
 function saveFirstFrame() {
@@ -340,6 +367,7 @@ async function connect() {
       await pc.setRemoteDescription(message.sdp);
       overlay.textContent = '\u5df2\u5b8c\u6210\u534f\u5546\uff0c\u7b49\u5f85\u89c6\u9891\u5e27';
       log('answer applied');
+      await flushRemoteCandidates();
       return;
     }
     if (message.type === 'progress') {
@@ -347,11 +375,7 @@ async function connect() {
       return;
     }
     if (message.type === 'candidate' && message.candidate) {
-      try {
-        await pc.addIceCandidate(message.candidate);
-      } catch (err) {
-        log(`addIceCandidate failed: ${err.message}`);
-      }
+      await addRemoteCandidate(message.candidate);
       return;
     }
     if (message.type === 'error') {
