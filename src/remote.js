@@ -32,6 +32,7 @@ let topbarHideTimer = 0;
 let topbarRevealTimer = 0;
 let answerTimer = 0;
 let offerSentAt = 0;
+let lastHostProgress = '';
 
 function log(message) {
   const line = `[${new Date().toLocaleTimeString()}] ${message}`;
@@ -55,11 +56,21 @@ function armAnswerTimer() {
   answerTimer = setTimeout(() => {
     if (pc?.remoteDescription || isClosing) return;
     const elapsed = offerSentAt ? Math.round((performance.now() - offerSentAt) / 1000) : 10;
-    setStatus('warn', '\u7b49\u5f85\u8fdc\u7a0b\u54cd\u5e94');
+    setStatus('warn', '等待 Mac 响应');
     overlay.style.display = 'grid';
-    overlay.textContent = `\u5df2\u53d1\u9001 offer ${elapsed}s\uff0c\u4ecd\u672a\u6536\u5230 answer\u3002\u8bf7\u5728 Mac \u7aef\u67e5\u770b\u65e5\u5fd7\uff1a\u662f\u5426\u6536\u5230 offer / \u662f\u5426\u5c4f\u5e55\u5f55\u5236\u6743\u9650\u88ab\u62d2\u7edd\u3002`;
-    log('answer timeout: no answer from host after offer');
+    overlay.textContent = lastHostProgress
+      ? `Mac 进度：${lastHostProgress}。已等待 ${elapsed}s，仍未收到 answer。`
+      : `已发送 offer ${elapsed}s，但 Mac 没有返回 answer。请确认 Mac 端是最新版本，并查看 Mac 日志是否收到 offer。`;
+    log(`answer timeout: no answer from host after offer; lastHostProgress=${lastHostProgress || 'none'}`);
   }, 10000);
+}
+
+function updateHostProgress(message) {
+  lastHostProgress = message.detail || message.stage || 'Mac is processing request';
+  setStatus('warn', 'Mac 正在准备');
+  overlay.style.display = 'grid';
+  overlay.textContent = `Mac 端：${lastHostProgress}`;
+  log(`host progress ${message.stage || ''}: ${message.detail || ''}`.trim());
 }
 
 function applyLogVisibility() {
@@ -227,7 +238,7 @@ function makePeer() {
     overlay.textContent = '\u5df2\u6536\u5230\u89c6\u9891\u8f68\u9053\uff0c\u7b49\u5f85\u7b2c\u4e00\u5e27';
     const playPromise = video.play();
     if (playPromise) playPromise.catch((err) => log(`video play skipped: ${err.message}`));
-    log(`remote track: ${event.track.kind}`);
+    log(`remote track: ${event.track.kind} muted=${event.track.muted} state=${event.track.readyState} streams=${event.streams.length}`);
     event.track.onunmute = () => {
       overlay.style.display = 'none';
       log('remote video unmuted');
@@ -251,7 +262,9 @@ function makePeer() {
       overlay.textContent = `\u8fde\u63a5\u72b6\u6001\uff1a${pc.connectionState}`;
     }
   };
-  pc.oniceconnectionstatechange = () => log(`ice=${pc.iceConnectionState}`);
+  pc.oniceconnectionstatechange = () => log(`ice=${pc.iceConnectionState} gathering=${pc.iceGatheringState}`);
+  pc.onicegatheringstatechange = () => log(`iceGathering=${pc.iceGatheringState}`);
+  pc.onsignalingstatechange = () => log(`signaling=${pc.signalingState}`);
 }
 
 function saveFirstFrame() {
@@ -273,6 +286,7 @@ function saveFirstFrame() {
 }
 
 async function createOffer() {
+  lastHostProgress = '';
   const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: false });
   await pc.setLocalDescription(offer);
   sendSignal({ type: 'offer', sdp: pc.localDescription });
@@ -307,7 +321,14 @@ async function connect() {
   };
   ws.onmessage = async (event) => {
     if (isClosing || !pc) return;
-    const message = JSON.parse(event.data);
+    let message;
+    try {
+      message = JSON.parse(event.data);
+    } catch (err) {
+      log(`bad signal json: ${err.message}`);
+      return;
+    }
+    log(`signal received: ${message.type || 'unknown'}`);
     if (message.type === 'hello-ok') {
       setStatus('warn', '协商媒体');
       log(`paired as ${message.clientId.slice(0, 8)}`);
@@ -319,6 +340,10 @@ async function connect() {
       await pc.setRemoteDescription(message.sdp);
       overlay.textContent = '\u5df2\u5b8c\u6210\u534f\u5546\uff0c\u7b49\u5f85\u89c6\u9891\u5e27';
       log('answer applied');
+      return;
+    }
+    if (message.type === 'progress') {
+      updateHostProgress(message);
       return;
     }
     if (message.type === 'candidate' && message.candidate) {

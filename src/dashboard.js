@@ -328,6 +328,26 @@ async function waitForLiveTrack(track, timeoutMs = 1500) {
   });
 }
 
+function withTimeout(promise, timeoutMs, message) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
+function sendSignalProgress(clientId, stage, detail = '') {
+  window.lanRemote.sendSignal({
+    clientId,
+    message: {
+      type: 'progress',
+      stage,
+      detail,
+      ts: Date.now(),
+    },
+  });
+}
+
 async function tuneCaptureTrack(track) {
   try {
     await track.applyConstraints({ frameRate: { ideal: 60 } });
@@ -338,7 +358,11 @@ async function tuneCaptureTrack(track) {
 
 async function startCapture() {
   if (localStream) return localStream;
-  localStream = await navigator.mediaDevices.getDisplayMedia({ audio: false, video: true });
+  localStream = await withTimeout(
+    navigator.mediaDevices.getDisplayMedia({ audio: false, video: true }),
+    8000,
+    'Mac screen capture did not start within 8s; check Screen Recording permission and restart the Mac app',
+  );
   const tracks = localStream.getVideoTracks();
   if (tracks.length === 0) throw new Error('No screen video track returned');
 
@@ -402,6 +426,7 @@ function makeHostPeer(clientId) {
   };
   pc.onconnectionstatechange = () => log(`incoming ${clientId.slice(0, 8)} state=${pc.connectionState}`);
   pc.oniceconnectionstatechange = () => log(`incoming ${clientId.slice(0, 8)} ice=${pc.iceConnectionState}`);
+  pc.onnegotiationneeded = () => log(`incoming ${clientId.slice(0, 8)} negotiationneeded`);
   pc.ondatachannel = (event) => {
     const channel = event.channel;
     channel.onmessage = (msg) => {
@@ -417,29 +442,96 @@ function makeHostPeer(clientId) {
   return pc;
 }
 
+function ensureVideoSender(pc) {
+  let transceiver = pc.getTransceivers().find((item) => (
+    item.receiver?.track?.kind === 'video' || item.sender?.track?.kind === 'video'
+  ));
+  if (!transceiver) transceiver = pc.addTransceiver('video', { direction: 'sendonly' });
+  try {
+    transceiver.direction = 'sendonly';
+  } catch (err) {
+    log(`set video transceiver direction skipped: ${err.message}`);
+  }
+  return transceiver;
+}
+
+function createPlaceholderTrack() {
+  const canvas = document.createElement('canvas');
+  canvas.width = 1280;
+  canvas.height = 720;
+  const ctx = canvas.getContext('2d');
+  const draw = () => {
+    ctx.fillStyle = '#0f172a';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = '#93c5fd';
+    ctx.font = '600 42px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('P2P Remote LAN', canvas.width / 2, canvas.height / 2 - 20);
+    ctx.fillStyle = '#e5e7eb';
+    ctx.font = '28px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
+    ctx.fillText('Mac 正在准备屏幕画面...', canvas.width / 2, canvas.height / 2 + 32);
+  };
+  draw();
+  const timer = setInterval(draw, 1000);
+  const stream = canvas.captureStream?.(2);
+  const track = stream?.getVideoTracks?.()[0] || null;
+  if (track) {
+    track.contentHint = 'detail';
+    track._p2pCleanup = () => clearInterval(timer);
+  } else {
+    clearInterval(timer);
+  }
+  return track;
+}
+
+function cleanupTrack(track) {
+  try {
+    track?._p2pCleanup?.();
+    track?.stop?.();
+  } catch {}
+}
+
+async function attachScreenStream(pc, stream, videoTransceiver) {
+  for (const track of stream.getTracks()) {
+    if (track.kind === 'video' && videoTransceiver?.sender) {
+      const previousTrack = videoTransceiver.sender.track;
+      await videoTransceiver.sender.replaceTrack(track);
+      if (previousTrack && previousTrack !== track) cleanupTrack(previousTrack);
+      await tuneSender(videoTransceiver.sender);
+      continue;
+    }
+    const sender = pc.addTrack(track, stream);
+    if (track.kind === 'video') await tuneSender(sender);
+  }
+}
+
 async function handleSignal({ clientId, message }) {
   if (!message?.type) return;
   let pc = peers.get(clientId);
 
   if (message.type === 'offer') {
     try {
-      const stream = await startCapture();
+      log(`offer received from ${clientId.slice(0, 8)}; starting capture`);
+      sendSignalProgress(clientId, 'offer-received', 'Mac received offer, preparing WebRTC answer');
       if (pc) pc.close();
       pc = makeHostPeer(clientId);
 
-      for (const track of stream.getTracks()) {
-        const sender = pc.addTrack(track, stream);
-        if (track.kind === 'video') {
-          preferH264(pc, sender);
-          await tuneSender(sender);
-        }
-      }
-
       await pc.setRemoteDescription(message.sdp);
+      const videoTransceiver = ensureVideoSender(pc);
+      const placeholderTrack = createPlaceholderTrack();
+      if (placeholderTrack) await videoTransceiver.sender.replaceTrack(placeholderTrack);
+      preferH264(pc, videoTransceiver.sender);
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       window.lanRemote.sendSignal({ clientId, message: { type: 'answer', sdp: pc.localDescription } });
+      sendSignalProgress(clientId, 'answer-sent', 'Mac sent WebRTC answer');
       log(`answered remote desktop request from ${clientId.slice(0, 8)}`);
+
+      sendSignalProgress(clientId, 'capture-starting', 'Mac is starting screen capture');
+      const stream = await startCapture();
+      sendSignalProgress(clientId, 'capture-ready', 'Mac screen capture is ready');
+      await attachScreenStream(pc, stream, videoTransceiver);
+      log(`screen stream attached for ${clientId.slice(0, 8)}`);
     } catch (err) {
       window.lanRemote.sendSignal({ clientId, message: { type: 'error', error: err.message } });
       log(`screen share failed: ${err.message}`);
