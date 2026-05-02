@@ -1,0 +1,45 @@
+﻿<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>P2P Remote LAN - Host</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <main class="shell">
+    <section class="header">
+      <div>
+        <h1 class="title">Mac 主机端</h1>
+        <p class="subtitle">按一次“开始共享屏幕”，Windows 客户端用 IP + PIN 连接。</p>
+      </div>
+      <div class="status"><span id="statusDot" class="dot warn"></span><span id="statusText">等待共享</span></div>
+    </section>
+
+    <section class="grid">
+      <div class="card">
+        <div class="row" style="justify-content: space-between; margin-bottom: 14px;">
+          <div>
+            <div class="small">配对 PIN</div>
+            <div id="pin" class="pin">------</div>
+          </div>
+          <button id="startShare">开始共享屏幕</button>
+        </div>
+        <div class="kv">
+          <b>监听端口</b><span id="port" class="code">-</span>
+          <b>局域网 IP</b><span id="addresses">-</span>
+          <b>主屏范围</b><span id="display" class="code">-</span>
+          <b>连接状态</b><span id="peerState">未连接</span>
+        </div>
+        <p class="small" style="margin-top: 14px;">macOS 需要给本应用开启 Screen Recording 和 Accessibility 权限；本 MVP 默认把输入映射到主屏，请在系统弹窗里选择主屏幕。</p>
+      </div>
+
+      <div class="card">
+        <h3 style="margin-top: 0;">事件日志</h3>
+        <pre id="log" class="log"></pre>
+      </div>
+    </section>
+  </main>
+  <script src="host.js"></script>
+</body>
+</html>
