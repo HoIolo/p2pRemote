@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>P2P Remote LAN - Remote</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body class="remoteBody">
+  <main class="remoteShell">
+    <header class="remoteTopbar">
+      <div class="remoteTitle">
+        <span id="statusDot" class="dot"></span>
+        <strong id="remoteName">远程设备</strong>
+        <span id="statusText">连接中</span>
+      </div>
+      <div class="remoteActions">
+        <button id="reconnect" class="secondary">重连</button>
+        <button id="fullscreen" class="secondary">全屏</button>
+      </div>
+    </header>
+
+    <section class="remoteStage">
+      <video id="remoteVideo" autoplay playsinline muted tabindex="0"></video>
+      <div id="overlay" class="remoteOverlay">正在连接视频流</div>
+    </section>
+
+    <pre id="log" class="remoteLog"></pre>
+  </main>
+  <script src="remote.js"></script>
+</body>
+</html>

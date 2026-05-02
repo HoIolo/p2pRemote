@@ -1,4 +1,4 @@
-﻿<!doctype html>
+<!doctype html>
 <html lang="zh-CN">
 <head>
   <meta charset="UTF-8" />
@@ -23,7 +23,11 @@
             <div class="small">配对 PIN</div>
             <div id="pin" class="pin">------</div>
           </div>
-          <button id="startShare">开始共享屏幕</button>
+          <div class="row">
+            <button id="openScreenSettings" class="secondary" title="打开 macOS 屏幕录制权限设置">权限设置</button>
+            <button id="resetScreenPermission" class="secondary" title="清除旧包留下的屏幕录制权限记录">重置权限</button>
+            <button id="startShare">开始共享屏幕</button>
+          </div>
         </div>
         <div class="kv">
           <b>监听端口</b><span id="port" class="code">-</span>
@@ -31,7 +35,7 @@
           <b>主屏范围</b><span id="display" class="code">-</span>
           <b>连接状态</b><span id="peerState">未连接</span>
         </div>
-        <p class="small" style="margin-top: 14px;">macOS 需要给本应用开启 Screen Recording 和 Accessibility 权限；本 MVP 默认把输入映射到主屏，请在系统弹窗里选择主屏幕。</p>
+        <p class="small" style="margin-top: 14px;">macOS 需要给本应用开启 Screen Recording 和 Accessibility 权限；如果刚打开权限，请完全退出本应用后再重新打开。</p>
       </div>
 
       <div class="card">

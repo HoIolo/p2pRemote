@@ -1,0 +1,83 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="tile" x1="126" y1="94" x2="884" y2="932" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#18D5FF"/>
+      <stop offset="0.32" stop-color="#2563EB"/>
+      <stop offset="0.62" stop-color="#8B5CF6"/>
+      <stop offset="0.83" stop-color="#EC4899"/>
+      <stop offset="1" stop-color="#F97316"/>
+    </linearGradient>
+    <linearGradient id="tileSheen" x1="214" y1="128" x2="798" y2="898" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FFFFFF" stop-opacity="0.72"/>
+      <stop offset="0.45" stop-color="#FFFFFF" stop-opacity="0.16"/>
+      <stop offset="1" stop-color="#FFFFFF" stop-opacity="0"/>
+    </linearGradient>
+    <linearGradient id="screen" x1="230" y1="258" x2="797" y2="648" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#062A72"/>
+      <stop offset="0.46" stop-color="#1243D7"/>
+      <stop offset="1" stop-color="#111827"/>
+    </linearGradient>
+    <linearGradient id="screenRim" x1="236" y1="250" x2="790" y2="646" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#BFF6FF"/>
+      <stop offset="0.48" stop-color="#67E8F9"/>
+      <stop offset="1" stop-color="#F9A8D4"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="318" y1="444" x2="718" y2="444" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#FDE68A"/>
+      <stop offset="0.38" stop-color="#67E8F9"/>
+      <stop offset="0.72" stop-color="#C084FC"/>
+      <stop offset="1" stop-color="#FB7185"/>
+    </linearGradient>
+    <linearGradient id="stand" x1="340" y1="675" x2="700" y2="802" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#7DD3FC"/>
+      <stop offset="0.5" stop-color="#6366F1"/>
+      <stop offset="1" stop-color="#DB2777"/>
+    </linearGradient>
+    <filter id="tileShadow" x="50" y="64" width="924" height="930" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="38" stdDeviation="44" flood-color="#1E1B4B" flood-opacity="0.28"/>
+      <feDropShadow dx="0" dy="10" stdDeviation="16" flood-color="#020617" flood-opacity="0.18"/>
+    </filter>
+    <filter id="screenShadow" x="150" y="190" width="745" height="660" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="34" stdDeviation="34" flood-color="#0F172A" flood-opacity="0.36"/>
+      <feDropShadow dx="0" dy="8" stdDeviation="12" flood-color="#020617" flood-opacity="0.24"/>
+    </filter>
+    <filter id="cursorShadow" x="548" y="462" width="268" height="326" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="13" dy="18" stdDeviation="10" flood-color="#020617" flood-opacity="0.32"/>
+    </filter>
+    <clipPath id="tileClip">
+      <rect x="96" y="96" width="832" height="832" rx="218"/>
+    </clipPath>
+  </defs>
+
+  <g filter="url(#tileShadow)">
+    <rect x="96" y="96" width="832" height="832" rx="218" fill="url(#tile)"/>
+    <g clip-path="url(#tileClip)">
+      <circle cx="248" cy="214" r="198" fill="#FFFFFF" opacity="0.26"/>
+      <circle cx="862" cy="760" r="274" fill="#00E5FF" opacity="0.16"/>
+      <circle cx="170" cy="790" r="230" fill="#5B21B6" opacity="0.28"/>
+      <path d="M74 520C222 418 334 392 488 462C646 534 762 482 956 334V96H74V520Z" fill="#FFFFFF" opacity="0.13"/>
+      <path d="M104 822C280 612 486 606 646 706C756 776 838 786 970 704V928H104V822Z" fill="#020617" opacity="0.16"/>
+      <rect x="110" y="110" width="804" height="804" rx="205" stroke="url(#tileSheen)" stroke-width="18"/>
+    </g>
+  </g>
+
+  <g filter="url(#screenShadow)">
+    <rect x="204" y="244" width="616" height="410" rx="92" fill="url(#screen)"/>
+    <rect x="231" y="271" width="562" height="356" rx="68" stroke="url(#screenRim)" stroke-width="16"/>
+    <path d="M257 350C348 274 472 286 578 342C666 388 728 366 793 306V285C793 277 787 271 779 271H310C281 271 257 295 257 324V350Z" fill="#FFFFFF" opacity="0.24"/>
+    <path d="M424 650L382 756" stroke="url(#stand)" stroke-width="58" stroke-linecap="round"/>
+    <path d="M604 650L646 756" stroke="url(#stand)" stroke-width="58" stroke-linecap="round"/>
+    <rect x="326" y="736" width="374" height="66" rx="33" fill="url(#stand)"/>
+  </g>
+
+  <path d="M328 452H696" stroke="#FFFFFF" stroke-opacity="0.78" stroke-width="27" stroke-linecap="round"/>
+  <path d="M328 452C396 386 456 386 520 452C584 518 632 518 696 452" stroke="url(#signal)" stroke-width="24" stroke-linecap="round"/>
+  <circle cx="328" cy="452" r="43" fill="#FFFFFF"/>
+  <circle cx="512" cy="452" r="34" fill="#A7F3D0"/>
+  <circle cx="696" cy="452" r="43" fill="#FFFFFF"/>
+
+  <g filter="url(#cursorShadow)">
+    <path d="M624 510L778 582L713 616L766 716L708 746L656 644L596 700L624 510Z" fill="#FFFFFF"/>
+    <path d="M624 510L778 582L713 616L766 716L708 746L656 644L596 700L624 510Z" stroke="#1E1B4B" stroke-opacity="0.36" stroke-width="10" stroke-linejoin="round"/>
+  </g>
+</svg>

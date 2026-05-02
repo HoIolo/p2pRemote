@@ -1,4 +1,4 @@
-﻿const $ = (id) => document.getElementById(id);
+const $ = (id) => document.getElementById(id);
 
 const pinEl = $('pin');
 const portEl = $('port');
@@ -9,6 +9,8 @@ const statusDot = $('statusDot');
 const statusText = $('statusText');
 const logEl = $('log');
 const startShareBtn = $('startShare');
+const openScreenSettingsBtn = $('openScreenSettings');
+const resetScreenPermissionBtn = $('resetScreenPermission');
 
 let localStream = null;
 const peers = new Map();
@@ -32,6 +34,27 @@ async function initInfo() {
     : '<span class="small">未找到非内网 IPv4 地址</span>';
   displayEl.textContent = `${info.display.x},${info.display.y} ${info.display.width}x${info.display.height} @${info.scaleFactor}x`;
   log(`host ready; port=${info.port}; pin=${info.pin}`);
+
+  if (info.platform === 'darwin') {
+    const status = await window.lanRemote.getScreenCaptureStatus();
+    log(`macOS screen permission=${status}`);
+  }
+}
+
+async function tuneCaptureTrack(track) {
+  try {
+    const maxFps = Number(localStorage.getItem('maxFps') || 60);
+    await track.applyConstraints({ frameRate: { ideal: maxFps } });
+  } catch (err) {
+    log(`capture constraints skipped: ${err.message}`);
+  }
+
+  const settings = track.getSettings?.();
+  if (settings) {
+    const size = settings.width && settings.height ? `${settings.width}x${settings.height}` : 'unknown size';
+    const fps = settings.frameRate ? `@${Math.round(settings.frameRate)}fps` : '';
+    log(`capture settings: ${size}${fps}`);
+  }
 }
 
 async function startCapture() {
@@ -40,21 +63,20 @@ async function startCapture() {
   setStatus('warn', '等待系统屏幕授权');
   localStream = await navigator.mediaDevices.getDisplayMedia({
     audio: false,
-    video: {
-      cursor: 'always',
-      displaySurface: 'monitor',
-      frameRate: { ideal: 60, max: 120 },
-      width: { ideal: 2560 },
-      height: { ideal: 1440 },
-    },
+    video: true,
   });
 
-  for (const track of localStream.getVideoTracks()) {
+  const videoTracks = localStream.getVideoTracks();
+  if (videoTracks.length === 0) throw new Error('No screen video track returned');
+
+  for (const track of videoTracks) {
     track.contentHint = 'motion';
+    await tuneCaptureTrack(track);
     track.addEventListener('ended', () => {
       log('screen capture stopped');
       setStatus('warn', '共享已停止');
       localStream = null;
+      startShareBtn.disabled = false;
       for (const peer of peers.values()) peer.close();
       peers.clear();
     });
@@ -178,7 +200,24 @@ startShareBtn.addEventListener('click', async () => {
     await startCapture();
   } catch (err) {
     setStatus('warn', '共享失败');
-    log(`screen capture failed: ${err.message}`);
+    const status = await window.lanRemote.getScreenCaptureStatus().catch(() => 'unknown');
+    const hint = status === 'granted'
+      ? 'macOS reports granted; if you just enabled it, fully quit and reopen the app'
+      : 'if the switch is already on, click 重置权限, enable it again, then fully quit and reopen the app';
+    log(`screen capture failed: ${err.message}; macOS screen permission=${status}; ${hint}`);
+  }
+});
+
+openScreenSettingsBtn?.addEventListener('click', () => {
+  window.lanRemote.openScreenCaptureSettings().catch((err) => log(`open settings failed: ${err.message}`));
+});
+
+resetScreenPermissionBtn?.addEventListener('click', async () => {
+  try {
+    await window.lanRemote.resetScreenCapturePermission();
+    log('screen permission record reset; enable P2P Remote LAN again, then fully quit and reopen the app');
+  } catch (err) {
+    log(`reset screen permission failed: ${err.message}`);
   }
 });
 

@@ -10,7 +10,7 @@
                     "host":  "electron . -- --host",
                     "client":  "electron . -- --client",
                     "start":  "electron .",
-                    "build:mac-helper":  "cd native/macos-input-helper \u0026\u0026 swift build -c release",
+                    "build:mac-helper":  "cd native/macos-input-helper \u0026\u0026 swift build -c release --arch arm64 --arch x86_64",
                     "dist:win":  "electron-builder --win",
                     "dist:mac":  "electron-builder --mac",
                     "pack:win":  "electron-builder --win --dir",
@@ -90,12 +90,14 @@
                                          ],
                               "extraResources":  [
                                                      {
-                                                         "from":  "native/macos-input-helper/.build/release/macos-input-helper",
+                                                         "from":  "native/macos-input-helper/.build/apple/Products/Release/macos-input-helper",
                                                          "to":  "macos-input-helper"
                                                      }
                                                  ],
                               "extendInfo":  {
                                                  "NSHumanReadableCopyright":  "Copyright (c) 2026",
+                                                 "NSScreenCaptureUsageDescription":  "P2P Remote LAN needs screen recording permission when you explicitly share this Mac.",
+                                                 "NSAudioCaptureUsageDescription":  "P2P Remote LAN does not capture system audio.",
                                                  "NSAppleEventsUsageDescription":  "P2P Remote LAN needs local automation permission only when you explicitly control this Mac.",
                                                  "NSCameraUsageDescription":  "P2P Remote LAN does not use the camera.",
                                                  "NSMicrophoneUsageDescription":  "P2P Remote LAN does not use the microphone."

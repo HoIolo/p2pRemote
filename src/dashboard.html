@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>P2P Remote LAN</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body class="light">
+  <div class="appFrame">
+    <aside class="sidebar">
+      <div class="traffic" aria-hidden="true">
+        <span class="red"></span><span class="yellow"></span><span class="green"></span>
+      </div>
+
+      <section class="sideGroup">
+        <div class="sideTitle">
+          <span class="sideIcon">▣</span>
+          <span>我的设备</span>
+        </div>
+        <div id="deviceList" class="deviceList"></div>
+      </section>
+
+      <section class="sideGroup">
+        <div class="sideTitle">
+          <span class="sideIcon">☁</span>
+          <span>局域网</span>
+        </div>
+        <button id="refreshDevices" class="sideItem plain">刷新设备</button>
+      </section>
+
+      <section class="sideGroup">
+        <div class="sideTitle">
+          <span class="sideIcon">▦</span>
+          <span>本机</span>
+        </div>
+        <div class="localCard">
+          <div class="small">本机 PIN</div>
+          <div id="localPin" class="localPin">------</div>
+          <div id="localAddr" class="small"></div>
+        </div>
+      </section>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div class="topTitle">
+          <button class="iconBtn" disabled>‹</button>
+          <button class="iconBtn" disabled>›</button>
+          <span id="selectedStatus" class="pill muted">等待设备</span>
+          <h1 id="selectedName">P2P Remote LAN</h1>
+        </div>
+        <div class="topActions">
+          <button id="refreshTop" class="iconBtn" title="刷新">↻</button>
+          <button id="openScreenSettings" class="iconBtn" title="屏幕录制权限">◉</button>
+          <button id="resetScreenPermission" class="iconBtn" title="重置屏幕录制权限">↺</button>
+        </div>
+      </header>
+
+      <section class="content">
+        <div id="heroCard" class="remoteHero empty">
+          <div class="heroPreview">
+            <img id="previewImage" class="devicePreviewImage" src="assets/device-win.png" alt="" />
+            <button id="enterDesktop" class="enterDesktop" disabled>进入桌面 →</button>
+          </div>
+          <div class="heroActions">
+            <button id="connectSelected" class="heroAction" disabled>▣ 远程桌面</button>
+            <span class="divider"></span>
+            <button class="heroAction" disabled>⋯ 更多</button>
+          </div>
+        </div>
+
+        <h2>快速启动</h2>
+        <div id="quickGrid" class="quickGrid">
+          <button id="manualAdd" class="quickAdd">＋<span>手动连接</span></button>
+        </div>
+
+        <details class="diagnostics">
+          <summary>连接日志</summary>
+          <pre id="log" class="log lightLog"></pre>
+        </details>
+      </section>
+    </main>
+  </div>
+  <script src="dashboard.js"></script>
+</body>
+</html>

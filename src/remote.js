@@ -1,15 +1,15 @@
 const $ = (id) => document.getElementById(id);
 
-const hostInput = $('host');
-const portInput = $('port');
-const pinInput = $('pin');
-const connectBtn = $('connect');
-const video = $('remoteVideo');
-const overlay = $('overlay');
+const remoteNameEl = $('remoteName');
 const statusDot = $('statusDot');
 const statusText = $('statusText');
+const reconnectBtn = $('reconnect');
+const fullscreenBtn = $('fullscreen');
+const video = $('remoteVideo');
+const overlay = $('overlay');
 const logEl = $('log');
 
+let config = null;
 let ws = null;
 let pc = null;
 let inputChannel = null;
@@ -17,6 +17,8 @@ let pressedKeys = new Set();
 let pointerDown = false;
 let pendingMove = null;
 let moveRaf = 0;
+let fullScreen = false;
+let previewSaved = false;
 
 function log(message) {
   const line = `[${new Date().toLocaleTimeString()}] ${message}`;
@@ -29,23 +31,20 @@ function setStatus(kind, text) {
 }
 
 function endpoint() {
-  const rawHost = hostInput.value.trim().replace(/^wss?:\/\//, '').replace(/\/$/, '');
-  const port = portInput.value.trim() || '7777';
-  if (!rawHost) throw new Error('请输入 Mac 主机 IP');
-  if (rawHost.startsWith('[')) return rawHost.includes(']:') ? `ws://${rawHost}` : `ws://${rawHost}:${port}`;
-  if (rawHost.includes(':') && rawHost.includes('.')) return `ws://${rawHost}`; // IPv4:port
-  if (rawHost.includes(':')) return `ws://[${rawHost}]:${port}`; // IPv6 literal
-  return `ws://${rawHost}:${port}`;
+  const host = config.address;
+  const port = config.port || 7777;
+  if (host.startsWith('[')) return host.includes(']:') ? `ws://${host}` : `ws://${host}:${port}`;
+  if (host.includes(':') && host.includes('.')) return `ws://${host}`;
+  if (host.includes(':')) return `ws://[${host}]:${port}`;
+  return `ws://${host}:${port}`;
 }
 
 function sendSignal(message) {
-  if (!ws || ws.readyState !== WebSocket.OPEN) return;
-  ws.send(JSON.stringify(message));
+  if (ws?.readyState === WebSocket.OPEN) ws.send(JSON.stringify(message));
 }
 
 function sendInput(event) {
-  if (!inputChannel || inputChannel.readyState !== 'open') return;
-  // Drop input if the SCTP buffer is backed up; fresh input is better than late input.
+  if (inputChannel?.readyState !== 'open') return;
   if (inputChannel.bufferedAmount > 8_192) return;
   inputChannel.send(JSON.stringify({ ...event, t: performance.now() }));
 }
@@ -62,57 +61,73 @@ function makePeer() {
   inputChannel = pc.createDataChannel('input', {
     ordered: false,
     maxRetransmits: 0,
-    negotiated: false,
   });
   inputChannel.bufferedAmountLowThreshold = 4_096;
   inputChannel.onopen = () => log('input data channel open');
   inputChannel.onclose = () => log('input data channel closed');
 
   pc.ontrack = (event) => {
-    video.srcObject = event.streams[0] || new MediaStream([event.track]);
+    const stream = event.streams[0] || new MediaStream([event.track]);
+    video.srcObject = stream;
     overlay.style.display = 'none';
-    video.play().catch(() => {});
+    video.play().catch((err) => log(`video play skipped: ${err.message}`));
     log(`remote track: ${event.track.kind}`);
+    event.track.onunmute = () => log('remote video unmuted');
   };
 
   pc.onicecandidate = (event) => {
     if (event.candidate) sendSignal({ type: 'candidate', candidate: event.candidate });
   };
-
   pc.onconnectionstatechange = () => {
     log(`peer state=${pc.connectionState}`);
     if (pc.connectionState === 'connected') setStatus('ok', '已连接');
     if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) setStatus('warn', pc.connectionState);
   };
-
   pc.oniceconnectionstatechange = () => log(`ice=${pc.iceConnectionState}`);
 }
 
+function saveFirstFrame() {
+  if (previewSaved || !config || !video.videoWidth || !video.videoHeight) return;
+  previewSaved = true;
+  try {
+    const canvas = document.createElement('canvas');
+    const width = 960;
+    const height = Math.round(width * video.videoHeight / video.videoWidth);
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(video, 0, 0, width, height);
+    const dataUrl = canvas.toDataURL('image/jpeg', 0.78);
+    window.lanRemote.saveDevicePreview(config.id, dataUrl).catch(() => {});
+  } catch (err) {
+    log(`preview capture skipped: ${err.message}`);
+  }
+}
+
 async function createOffer() {
-  const offer = await pc.createOffer({ offerToReceiveVideo: true, offerToReceiveAudio: false });
+  const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   sendSignal({ type: 'offer', sdp: pc.localDescription });
   log('offer sent');
 }
 
 async function connect() {
+  if (!config) return;
   if (ws) ws.close();
   if (pc) pc.close();
   pressedKeys.clear();
+  pointerDown = false;
   overlay.style.display = 'grid';
-  overlay.innerHTML = '等待视频流<br /><span class="small">连接后请点击画面使键盘输入聚焦</span>';
-
-  const pin = pinInput.value.trim();
-  if (!/^\d{4,8}$/.test(pin)) throw new Error('请输入正确 PIN');
+  overlay.textContent = '正在连接视频流';
 
   makePeer();
   const url = endpoint();
-  setStatus('warn', '连接信令中');
+  setStatus('warn', '连接中');
   log(`connecting ${url}`);
 
   ws = new WebSocket(url);
   ws.onopen = () => {
-    ws.send(JSON.stringify({ type: 'hello', pin }));
+    ws.send(JSON.stringify({ type: 'hello', pin: config.pin }));
     log('pairing hello sent');
   };
   ws.onerror = () => setStatus('warn', '信令错误');
@@ -123,7 +138,7 @@ async function connect() {
   ws.onmessage = async (event) => {
     const message = JSON.parse(event.data);
     if (message.type === 'hello-ok') {
-      setStatus('warn', '已配对，协商媒体');
+      setStatus('warn', '协商媒体');
       log(`paired as ${message.clientId.slice(0, 8)}`);
       await createOffer();
       return;
@@ -142,8 +157,9 @@ async function connect() {
       return;
     }
     if (message.type === 'error') {
-      setStatus('warn', message.error || 'host error');
-      log(`host error: ${message.error}`);
+      setStatus('warn', message.error || 'remote error');
+      overlay.textContent = message.error || '远程端共享失败';
+      log(`remote error: ${message.error}`);
     }
   };
 }
@@ -179,6 +195,8 @@ function enqueueMove(event) {
   });
 }
 
+video.addEventListener('loadedmetadata', () => log(`video metadata ${video.videoWidth}x${video.videoHeight}`));
+video.addEventListener('loadeddata', saveFirstFrame);
 video.addEventListener('contextmenu', (event) => event.preventDefault());
 video.addEventListener('mousedown', (event) => {
   event.preventDefault();
@@ -202,6 +220,11 @@ video.addEventListener('wheel', (event) => {
 }, { passive: false });
 
 window.addEventListener('keydown', (event) => {
+  if (event.key === 'F11') {
+    fullscreenBtn.click();
+    event.preventDefault();
+    return;
+  }
   if (document.activeElement !== video || inputChannel?.readyState !== 'open') return;
   if (pressedKeys.has(event.code)) return;
   event.preventDefault();
@@ -220,15 +243,21 @@ window.addEventListener('blur', () => {
   pointerDown = false;
 });
 
-connectBtn.addEventListener('click', () => connect().catch((err) => {
+reconnectBtn.addEventListener('click', () => connect().catch((err) => log(`connect failed: ${err.stack || err.message}`)));
+fullscreenBtn.addEventListener('click', async () => {
+  fullScreen = !fullScreen;
+  await window.lanRemote.setWindowFullscreen(fullScreen);
+  fullscreenBtn.textContent = fullScreen ? '退出全屏' : '全屏';
+});
+
+window.lanRemote.getRemoteConfig().then((remoteConfig) => {
+  config = remoteConfig;
+  if (!config) throw new Error('Missing remote config');
+  remoteNameEl.textContent = config.name;
+  document.title = `${config.name} - P2P Remote LAN`;
+  return connect();
+}).catch((err) => {
   setStatus('warn', '连接失败');
-  log(`connect failed: ${err.stack || err.message}`);
-}));
-
-for (const input of [hostInput, portInput, pinInput]) {
-  input.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter') connectBtn.click();
-  });
-}
-
-log('client ready');
+  overlay.textContent = err.message;
+  log(`init failed: ${err.stack || err.message}`);
+});

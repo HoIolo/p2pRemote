@@ -1,8 +1,21 @@
-﻿const { app, BrowserWindow, ipcMain, screen, dialog } = require('electron');
+const {
+  app,
+  BrowserWindow,
+  ipcMain,
+  screen,
+  dialog,
+  desktopCapturer,
+  session,
+  systemPreferences,
+  shell,
+} = require('electron');
 const crypto = require('crypto');
+const dgram = require('dgram');
+const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const WebSocket = require('ws');
+const { execFile } = require('child_process');
 const { injectInput } = require('./injector');
 
 // Latency-oriented Chromium defaults. This is a LAN-only consent-based app;
@@ -18,18 +31,25 @@ function resolveRole() {
   if (process.env.P2P_REMOTE_ROLE === 'host') return 'host';
   if (process.env.P2P_REMOTE_ROLE === 'client') return 'client';
 
-  // Double-click packaged behavior for the intended product split:
-  // macOS runs as the controlled host, Windows runs as the controller.
-  return process.platform === 'darwin' ? 'host' : 'client';
+  return 'dashboard';
 }
 
 const ROLE = resolveRole();
 const SIGNAL_PORT = Number(process.env.P2P_REMOTE_PORT || 7777);
+const DISCOVERY_PORT = Number(process.env.P2P_REMOTE_DISCOVERY_PORT || 47777);
 const PIN = String(crypto.randomInt(100000, 999999));
+const BUNDLE_ID = 'com.p2premotelan.app';
 
 let win = null;
 let wss = null;
+let discoverySocket = null;
+let discoveryTimer = null;
+let pruneTimer = null;
+let deviceId = null;
 const clients = new Map();
+const devices = new Map();
+const remoteConfigs = new Map();
+const devicePreviews = new Map();
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) app.quit();
@@ -49,6 +69,81 @@ function lanAddresses() {
     }
   }
   return out;
+}
+
+function subnetBroadcast(address, netmask) {
+  const ip = address.split('.').map((part) => Number(part));
+  const mask = netmask.split('.').map((part) => Number(part));
+  if (ip.length !== 4 || mask.length !== 4 || ip.some((n) => !Number.isInteger(n)) || mask.some((n) => !Number.isInteger(n))) {
+    return null;
+  }
+  return ip.map((part, index) => (part | (~mask[index] & 255)) & 255).join('.');
+}
+
+function broadcastAddresses() {
+  const out = new Set(['255.255.255.255']);
+  for (const addrs of Object.values(os.networkInterfaces())) {
+    for (const addr of addrs || []) {
+      if (addr.family !== 'IPv4' || addr.internal || !addr.netmask) continue;
+      const broadcast = subnetBroadcast(addr.address, addr.netmask);
+      if (broadcast) out.add(broadcast);
+    }
+  }
+  return [...out];
+}
+
+function ensureDeviceId() {
+  if (deviceId) return deviceId;
+  const file = path.join(app.getPath('userData'), 'device-id');
+  try {
+    deviceId = fs.readFileSync(file, 'utf8').trim();
+  } catch {
+    deviceId = crypto.randomUUID();
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, deviceId);
+  }
+  return deviceId;
+}
+
+function deviceName() {
+  return os.hostname() || (process.platform === 'darwin' ? 'Mac' : process.platform === 'win32' ? 'Windows PC' : 'Remote Device');
+}
+
+function localDevicePayload() {
+  return {
+    type: 'p2p-remote-lan:announce',
+    version: 1,
+    id: ensureDeviceId(),
+    name: deviceName(),
+    platform: process.platform,
+    port: SIGNAL_PORT,
+    pin: PIN,
+    addresses: lanAddresses().map((item) => item.address),
+    ts: Date.now(),
+  };
+}
+
+function serializeDevice(device) {
+  return {
+    id: device.id,
+    name: device.name || 'Unknown Device',
+    platform: device.platform || 'unknown',
+    address: device.address,
+    port: Number(device.port || SIGNAL_PORT),
+    pin: String(device.pin || ''),
+    addresses: device.addresses || [],
+    lastSeen: device.lastSeen,
+    preview: devicePreviews.get(device.id) || null,
+  };
+}
+
+function sendDeviceList() {
+  const now = Date.now();
+  const list = [...devices.values()]
+    .filter((device) => now - device.lastSeen < 15_000)
+    .map(serializeDevice)
+    .sort((a, b) => a.name.localeCompare(b.name));
+  win?.webContents.send('devices-updated', list);
 }
 
 function createWindow(file, options = {}) {
@@ -72,7 +167,66 @@ function createWindow(file, options = {}) {
   return browserWindow;
 }
 
+function createRemoteWindow(device) {
+  const remoteWindow = createWindow('remote.html', {
+    width: 1280,
+    height: 820,
+    title: `${device.name || device.address} - P2P Remote LAN`,
+  });
+  remoteConfigs.set(remoteWindow.webContents.id, serializeDevice(device));
+  remoteWindow.on('closed', () => {
+    remoteConfigs.delete(remoteWindow.webContents.id);
+  });
+  return remoteWindow;
+}
+
+function getScreenCaptureStatus() {
+  if (process.platform !== 'darwin') return 'unknown';
+  try {
+    return systemPreferences.getMediaAccessStatus('screen');
+  } catch {
+    return 'unknown';
+  }
+}
+
+function registerDisplayMediaHandler() {
+  session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
+    try {
+      if (!request.videoRequested) {
+        callback({});
+        return;
+      }
+
+      const sources = await desktopCapturer.getSources({
+        types: ['screen'],
+        thumbnailSize: { width: 1, height: 1 },
+      });
+      const primaryDisplayId = String(screen.getPrimaryDisplay().id);
+      const primarySource = sources.find((source) => source.display_id === primaryDisplayId);
+      const source = primarySource || sources[0];
+
+      if (!source) {
+        win?.webContents.send('host-log', {
+          level: 'error',
+          message: `no screen capture source found; macOS screen permission=${getScreenCaptureStatus()}`,
+        });
+        callback({});
+        return;
+      }
+
+      callback({ video: source });
+    } catch (err) {
+      win?.webContents.send('host-log', {
+        level: 'error',
+        message: `screen source selection failed: ${err && err.message ? err.message : String(err)}; macOS screen permission=${getScreenCaptureStatus()}`,
+      });
+      callback({});
+    }
+  }, { useSystemPicker: true });
+}
+
 function startSignalServer() {
+  if (wss) return;
   wss = new WebSocket.Server({ port: SIGNAL_PORT, host: '0.0.0.0' });
 
   wss.on('connection', (socket, req) => {
@@ -125,6 +279,48 @@ function startSignalServer() {
   });
 }
 
+function announcePresence() {
+  if (!discoverySocket) return;
+  const payload = Buffer.from(JSON.stringify(localDevicePayload()));
+  for (const address of broadcastAddresses()) {
+    discoverySocket.send(payload, 0, payload.length, DISCOVERY_PORT, address);
+  }
+}
+
+function startDiscovery() {
+  if (discoverySocket) return;
+  discoverySocket = dgram.createSocket({ type: 'udp4', reuseAddr: true });
+
+  discoverySocket.on('message', (buf, rinfo) => {
+    let message;
+    try {
+      message = JSON.parse(buf.toString('utf8'));
+    } catch {
+      return;
+    }
+    if (message?.type !== 'p2p-remote-lan:announce' || message.id === ensureDeviceId()) return;
+
+    devices.set(message.id, {
+      ...message,
+      address: rinfo.address,
+      lastSeen: Date.now(),
+    });
+    sendDeviceList();
+  });
+
+  discoverySocket.on('error', (err) => {
+    win?.webContents.send('host-log', { level: 'error', message: `discovery failed: ${err.message}` });
+  });
+
+  discoverySocket.bind(DISCOVERY_PORT, () => {
+    discoverySocket.setBroadcast(true);
+    announcePresence();
+  });
+
+  discoveryTimer = setInterval(announcePresence, 2_000);
+  pruneTimer = setInterval(sendDeviceList, 5_000);
+}
+
 async function startHost() {
   startSignalServer();
   win = createWindow('host.html', { title: 'P2P Remote LAN - macOS Host' });
@@ -132,6 +328,12 @@ async function startHost() {
 
 async function startClient() {
   win = createWindow('client.html', { title: 'P2P Remote LAN - Windows Client' });
+}
+
+async function startDashboard() {
+  startSignalServer();
+  startDiscovery();
+  win = createWindow('dashboard.html', { title: 'P2P Remote LAN' });
 }
 
 ipcMain.handle('host-info', () => {
@@ -145,6 +347,79 @@ ipcMain.handle('host-info', () => {
     scaleFactor: primary.scaleFactor,
     platform: process.platform,
   };
+});
+
+ipcMain.handle('app-info', () => {
+  const primary = screen.getPrimaryDisplay();
+  return {
+    device: localDevicePayload(),
+    discoveryPort: DISCOVERY_PORT,
+    display: primary.bounds,
+    scaleFactor: primary.scaleFactor,
+    screenCaptureStatus: getScreenCaptureStatus(),
+  };
+});
+
+ipcMain.handle('devices-list', () => {
+  const now = Date.now();
+  const list = [...devices.values()]
+    .filter((device) => now - device.lastSeen < 15_000)
+    .map(serializeDevice)
+    .sort((a, b) => a.name.localeCompare(b.name));
+  win?.webContents.send('devices-updated', list);
+  return list;
+});
+
+ipcMain.handle('refresh-devices', () => {
+  announcePresence();
+  sendDeviceList();
+  return true;
+});
+
+ipcMain.handle('open-remote-window', (_event, device) => {
+  if (!device || !device.address || !device.port || !device.pin) {
+    throw new Error('Device is missing connection details');
+  }
+  createRemoteWindow(device);
+  return true;
+});
+
+ipcMain.handle('remote-config', (event) => {
+  return remoteConfigs.get(event.sender.id) || null;
+});
+
+ipcMain.handle('save-device-preview', (_event, id, dataUrl) => {
+  if (!id || typeof dataUrl !== 'string' || !dataUrl.startsWith('data:image/')) return false;
+  devicePreviews.set(String(id), dataUrl);
+  sendDeviceList();
+  return true;
+});
+
+ipcMain.handle('set-window-fullscreen', (event, fullScreen) => {
+  const browserWindow = BrowserWindow.fromWebContents(event.sender);
+  if (!browserWindow) return false;
+  browserWindow.setFullScreen(Boolean(fullScreen));
+  return browserWindow.isFullScreen();
+});
+
+ipcMain.handle('screen-capture-status', () => getScreenCaptureStatus());
+
+ipcMain.handle('open-screen-capture-settings', async () => {
+  if (process.platform !== 'darwin') return false;
+  await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
+  return true;
+});
+
+ipcMain.handle('reset-screen-capture-permission', async () => {
+  if (process.platform !== 'darwin') return false;
+  await new Promise((resolve, reject) => {
+    execFile('/usr/bin/tccutil', ['reset', 'ScreenCapture', BUNDLE_ID], (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+  await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
+  return true;
 });
 
 ipcMain.on('signal-send', (_event, payload) => {
@@ -168,20 +443,33 @@ ipcMain.on('input-event', async (_event, event) => {
 });
 
 app.whenReady().then(async () => {
+  registerDisplayMediaHandler();
+
   if (ROLE === 'host') await startHost();
-  else await startClient();
+  else if (ROLE === 'client') await startClient();
+  else await startDashboard();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       if (ROLE === 'host') startHost();
-      else startClient();
+      else if (ROLE === 'client') startClient();
+      else startDashboard();
     }
   });
 });
 
 app.on('window-all-closed', () => {
-  if (wss) wss.close();
+  if (wss) {
+    wss.close();
+    wss = null;
+  }
+  if (discoveryTimer) clearInterval(discoveryTimer);
+  if (pruneTimer) clearInterval(pruneTimer);
+  discoveryTimer = null;
+  pruneTimer = null;
+  if (discoverySocket) {
+    discoverySocket.close();
+    discoverySocket = null;
+  }
   if (process.platform !== 'darwin') app.quit();
 });
-
-
