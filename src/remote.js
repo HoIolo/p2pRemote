@@ -30,6 +30,18 @@ function setStatus(kind, text) {
   statusText.textContent = text;
 }
 
+function wireWindowControls() {
+  for (const button of document.querySelectorAll('[data-window-action]')) {
+    button.addEventListener('click', () => {
+      window.lanRemote.windowAction(button.dataset.windowAction);
+    });
+  }
+  document.querySelector('.remoteTopbar')?.addEventListener('dblclick', (event) => {
+    if (event.target.closest('button')) return;
+    window.lanRemote.windowAction('toggle-maximize');
+  });
+}
+
 function endpoint() {
   const host = config.address;
   const port = config.port || 7777;
@@ -247,8 +259,15 @@ reconnectBtn.addEventListener('click', () => connect().catch((err) => log(`conne
 fullscreenBtn.addEventListener('click', async () => {
   fullScreen = !fullScreen;
   await window.lanRemote.setWindowFullscreen(fullScreen);
-  fullscreenBtn.textContent = fullScreen ? '退出全屏' : '全屏';
+  const label = fullscreenBtn.querySelector('span');
+  if (label) label.textContent = fullScreen ? '退出全屏' : '全屏';
 });
+
+wireWindowControls();
+
+window.lanRemote.getAppInfo().then((info) => {
+  document.body.dataset.platform = info.device.platform;
+}).catch(() => {});
 
 window.lanRemote.getRemoteConfig().then((remoteConfig) => {
   config = remoteConfig;

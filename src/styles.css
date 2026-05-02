@@ -9,6 +9,7 @@
 body { margin: 0; min-height: 100vh; background: radial-gradient(circle at top left, #172554 0, #070b16 42%, #050711 100%); }
 button, input { font: inherit; }
 button {
+  -webkit-app-region: no-drag;
   border: 0;
   border-radius: 12px;
   padding: 10px 14px;
@@ -24,6 +25,7 @@ button.secondary {
   color: #bfdbfe;
 }
 input {
+  -webkit-app-region: no-drag;
   border: 1px solid rgba(148, 163, 184, .28);
   border-radius: 12px;
   padding: 10px 12px;
@@ -116,24 +118,16 @@ body.light {
 .sidebar {
   background: #e9e9e7;
   border-right: 1px solid #d0d0ce;
-  padding: 24px 16px;
+  padding: 0 16px 24px;
 }
 
-.traffic {
+.sidebarChrome {
+  -webkit-app-region: drag;
+  height: 66px;
   display: flex;
-  gap: 14px;
-  margin: 8px 0 46px 8px;
+  align-items: center;
+  margin-bottom: 22px;
 }
-
-.traffic span {
-  width: 14px;
-  height: 14px;
-  border-radius: 50%;
-  border: 1px solid rgba(0, 0, 0, .14);
-}
-.traffic .red { background: #ff5f57; }
-.traffic .yellow { background: #ffbd2e; }
-.traffic .green { background: #c9c9c7; }
 
 .sideGroup { margin-bottom: 30px; }
 .sideTitle {
@@ -144,9 +138,14 @@ body.light {
   font-weight: 800;
   margin: 0 0 14px;
 }
-.sideIcon { width: 24px; text-align: center; color: #262626; }
+.sideIcon {
+  width: 22px;
+  height: 22px;
+  color: #262626;
+}
 .deviceList { display: grid; gap: 4px; }
 .sideItem {
+  -webkit-app-region: no-drag;
   width: 100%;
   border: 0;
   border-radius: 8px;
@@ -180,9 +179,12 @@ body.light {
   display: grid;
   place-items: center;
   color: #fff;
-  background: #3b82f6;
-  font-size: 18px;
-  font-weight: 800;
+  background: linear-gradient(135deg, #2563eb, #8b5cf6 55%, #ec4899);
+  box-shadow: 0 8px 18px rgba(37, 99, 235, .24);
+}
+.devicePlatformIcon {
+  width: 18px;
+  height: 18px;
 }
 .deviceText { display: grid; min-width: 0; }
 .deviceText b {
@@ -218,13 +220,15 @@ body.light {
   background: #fbfbfa;
 }
 .topbar {
+  -webkit-app-region: drag;
   height: 66px;
   border-bottom: 1px solid #dadad8;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  padding: 0 26px;
+  padding: 0 26px 0 34px;
 }
+body[data-platform="win32"] .topbar { padding-right: 154px; }
 .topTitle,
 .topActions {
   display: flex;
@@ -246,11 +250,15 @@ body.light {
   place-items: center;
   background: transparent;
   color: #606365;
-  font-size: 26px;
   font-weight: 500;
 }
 .iconBtn:hover:not(:disabled) { background: #eeeeec; }
 .iconBtn:disabled { opacity: .35; }
+.icon {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+}
 .pill {
   border-radius: 999px;
   padding: 7px 13px;
@@ -303,6 +311,10 @@ body.light {
   inset: 0;
   width: 100%;
   border-radius: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
   background: linear-gradient(180deg, rgba(0, 0, 0, .04), rgba(0, 0, 0, .18));
   color: #fff;
   font-size: 25px;
@@ -324,6 +336,10 @@ body.light {
 .heroAction {
   height: 100%;
   border-radius: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
   background: #fff;
   color: #222;
   font-size: 18px;
@@ -354,8 +370,8 @@ body.light {
   border-radius: 56px;
   background: #eeeeec;
   color: #444;
-  font-size: 34px;
 }
+.quickIcon { width: 34px; height: 34px; }
 .quickAdd span {
   font-size: 14px;
   font-weight: 700;
@@ -382,13 +398,18 @@ body.light {
   background: #111;
 }
 .remoteTopbar {
+  -webkit-app-region: drag;
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 0 14px;
+  padding: 0 14px 0 92px;
   background: #f7f7f5;
   border-bottom: 1px solid #dadad8;
+}
+body[data-platform="win32"] .remoteTopbar {
+  padding-left: 14px;
+  padding-right: 154px;
 }
 .remoteTitle,
 .remoteActions {
@@ -397,12 +418,23 @@ body.light {
   gap: 10px;
 }
 .remoteTitle {
+  min-width: 0;
+  flex: 1 1 auto;
   color: #222;
 }
 .remoteTitle strong {
   font-size: 18px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.iconText {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
 }
 .remoteStage {
+  -webkit-app-region: no-drag;
   position: relative;
   min-height: 0;
   background: #050505;

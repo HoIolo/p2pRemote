@@ -20,15 +20,19 @@ let selectedId = null;
 let localStream = null;
 const peers = new Map();
 
+function iconSvg(name, className = 'icon') {
+  return `<svg class="${className}" aria-hidden="true"><use href="assets/icons.svg#${name}"></use></svg>`;
+}
+
 function log(message) {
   const line = `[${new Date().toLocaleTimeString()}] ${message}`;
   logEl.textContent = `${line}\n${logEl.textContent}`;
 }
 
 function platformIcon(platform) {
-  if (platform === 'darwin') return '';
-  if (platform === 'win32') return '⊞';
-  return '▣';
+  if (platform === 'darwin') return iconSvg('platform-mac', 'devicePlatformIcon');
+  if (platform === 'win32') return iconSvg('platform-win', 'devicePlatformIcon');
+  return iconSvg('platform-device', 'devicePlatformIcon');
 }
 
 function platformName(platform) {
@@ -105,6 +109,7 @@ async function openSelected() {
 
 async function initApp() {
   const info = await window.lanRemote.getAppInfo();
+  document.body.dataset.platform = info.device.platform;
   localPinEl.textContent = info.device.pin;
   localAddrEl.textContent = info.device.addresses.length
     ? `${info.device.addresses.join(' / ')}:${info.device.port}`
@@ -239,6 +244,20 @@ async function handleSignal({ clientId, message }) {
   }
 }
 
+function wireWindowControls() {
+  for (const button of document.querySelectorAll('[data-window-action]')) {
+    button.addEventListener('click', () => {
+      window.lanRemote.windowAction(button.dataset.windowAction);
+    });
+  }
+  for (const region of document.querySelectorAll('.topbar, .sidebarChrome')) {
+    region.addEventListener('dblclick', (event) => {
+      if (event.target.closest('button')) return;
+      window.lanRemote.windowAction('toggle-maximize');
+    });
+  }
+}
+
 deviceListEl.addEventListener('dblclick', openSelected);
 enterDesktopBtn.addEventListener('click', openSelected);
 connectSelectedBtn.addEventListener('click', openSelected);
@@ -281,4 +300,5 @@ window.lanRemote.onClientDisconnected(({ clientId }) => {
 });
 window.lanRemote.onHostLog((entry) => log(`${entry.level || 'info'}: ${entry.message}`));
 
+wireWindowControls();
 initApp().catch((err) => log(`init failed: ${err.stack || err.message}`));

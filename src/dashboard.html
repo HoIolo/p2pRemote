@@ -9,13 +9,11 @@
 <body class="light">
   <div class="appFrame">
     <aside class="sidebar">
-      <div class="traffic" aria-hidden="true">
-        <span class="red"></span><span class="yellow"></span><span class="green"></span>
-      </div>
+      <div class="sidebarChrome"></div>
 
       <section class="sideGroup">
         <div class="sideTitle">
-          <span class="sideIcon">▣</span>
+          <svg class="sideIcon" aria-hidden="true"><use href="assets/icons.svg#icon-devices"></use></svg>
           <span>我的设备</span>
         </div>
         <div id="deviceList" class="deviceList"></div>
@@ -23,7 +21,7 @@
 
       <section class="sideGroup">
         <div class="sideTitle">
-          <span class="sideIcon">☁</span>
+          <svg class="sideIcon" aria-hidden="true"><use href="assets/icons.svg#icon-lan"></use></svg>
           <span>局域网</span>
         </div>
         <button id="refreshDevices" class="sideItem plain">刷新设备</button>
@@ -31,7 +29,7 @@
 
       <section class="sideGroup">
         <div class="sideTitle">
-          <span class="sideIcon">▦</span>
+          <svg class="sideIcon" aria-hidden="true"><use href="assets/icons.svg#icon-computer"></use></svg>
           <span>本机</span>
         </div>
         <div class="localCard">
@@ -45,15 +43,15 @@
     <main class="workspace">
       <header class="topbar">
         <div class="topTitle">
-          <button class="iconBtn" disabled>‹</button>
-          <button class="iconBtn" disabled>›</button>
+          <button class="iconBtn" disabled aria-label="后退"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-chevron-left"></use></svg></button>
+          <button class="iconBtn" disabled aria-label="前进"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-chevron-right"></use></svg></button>
           <span id="selectedStatus" class="pill muted">等待设备</span>
           <h1 id="selectedName">P2P Remote LAN</h1>
         </div>
         <div class="topActions">
-          <button id="refreshTop" class="iconBtn" title="刷新">↻</button>
-          <button id="openScreenSettings" class="iconBtn" title="屏幕录制权限">◉</button>
-          <button id="resetScreenPermission" class="iconBtn" title="重置屏幕录制权限">↺</button>
+          <button id="refreshTop" class="iconBtn" title="刷新" aria-label="刷新"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-refresh"></use></svg></button>
+          <button id="openScreenSettings" class="iconBtn" title="屏幕录制权限" aria-label="屏幕录制权限"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-record"></use></svg></button>
+          <button id="resetScreenPermission" class="iconBtn" title="重置屏幕录制权限" aria-label="重置屏幕录制权限"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-reset"></use></svg></button>
         </div>
       </header>
 
@@ -61,18 +59,18 @@
         <div id="heroCard" class="remoteHero empty">
           <div class="heroPreview">
             <img id="previewImage" class="devicePreviewImage" src="assets/device-win.png" alt="" />
-            <button id="enterDesktop" class="enterDesktop" disabled>进入桌面 →</button>
+            <button id="enterDesktop" class="enterDesktop" disabled><span>进入桌面</span><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-arrow-right"></use></svg></button>
           </div>
           <div class="heroActions">
-            <button id="connectSelected" class="heroAction" disabled>▣ 远程桌面</button>
+            <button id="connectSelected" class="heroAction" disabled><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-monitor-play"></use></svg><span>远程桌面</span></button>
             <span class="divider"></span>
-            <button class="heroAction" disabled>⋯ 更多</button>
+            <button class="heroAction" disabled><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-more"></use></svg><span>更多</span></button>
           </div>
         </div>
 
         <h2>快速启动</h2>
         <div id="quickGrid" class="quickGrid">
-          <button id="manualAdd" class="quickAdd">＋<span>手动连接</span></button>
+          <button id="manualAdd" class="quickAdd"><svg class="quickIcon" aria-hidden="true"><use href="assets/icons.svg#icon-plus"></use></svg><span>手动连接</span></button>
         </div>
 
         <details class="diagnostics">

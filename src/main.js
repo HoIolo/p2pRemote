@@ -146,6 +146,30 @@ function sendDeviceList() {
   win?.webContents.send('devices-updated', list);
 }
 
+function windowChromeOptions(options) {
+  if (options.frame === true) return { frame: true };
+
+  if (process.platform === 'darwin') {
+    return {
+      titleBarStyle: 'hiddenInset',
+      trafficLightPosition: options.trafficLightPosition || { x: 16, y: 17 },
+    };
+  }
+
+  if (process.platform === 'win32') {
+    return {
+      titleBarStyle: 'hidden',
+      titleBarOverlay: {
+        color: options.titleBarColor || '#f7f7f5',
+        symbolColor: options.titleBarSymbolColor || '#5f6368',
+        height: options.titleBarHeight || 66,
+      },
+    };
+  }
+
+  return { frame: false };
+}
+
 function createWindow(file, options = {}) {
   const browserWindow = new BrowserWindow({
     width: options.width || 1180,
@@ -153,6 +177,7 @@ function createWindow(file, options = {}) {
     minWidth: 900,
     minHeight: 560,
     backgroundColor: '#0b1020',
+    ...windowChromeOptions(options),
     title: options.title || 'P2P Remote LAN',
     autoHideMenuBar: true,
     webPreferences: {
@@ -172,6 +197,7 @@ function createRemoteWindow(device) {
     width: 1280,
     height: 820,
     title: `${device.name || device.address} - P2P Remote LAN`,
+    titleBarHeight: 54,
   });
   remoteConfigs.set(remoteWindow.webContents.id, serializeDevice(device));
   remoteWindow.on('closed', () => {
@@ -323,11 +349,11 @@ function startDiscovery() {
 
 async function startHost() {
   startSignalServer();
-  win = createWindow('host.html', { title: 'P2P Remote LAN - macOS Host' });
+  win = createWindow('host.html', { title: 'P2P Remote LAN - macOS Host', frame: true });
 }
 
 async function startClient() {
-  win = createWindow('client.html', { title: 'P2P Remote LAN - Windows Client' });
+  win = createWindow('client.html', { title: 'P2P Remote LAN - Windows Client', frame: true });
 }
 
 async function startDashboard() {
@@ -400,6 +426,18 @@ ipcMain.handle('set-window-fullscreen', (event, fullScreen) => {
   if (!browserWindow) return false;
   browserWindow.setFullScreen(Boolean(fullScreen));
   return browserWindow.isFullScreen();
+});
+
+ipcMain.handle('window-action', (event, action) => {
+  const browserWindow = BrowserWindow.fromWebContents(event.sender);
+  if (!browserWindow) return false;
+  if (action === 'minimize') browserWindow.minimize();
+  if (action === 'toggle-maximize') {
+    if (browserWindow.isMaximized()) browserWindow.unmaximize();
+    else browserWindow.maximize();
+  }
+  if (action === 'close') browserWindow.close();
+  return true;
 });
 
 ipcMain.handle('screen-capture-status', () => getScreenCaptureStatus());

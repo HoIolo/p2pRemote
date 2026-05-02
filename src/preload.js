@@ -9,6 +9,7 @@ contextBridge.exposeInMainWorld('lanRemote', {
   getRemoteConfig: () => ipcRenderer.invoke('remote-config'),
   saveDevicePreview: (id, dataUrl) => ipcRenderer.invoke('save-device-preview', id, dataUrl),
   setWindowFullscreen: (fullScreen) => ipcRenderer.invoke('set-window-fullscreen', fullScreen),
+  windowAction: (action) => ipcRenderer.invoke('window-action', action),
   getScreenCaptureStatus: () => ipcRenderer.invoke('screen-capture-status'),
   openScreenCaptureSettings: () => ipcRenderer.invoke('open-screen-capture-settings'),
   resetScreenCapturePermission: () => ipcRenderer.invoke('reset-screen-capture-permission'),
