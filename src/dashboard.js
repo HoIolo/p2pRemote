@@ -162,7 +162,7 @@ function nativeV2DisplayOptions(device) {
     return {
       width: clampEven(defaults.width || 1920, 1920),
       height: clampEven(defaults.height || 1080, 1080),
-      bitrate: defaults.bitrate || 45_000_000,
+      bitrate: defaults.bitrate || 20_000_000,
     };
   }
 
@@ -188,11 +188,14 @@ function nativeV2ClientOptions(device) {
   const display = nativeV2DisplayOptions(device);
   return {
     hostIp: device.address,
+    hostName: device.name,
+    hostPlatform: device.platform,
     videoPort: defaults.videoPort || 45000,
     inputPort: defaults.inputPort || 45001,
     width: display.width,
     height: display.height,
     fps: defaults.fps || 60,
+    bitrate: display.bitrate,
     fullscreen: true,
     transport: 'udp',
   };

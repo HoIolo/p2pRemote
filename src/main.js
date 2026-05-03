@@ -394,13 +394,17 @@ function startNativeV2Client(options = {}) {
   const width = normalizeNativeV2Number(options.width, 1920, 640, 7680);
   const height = normalizeNativeV2Number(options.height, 1080, 360, 4320);
   const fps = normalizeNativeV2Number(options.fps, 120, 30, 240);
+  const bitrate = normalizeNativeV2Number(options.bitrate, 20_000_000, 0, 200_000_000);
   const args = [
     '--host-ip', String(options.hostIp),
+    '--host-name', String(options.hostName || 'Remote Device'),
+    '--host-platform', String(options.hostPlatform || 'unknown'),
     '--video-port', String(videoPort),
     '--input-port', String(inputPort),
     '--width', String(width),
     '--height', String(height),
     '--fps', String(fps),
+    '--bitrate', String(bitrate),
   ];
   args.push('--transport', options.transport === 'udp' ? 'udp' : 'tcp');
   if (options.fullscreen !== false) args.push('--fullscreen');
@@ -447,6 +451,7 @@ function startNativeV2Client(options = {}) {
     width,
     height,
     fps,
+    bitrate,
     fullscreen: options.fullscreen !== false,
   };
 }
@@ -472,7 +477,7 @@ function startNativeV2Host(options = {}) {
   const width = normalizeNativeV2Number(options.width, 1920, 640, 7680);
   const height = normalizeNativeV2Number(options.height, 1080, 360, 4320);
   const fps = normalizeNativeV2Number(options.fps, 120, 30, 240);
-  const bitrate = normalizeNativeV2Number(options.bitrate, 45_000_000, 1_000_000, 200_000_000);
+  const bitrate = normalizeNativeV2Number(options.bitrate, 20_000_000, 1_000_000, 200_000_000);
   const keyint = normalizeNativeV2Number(options.keyint, 1, 1, 300);
   const args = [
     '--client-ip', String(options.clientIp),
