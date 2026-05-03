@@ -1,6 +1,28 @@
 import Foundation
 import CoreGraphics
 
+@available(macOS 13.0, *)
+final class NativeHostRuntime {
+    let tcpServer: TcpVideoServer?
+    let udpSender: UdpVideoSender?
+    let encoder: H264LowLatencyEncoder
+    let output: ScreenCaptureOutput
+    let capturer: ScreenCapturer
+    let input: InputReceiver
+
+    init(tcpServer: TcpVideoServer?, udpSender: UdpVideoSender?, encoder: H264LowLatencyEncoder, output: ScreenCaptureOutput, capturer: ScreenCapturer, input: InputReceiver) {
+        self.tcpServer = tcpServer
+        self.udpSender = udpSender
+        self.encoder = encoder
+        self.output = output
+        self.capturer = capturer
+        self.input = input
+    }
+}
+
+@available(macOS 13.0, *)
+private var gRuntime: NativeHostRuntime?
+
 @main
 struct MacHostMain {
     static func main() async {
@@ -37,6 +59,15 @@ struct MacHostMain {
 
             let input = try InputReceiver(port: cfg.inputPort, displayBounds: displayBounds)
             input.start()
+            gRuntime = NativeHostRuntime(
+                tcpServer: tcpServer,
+                udpSender: udpSender,
+                encoder: encoder,
+                output: output,
+                capturer: capturer,
+                input: input
+            )
+            print("[ready] runtime retained encoder/output/capturer/input")
             print("[ready] host streaming. Press Ctrl+C to stop.")
             dispatchMain()
         } catch {

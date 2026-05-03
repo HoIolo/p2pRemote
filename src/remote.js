@@ -185,6 +185,33 @@ function sendInput(event) {
   inputChannel.send(JSON.stringify({ ...event, t: performance.now() }));
 }
 
+function parseCandidate(candidateLike) {
+  const raw = candidateLike?.candidate || '';
+  const match = raw.match(/^candidate:\S+\s+\d+\s+(\w+)\s+\d+\s+([0-9a-fA-F\.:]+)\s+(\d+)\s+typ\s+(\w+)/i);
+  if (!match) return null;
+  return {
+    protocol: String(match[1] || '').toLowerCase(),
+    address: match[2] || '',
+    port: Number(match[3] || 0),
+    type: String(match[4] || '').toLowerCase(),
+  };
+}
+
+function describeCandidate(candidateLike) {
+  const parsed = parseCandidate(candidateLike);
+  if (!parsed) return candidateLike?.candidate || 'unknown-candidate';
+  return `${parsed.type}/${parsed.protocol} ${parsed.address}:${parsed.port}`;
+}
+
+function shouldUseCandidate(candidateLike) {
+  const parsed = parseCandidate(candidateLike);
+  if (!parsed) return false;
+  if (parsed.protocol !== 'udp' || parsed.type !== 'host') return false;
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(parsed.address)) return false;
+  if (parsed.address.startsWith('127.')) return false;
+  return true;
+}
+
 function clearStatsTimer() {
   clearInterval(statsTimer);
   statsTimer = 0;
@@ -299,7 +326,13 @@ function makePeer() {
   };
 
   pc.onicecandidate = (event) => {
-    if (event.candidate) sendSignal({ type: 'candidate', candidate: event.candidate });
+    if (!event.candidate) return;
+    if (!shouldUseCandidate(event.candidate)) {
+      log(`skip local ICE candidate ${describeCandidate(event.candidate)}`);
+      return;
+    }
+    log(`send local ICE candidate ${describeCandidate(event.candidate)}`);
+    sendSignal({ type: 'candidate', candidate: event.candidate });
   };
   pc.onconnectionstatechange = () => {
     log(`peer state=${pc.connectionState}`);
@@ -320,14 +353,18 @@ function makePeer() {
 
 async function addRemoteCandidate(candidate) {
   if (!pc || !candidate) return;
+  if (!shouldUseCandidate(candidate)) {
+    log(`ignored remote ICE candidate ${describeCandidate(candidate)}`);
+    return;
+  }
   if (!pc.remoteDescription) {
     pendingRemoteCandidates.push(candidate);
-    log(`queued remote ICE candidate (${pendingRemoteCandidates.length}) until answer is applied`);
+    log(`queued remote ICE candidate (${pendingRemoteCandidates.length}) until answer is applied: ${describeCandidate(candidate)}`);
     return;
   }
   try {
     await pc.addIceCandidate(candidate);
-    log('remote ICE candidate applied');
+    log(`remote ICE candidate applied: ${describeCandidate(candidate)}`);
   } catch (err) {
     log(`addIceCandidate failed: ${err.message}`);
   }
@@ -412,9 +449,11 @@ async function connect() {
     }
     if (message.type === 'answer') {
       clearAnswerTimer();
+      log(`applying remote answer type=${message.sdp?.type || 'unknown'} sdpLen=${message.sdp?.sdp?.length || 0}`);
       await pc.setRemoteDescription(message.sdp);
       overlay.textContent = '\u5df2\u5b8c\u6210\u534f\u5546\uff0c\u7b49\u5f85\u89c6\u9891\u5e27';
       log('answer applied');
+      log(`currentRemoteDescription type=${pc.currentRemoteDescription?.type || 'none'} pending=${pc.pendingRemoteDescription?.type || 'none'}`);
       await flushRemoteCandidates();
       return;
     }

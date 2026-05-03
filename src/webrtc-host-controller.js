@@ -54,6 +54,33 @@
       });
     }
 
+    function parseCandidate(candidateLike) {
+      const raw = candidateLike?.candidate || '';
+      const match = raw.match(/^candidate:\S+\s+\d+\s+(\w+)\s+\d+\s+([0-9a-fA-F\.:]+)\s+(\d+)\s+typ\s+(\w+)/i);
+      if (!match) return null;
+      return {
+        protocol: String(match[1] || '').toLowerCase(),
+        address: match[2] || '',
+        port: Number(match[3] || 0),
+        type: String(match[4] || '').toLowerCase(),
+      };
+    }
+
+    function describeCandidate(candidateLike) {
+      const parsed = parseCandidate(candidateLike);
+      if (!parsed) return candidateLike?.candidate || 'unknown-candidate';
+      return `${parsed.type}/${parsed.protocol} ${parsed.address}:${parsed.port}`;
+    }
+
+    function shouldUseCandidate(candidateLike) {
+      const parsed = parseCandidate(candidateLike);
+      if (!parsed) return false;
+      if (parsed.protocol !== 'udp' || parsed.type !== 'host') return false;
+      if (!/^\d+\.\d+\.\d+\.\d+$/.test(parsed.address)) return false;
+      if (parsed.address.startsWith('127.')) return false;
+      return true;
+    }
+
     async function tuneCaptureTrack(track) {
       try {
         const maxFps = Number(localStorage.getItem('maxFps') || 60);
@@ -161,17 +188,11 @@
     async function tuneSender(sender) {
       try {
         const params = sender.getParameters();
-        const next = { ...params };
-        const existingEncodings = Array.isArray(params.encodings) && params.encodings.length
-          ? params.encodings.map((encoding) => ({ ...encoding }))
-          : [{}];
-        next.encodings = existingEncodings;
-        next.encodings[0].maxBitrate = Number(localStorage.getItem('maxBitrate') || 35_000_000);
-        next.encodings[0].maxFramerate = Number(localStorage.getItem('maxFps') || 60);
-        if ('degradationPreference' in params) {
-          next.degradationPreference = 'maintain-framerate';
-        }
-        await sender.setParameters(next);
+        if (!Array.isArray(params.encodings) || params.encodings.length === 0) params.encodings = [{}];
+        params.encodings[0].maxBitrate = Number(localStorage.getItem('maxBitrate') || 35_000_000);
+        params.encodings[0].maxFramerate = Number(localStorage.getItem('maxFps') || 60);
+        if ('degradationPreference' in params) params.degradationPreference = 'maintain-framerate';
+        await sender.setParameters(params);
       } catch (err) {
         writeLog(`sender tuning skipped: ${err.message}`);
       }
@@ -186,7 +207,13 @@
       });
 
       pc.onicecandidate = (event) => {
-        if (event.candidate) sendSignal(clientId, { type: 'candidate', candidate: event.candidate });
+        if (!event.candidate) return;
+        if (!shouldUseCandidate(event.candidate)) {
+          writeLog(`skip local ICE candidate ${describeCandidate(event.candidate)}`);
+          return;
+        }
+        writeLog(`send local ICE candidate ${describeCandidate(event.candidate)}`);
+        sendSignal(clientId, { type: 'candidate', candidate: event.candidate });
       };
 
       pc.onconnectionstatechange = () => {
@@ -218,16 +245,20 @@
 
     async function addPeerCandidate(clientId, pc, candidate) {
       if (!candidate) return;
+      if (!shouldUseCandidate(candidate)) {
+        writeLog(`ignored remote ICE candidate from ${clientId.slice(0, 8)}: ${describeCandidate(candidate)}`);
+        return;
+      }
       if (!pc || !pc.remoteDescription) {
         const pending = pendingPeerCandidates.get(clientId) || [];
         pending.push(candidate);
         pendingPeerCandidates.set(clientId, pending);
-        writeLog(`queued ICE candidate from ${clientId.slice(0, 8)} (${pending.length}) until peer/offer is ready`);
+        writeLog(`queued ICE candidate from ${clientId.slice(0, 8)} (${pending.length}) until peer/offer is ready: ${describeCandidate(candidate)}`);
         return;
       }
       try {
         await pc.addIceCandidate(candidate);
-        writeLog(`ICE candidate applied from ${clientId.slice(0, 8)}`);
+        writeLog(`ICE candidate applied from ${clientId.slice(0, 8)}: ${describeCandidate(candidate)}`);
       } catch (err) {
         writeLog(`addIceCandidate failed from ${clientId.slice(0, 8)}: ${err.message}`);
       }
@@ -244,20 +275,26 @@
       }
     }
 
-    function ensureVideoSender(pc) {
-      let transceiver = pc.getTransceivers().find((item) => (
-        item.receiver?.track?.kind === 'video' || item.sender?.track?.kind === 'video'
-      ));
-      if (!transceiver) transceiver = pc.addTransceiver('video', { direction: 'sendonly' });
+    function ensureVideoSender(pc, stream = null) {
+      let sender = pc.getSenders().find((item) => item.track?.kind === 'video') || null;
+      const track = stream?.getVideoTracks?.()[0] || null;
+      if (!sender && track) {
+        sender = pc.addTrack(track, stream);
+      }
+      if (!sender) {
+        const transceiver = pc.addTransceiver('video', { direction: 'sendonly' });
+        sender = transceiver.sender;
+      }
+      const transceiver = pc.getTransceivers().find((item) => item.sender === sender);
       try {
-        transceiver.direction = 'sendonly';
+        if (transceiver) transceiver.direction = 'sendonly';
       } catch (err) {
         writeLog(`set video transceiver direction skipped: ${err.message}`);
       }
-      return transceiver;
+      return sender;
     }
 
-    function createPlaceholderTrack() {
+    function createPlaceholderStream() {
       const canvas = document.createElement('canvas');
       canvas.width = 1280;
       canvas.height = 720;
@@ -283,17 +320,20 @@
       } else {
         clearInterval(timer);
       }
-      return track;
+      return { stream, track };
     }
 
-    async function attachScreenStream(stream, videoTransceiver) {
+    async function attachScreenStream(stream, videoSender) {
       for (const track of stream.getTracks()) {
-        if (track.kind === 'video' && videoTransceiver?.sender) {
-          const previousTrack = videoTransceiver.sender.track;
+        if (track.kind === 'video' && videoSender) {
+          const previousTrack = videoSender.track;
           track.contentHint = 'motion';
-          await videoTransceiver.sender.replaceTrack(track);
+          try {
+            videoSender.setStreams?.(stream);
+          } catch {}
+          await videoSender.replaceTrack(track);
           if (previousTrack && previousTrack !== track) cleanupTrack(previousTrack);
-          await tuneSender(videoTransceiver.sender);
+          await tuneSender(videoSender);
           continue;
         }
       }
@@ -313,10 +353,12 @@
 
           await pc.setRemoteDescription(message.sdp);
           await flushPeerCandidates(clientId, pc);
-          const videoTransceiver = ensureVideoSender(pc);
-          const placeholderTrack = createPlaceholderTrack();
-          if (placeholderTrack) await videoTransceiver.sender.replaceTrack(placeholderTrack);
-          preferH264(pc, videoTransceiver.sender);
+          const placeholder = createPlaceholderStream();
+          const videoSender = ensureVideoSender(pc, placeholder.stream);
+          if (placeholder.track && videoSender.track !== placeholder.track) {
+            await videoSender.replaceTrack(placeholder.track);
+          }
+          preferH264(pc, videoSender);
 
           const answer = await pc.createAnswer();
           await pc.setLocalDescription(answer);
@@ -327,7 +369,7 @@
           sendSignalProgress(clientId, 'capture-starting', 'Mac is starting screen capture');
           const stream = await startCapture();
           sendSignalProgress(clientId, 'capture-ready', 'Mac screen capture is ready');
-          await attachScreenStream(stream, videoTransceiver);
+          await attachScreenStream(stream, videoSender);
           writeLog(`screen stream attached for ${clientId.slice(0, 8)}`);
         } catch (err) {
           const messageText = err?.message || String(err);
