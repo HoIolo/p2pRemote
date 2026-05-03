@@ -59,6 +59,7 @@ const pendingSignalMessages = [];
 let nativeV2ClientProcess = null;
 let nativeV2HostProcess = null;
 let nativeV2ClientLastOptions = null;
+let nativeV2LastRemoteHostRequest = null;
 let appIsQuitting = false;
 let nativeV2HostAutoStopTimer = null;
 
@@ -348,7 +349,7 @@ function writeNativeV2ClientProfile(profileFile = nativeV2ClientProfilePath(), p
     width: Number(profile.width) || 1920,
     height: Number(profile.height) || 1080,
     fps: Number(profile.fps) || 60,
-    bitrate: Number(profile.bitrate) || 28_000_000,
+    bitrate: Number(profile.bitrate) || 14_000_000,
   };
   fs.mkdirSync(path.dirname(profileFile), { recursive: true });
   fs.writeFileSync(profileFile, JSON.stringify(payload, null, 2));
@@ -377,9 +378,9 @@ function nativeV2StatusPayload() {
       width: Number(savedClientProfile.width) || 1920,
       height: Number(savedClientProfile.height) || 1080,
       fps: Number(savedClientProfile.fps) || 60,
-      bitrate: Number(savedClientProfile.bitrate) || 28_000_000,
+      bitrate: Number(savedClientProfile.bitrate) || 14_000_000,
       keyint: 1,
-      transport: 'tcp',
+      transport: 'udp',
     },
   };
 }
@@ -389,6 +390,25 @@ function broadcastNativeV2Status(extra = {}) {
     ...nativeV2StatusPayload(),
     ...extra,
   });
+}
+
+async function restartNativeV2RemoteHostForClientProfile(profile) {
+  const saved = nativeV2LastRemoteHostRequest;
+  if (!saved?.device?.address || !saved?.device?.port || !saved?.device?.pin) return false;
+  const nextOptions = {
+    ...saved.options,
+    width: Number(profile.width) || saved.options.width,
+    height: Number(profile.height) || saved.options.height,
+    fps: Number(profile.fps) || saved.options.fps,
+    bitrate: Number(profile.bitrate) || saved.options.bitrate,
+    transport: profile.transport === 'udp' ? 'udp' : (saved.options.transport === 'udp' ? 'udp' : 'tcp'),
+  };
+  sendToMainWindow('host-log', {
+    level: 'info',
+    message: `native-v2 reconfigure: requesting Mac host restart ${saved.device.address}:${saved.device.port} -> ${nextOptions.width}x${nextOptions.height}@${nextOptions.fps} bitrate=${nextOptions.bitrate}`,
+  });
+  await requestNativeV2RemoteHost(saved.device, nextOptions);
+  return true;
 }
 
 function relayNativeV2ProcessOutput(kind, proc, chunk) {
@@ -448,15 +468,16 @@ function startNativeV2Client(options = {}) {
 
   const exePath = findFirstExistingPath(nativeV2WinClientCandidates());
   if (!exePath) {
-    throw new Error('Native v2 Windows 客户端还没有构建。请先在本机安装 Visual Studio Build Tools + CMake 后执行 npm run v2:win:build，或使用包含 native-v2 的安装包。');
+    throw new Error('Native v2 Windows client is not built yet. Run npm run v2:win:build first, or use an installer that includes native-v2.');
   }
 
   const videoPort = normalizeNativeV2Number(options.videoPort, 45000, 1, 65535);
   const inputPort = normalizeNativeV2Number(options.inputPort, 45001, 1, 65535);
   const width = normalizeNativeV2Number(options.width, 1920, 640, 7680);
   const height = normalizeNativeV2Number(options.height, 1080, 360, 4320);
-  const fps = normalizeNativeV2Number(options.fps, 120, 30, 240);
-  const bitrate = normalizeNativeV2Number(options.bitrate, 20_000_000, 0, 200_000_000);
+  const fps = normalizeNativeV2Number(options.fps, 60, 30, 240);
+  const bitrate = normalizeNativeV2Number(options.bitrate, 14_000_000, 0, 200_000_000);
+  const transport = options.transport === 'tcp' ? 'tcp' : 'udp';
   const profileFile = String(options.profileFile || nativeV2ClientProfilePath());
   writeNativeV2ClientProfile(profileFile, { width, height, fps, bitrate });
   const args = [
@@ -471,7 +492,7 @@ function startNativeV2Client(options = {}) {
     '--bitrate', String(bitrate),
     '--profile-file', profileFile,
   ];
-  args.push('--transport', options.transport === 'udp' ? 'udp' : 'tcp');
+  args.push('--transport', transport);
   if (options.fullscreen !== false) args.push('--fullscreen');
 
   nativeV2ClientLastOptions = {
@@ -485,7 +506,7 @@ function startNativeV2Client(options = {}) {
     fps,
     bitrate,
     fullscreen: options.fullscreen !== false,
-    transport: options.transport === 'udp' ? 'udp' : 'tcp',
+    transport,
     profileFile,
   };
 
@@ -499,7 +520,7 @@ function startNativeV2Client(options = {}) {
   const pid = nativeV2ClientProcess.pid;
   sendToMainWindow('host-log', {
     level: 'info',
-    message: `native-v2 client started pid=${pid} host=${options.hostIp}:${videoPort} transport=${options.transport === 'udp' ? 'udp' : 'tcp'}`,
+    message: `native-v2 client started pid=${pid} host=${options.hostIp}:${videoPort} transport=${transport}`,
   });
 
   proc.stdout?.on('data', (chunk) => {
@@ -525,6 +546,16 @@ function startNativeV2Client(options = {}) {
         if (!appIsQuitting) {
           try {
             startNativeV2Client(nextOptions);
+            if (nativeV2LastRemoteHostRequest?.device?.pin && nativeV2LastRemoteHostRequest?.device?.port) {
+              setTimeout(() => {
+                restartNativeV2RemoteHostForClientProfile(nextOptions).catch((err) => {
+                  sendToMainWindow('host-log', {
+                    level: 'error',
+                    message: `native-v2 remote host profile restart failed: ${err.message || String(err)}`,
+                  });
+                });
+              }, 220);
+            }
           } catch (err) {
             sendToMainWindow('host-log', {
               level: 'error',
@@ -558,6 +589,7 @@ function startNativeV2Client(options = {}) {
     fps,
     bitrate,
     fullscreen: options.fullscreen !== false,
+    transport,
     profileFile,
   };
 }
@@ -566,10 +598,7 @@ function startNativeV2Host(options = {}) {
   if (process.platform !== 'darwin') {
     throw new Error('Native v2 macOS host can only run on macOS');
   }
-  const allowUdpVideo = options.allowUdpVideo === true || process.env.P2P_NATIVE_V2_ALLOW_UDP === '1';
-  if (options.transport === 'udp' && !allowUdpVideo) {
-    throw new Error('Windows 端仍在请求 UDP 视频。请在 Windows 端拉取最新 main 并重新打包/安装；新版默认使用 TCP 45000 视频，避免黑屏。');
-  }
+  const allowUdpVideo = options.allowUdpVideo !== false && process.env.P2P_NATIVE_V2_DISABLE_UDP !== '1';
   if (!options.clientIp) {
     throw new Error('Native v2 host needs the Windows client IP address');
   }
@@ -579,17 +608,18 @@ function startNativeV2Host(options = {}) {
 
   const exePath = findFirstExistingPath(nativeV2MacHostCandidates());
   if (!exePath) {
-    throw new Error('Native v2 macOS Host 还没有构建。请在 Mac 上执行 npm run v2:mac:build，或使用包含 native-v2 host 的安装包。');
+    throw new Error('Native v2 macOS host is not built yet. Run npm run v2:mac:build on the Mac first, or use an installer that includes native-v2 host.');
   }
 
   const videoPort = normalizeNativeV2Number(options.videoPort, 45000, 1, 65535);
   const inputPort = normalizeNativeV2Number(options.inputPort, 45001, 1, 65535);
   const width = normalizeNativeV2Number(options.width, 1920, 640, 7680);
   const height = normalizeNativeV2Number(options.height, 1080, 360, 4320);
-  const fps = normalizeNativeV2Number(options.fps, 120, 30, 240);
-  const bitrate = normalizeNativeV2Number(options.bitrate, 20_000_000, 1_000_000, 200_000_000);
+  const fps = normalizeNativeV2Number(options.fps, 60, 30, 240);
+  const bitrate = normalizeNativeV2Number(options.bitrate, 14_000_000, 1_000_000, 200_000_000);
   const keyint = normalizeNativeV2Number(options.keyint, 1, 1, 300);
-  const transport = options.transport === 'udp' && allowUdpVideo ? 'udp' : 'tcp';
+  const requestedTransport = options.transport === 'tcp' ? 'tcp' : 'udp';
+  const transport = requestedTransport === 'udp' && allowUdpVideo ? 'udp' : 'tcp';
   const args = [
     '--client-ip', String(options.clientIp),
     '--video-port', String(videoPort),
@@ -722,6 +752,17 @@ function requestNativeV2RemoteHost(device, options = {}) {
       }
 
       if (message.type === 'native-v2-host-started' && message.requestId === requestId) {
+        nativeV2LastRemoteHostRequest = {
+          device: {
+            id: device.id,
+            name: device.name,
+            platform: device.platform,
+            address: device.address,
+            port: Number(device.port || SIGNAL_PORT),
+            pin: String(device.pin || ''),
+          },
+          options: { ...requestOptions },
+        };
         finish(null, message.result || { ok: true });
         return;
       }

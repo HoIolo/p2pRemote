@@ -153,7 +153,7 @@ function clampEven(value, fallback = 2) {
   return number % 2 === 0 ? number : number - 1;
 }
 
-function scaleResolution(width, height, maxLongEdge = 1920) {
+function scaleResolution(width, height, maxLongEdge = 1600) {
   const longEdge = Math.max(width, height);
   if (!longEdge || longEdge <= maxLongEdge) {
     return { width: clampEven(width, 1920), height: clampEven(height, 1080) };
@@ -167,10 +167,12 @@ function scaleResolution(width, height, maxLongEdge = 1920) {
 
 function autoBitrateForPixels(pixels, fallbackBitrate) {
   let bitrate = fallbackBitrate;
-  if (pixels <= 1280 * 720) bitrate = Math.max(bitrate, 16_000_000);
-  else if (pixels <= 1920 * 1080) bitrate = Math.max(bitrate, 28_000_000);
-  else if (pixels <= 2560 * 1440) bitrate = Math.max(bitrate, 40_000_000);
-  else bitrate = Math.max(bitrate, 60_000_000);
+  if (pixels <= 1280 * 720) bitrate = Math.max(bitrate, 8_000_000);
+  else if (pixels <= 1600 * 900) bitrate = Math.max(bitrate, 10_000_000);
+  else if (pixels <= 1920 * 1080) bitrate = Math.max(bitrate, 12_000_000);
+  else if (pixels <= 1920 * 1200) bitrate = Math.max(bitrate, 14_000_000);
+  else if (pixels <= 2560 * 1440) bitrate = Math.max(bitrate, 18_000_000);
+  else bitrate = Math.max(bitrate, 24_000_000);
   return bitrate;
 }
 
@@ -184,7 +186,7 @@ function nativeV2DisplayOptions(device) {
     return {
       width,
       height,
-      bitrate: autoBitrateForPixels(width * height, defaults.bitrate || 28_000_000),
+      bitrate: autoBitrateForPixels(width * height, defaults.bitrate || 14_000_000),
     };
   }
 
@@ -192,7 +194,7 @@ function nativeV2DisplayOptions(device) {
   const sourceHeight = clampEven(display.height * scaleFactor, defaults.height || 1080);
   const scaled = scaleResolution(sourceWidth, sourceHeight);
   const pixels = scaled.width * scaled.height;
-  const bitrate = autoBitrateForPixels(pixels, defaults.bitrate || 28_000_000);
+  const bitrate = autoBitrateForPixels(pixels, defaults.bitrate || 14_000_000);
 
   return {
     width: scaled.width,
@@ -204,7 +206,7 @@ function nativeV2DisplayOptions(device) {
 function nativeV2ClientOptions(device) {
   const defaults = nativeV2Status?.defaults || {};
   const display = nativeV2DisplayOptions(device);
-  const transport = defaults.transport || 'tcp';
+  const transport = defaults.transport || 'udp';
   return {
     hostIp: device.address,
     hostName: device.name,
@@ -224,7 +226,7 @@ function nativeV2HostOptions(device) {
   const defaults = nativeV2Status?.defaults || {};
   const clientIp = appInfo?.device?.addresses?.[0] || '';
   const display = nativeV2DisplayOptions(device);
-  const transport = defaults.transport || 'tcp';
+  const transport = defaults.transport || 'udp';
   return {
     clientIp: nativeV2Status?.platform === 'win32' ? clientIp : device.address,
     videoPort: defaults.videoPort || 45000,
@@ -244,7 +246,7 @@ function nativeV2MacHostCommand(device, routeAddress = '') {
   const display = nativeV2DisplayOptions(device);
   return [
     'cd native-v2/mac-host',
-    `CLIENT_IP=${clientIp} VIDEO_PORT=${defaults.videoPort || 45000} INPUT_PORT=${defaults.inputPort || 45001} WIDTH=${display.width} HEIGHT=${display.height} FPS=${defaults.fps || 60} BITRATE=${display.bitrate} TRANSPORT=${defaults.transport || 'tcp'} ./run-ultra.sh`,
+    `CLIENT_IP=${clientIp} VIDEO_PORT=${defaults.videoPort || 45000} INPUT_PORT=${defaults.inputPort || 45001} WIDTH=${display.width} HEIGHT=${display.height} FPS=${defaults.fps || 60} BITRATE=${display.bitrate} TRANSPORT=${defaults.transport || 'udp'} ./run-ultra.sh`,
   ].join('\n');
 }
 

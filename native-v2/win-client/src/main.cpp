@@ -39,6 +39,7 @@ using Microsoft::WRL::ComPtr;
 static constexpr int kMaxUdp = 1500;
 static constexpr int kVideoHeaderBytes = sizeof(P2VideoHeader);
 static constexpr int kMaxVideoFragmentPayload = 1200 - kVideoHeaderBytes;
+static constexpr size_t kMaxEncodedQueueDepth = 2;
 
 struct Config {
   std::wstring hostIp = L"127.0.0.1";
@@ -128,6 +129,8 @@ static std::atomic<uint64_t> g_packetsRx{0};
 static std::atomic<uint64_t> g_bytesRx{0};
 static std::atomic<uint64_t> g_framesComplete{0};
 static std::atomic<uint64_t> g_framesDropped{0};
+static std::atomic<uint64_t> g_clientFramesDropped{0};
+static std::atomic<uint64_t> g_networkFramesDropped{0};
 static std::atomic<uint64_t> g_decodeFails{0};
 static std::atomic<uint64_t> g_gpuRenderFails{0};
 static std::atomic<uint64_t> g_lastPacketQpc{0};
@@ -136,6 +139,13 @@ static std::atomic<bool> g_decoderPrimed{false};
 static std::atomic<bool> g_waitingForKeyframe{false};
 static std::atomic<uint64_t> g_lastKeyframeRequestQpc{0};
 static std::atomic<uint64_t> g_keyframeRequests{0};
+static std::atomic<int> g_currentBitrate{12'000'000};
+static std::atomic<int> g_minAdaptiveBitrate{4'000'000};
+static std::atomic<int> g_maxAdaptiveBitrate{20'000'000};
+static std::atomic<uint64_t> g_lastBitrateControlQpc{0};
+static std::atomic<uint64_t> g_lastBitrateIncreaseQpc{0};
+static std::atomic<double> g_recentDropScore{0.0};
+static std::atomic<uint64_t> g_lastAutoProfileChangeQpc{0};
 static uint64_t g_startedQpc = 0;
 static std::wstring g_localIp = L"-";
 static VideoProfile g_pendingProfile;
@@ -145,8 +155,8 @@ static int g_fpsIndex = 0;
 static int g_bitrateIndex = 0;
 static int g_exitCode = 0;
 static constexpr int kProfileApplyExitCode = 23;
-static constexpr std::array<int, 4> kFpsPresets = {30, 60, 90, 120};
-static constexpr std::array<int, 5> kBitratePresetsMbps = {16, 28, 40, 60, 80};
+static constexpr std::array<int, 5> kFpsPresets = {30, 45, 60, 90, 120};
+static constexpr std::array<int, 5> kBitratePresetsMbps = {8, 12, 16, 24, 32};
 
 struct NativeUiStats {
   double presentFps = 0.0;
@@ -156,8 +166,11 @@ struct NativeUiStats {
   double rxToPresentMs = 0.0;
   double packetAgeMs = 0.0;
   double frameAgeMs = 0.0;
-  double lossPct = 0.0;
+  double queueDropPct = 0.0;
+  double networkDropPct = 0.0;
   uint64_t dropped = 0;
+  uint64_t clientDropped = 0;
+  uint64_t networkDropped = 0;
   uint64_t decodeFails = 0;
   uint64_t gpuRenderFails = 0;
   uint64_t gpuFrames = 0;
@@ -168,6 +181,8 @@ static std::mutex g_uiStatsMu;
 static NativeUiStats g_uiStats;
 
 static void EnterVideoRecovery(const wchar_t* reason);
+static void SendInputPacket(uint8_t kind, float x, float y, int32_t dx, int32_t dy, uint16_t button, uint16_t keyCode);
+static void SendVideoBitrateControl(int bitrate, const wchar_t* reason);
 
 static uint64_t QpcNow() {
   LARGE_INTEGER q{};
@@ -178,6 +193,16 @@ static uint64_t QpcNow() {
 static uint64_t QpcDeltaUs(uint64_t start, uint64_t end) {
   if (!g_qpcFreq.QuadPart || end <= start) return 0;
   return (end - start) * 1'000'000ull / static_cast<uint64_t>(g_qpcFreq.QuadPart);
+}
+
+static void RecordClientFrameDrop(uint64_t count = 1) {
+  g_framesDropped.fetch_add(count, std::memory_order_relaxed);
+  g_clientFramesDropped.fetch_add(count, std::memory_order_relaxed);
+}
+
+static void RecordNetworkFrameDrop(uint64_t count = 1) {
+  g_framesDropped.fetch_add(count, std::memory_order_relaxed);
+  g_networkFramesDropped.fetch_add(count, std::memory_order_relaxed);
 }
 
 static void Log(const wchar_t* fmt, ...) {
@@ -260,7 +285,7 @@ static void PushEncoded(EncodedFrame&& f) {
     std::lock_guard lk(g_encodedMu);
     if (g_waitingForKeyframe.load(std::memory_order_relaxed)) {
       if (!f.keyframe) {
-        g_framesDropped.fetch_add(1, std::memory_order_relaxed);
+        RecordClientFrameDrop();
         return;
       }
       g_waitingForKeyframe.store(false, std::memory_order_relaxed);
@@ -269,19 +294,22 @@ static void PushEncoded(EncodedFrame&& f) {
     // Until the decoder has successfully produced a frame, keep the newest
     // keyframe around and drop delta frames that would otherwise starve sync.
     if (!g_decoderPrimed.load(std::memory_order_relaxed) && !f.keyframe) {
-      g_framesDropped.fetch_add(1, std::memory_order_relaxed);
+      RecordClientFrameDrop();
       return;
     }
 
     if (!g_encodedQueue.empty()) {
       const EncodedFrame& pending = g_encodedQueue.back();
       if (pending.keyframe && !f.keyframe) {
-        g_framesDropped.fetch_add(1, std::memory_order_relaxed);
+        RecordClientFrameDrop();
         return;
       }
     }
 
-    g_encodedQueue.clear(); // latency policy: keep newest decodable frame only
+    while (g_encodedQueue.size() >= kMaxEncodedQueueDepth) {
+      g_encodedQueue.pop_front();
+      RecordClientFrameDrop();
+    }
     g_encodedQueue.emplace_back(std::move(f));
     queued = true;
   }
@@ -581,12 +609,12 @@ float4 main(VSOut i) : SV_Target {
 
 static std::unique_ptr<D3DRenderer> g_renderer;
 
-static constexpr int kToolbarWidth = 470;
-static constexpr int kToolbarHeight = 56;
-static constexpr int kMenuWidth = 410;
-static constexpr int kMenuHeight = 458;
-static constexpr int kStatsWidth = 560;
-static constexpr int kStatsHeight = 720;
+static constexpr int kToolbarWidth = 560;
+static constexpr int kToolbarHeight = 60;
+static constexpr int kMenuWidth = 440;
+static constexpr int kMenuHeight = 486;
+static constexpr int kStatsWidth = 580;
+static constexpr int kStatsHeight = 760;
 static constexpr wchar_t kNativeClientVersion[] = L"native v2 0.1.0";
 
 static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -616,11 +644,13 @@ static int ClampEven(int value, int fallback = 2) {
 
 static int AutoBitrateForPixels(int width, int height, int fallback) {
   const int64_t pixels = static_cast<int64_t>(width) * height;
-  int bitrate = std::max(16'000'000, fallback);
-  if (pixels <= 1280ll * 720ll) bitrate = std::max(bitrate, 16'000'000);
-  else if (pixels <= 1920ll * 1080ll) bitrate = std::max(bitrate, 28'000'000);
-  else if (pixels <= 2560ll * 1440ll) bitrate = std::max(bitrate, 40'000'000);
-  else bitrate = std::max(bitrate, 60'000'000);
+  int bitrate = std::max(8'000'000, fallback);
+  if (pixels <= 1280ll * 720ll) bitrate = std::max(bitrate, 8'000'000);
+  else if (pixels <= 1600ll * 900ll) bitrate = std::max(bitrate, 10'000'000);
+  else if (pixels <= 1920ll * 1080ll) bitrate = std::max(bitrate, 12'000'000);
+  else if (pixels <= 1920ll * 1200ll) bitrate = std::max(bitrate, 14'000'000);
+  else if (pixels <= 2560ll * 1440ll) bitrate = std::max(bitrate, 18'000'000);
+  else bitrate = std::max(bitrate, 24'000'000);
   return bitrate;
 }
 
@@ -629,7 +659,7 @@ static VideoProfile CurrentVideoProfile() {
   profile.width = g_cfg.width;
   profile.height = g_cfg.height;
   profile.fps = g_cfg.fps;
-  profile.bitrate = g_cfg.bitrate > 0 ? g_cfg.bitrate : AutoBitrateForPixels(g_cfg.width, g_cfg.height, 28'000'000);
+  profile.bitrate = g_cfg.bitrate > 0 ? g_cfg.bitrate : AutoBitrateForPixels(g_cfg.width, g_cfg.height, 14'000'000);
   return profile;
 }
 
@@ -757,6 +787,62 @@ static void CycleBitrate(int delta) {
   const int count = static_cast<int>(kBitratePresetsMbps.size());
   g_bitrateIndex = (g_bitrateIndex + delta + count) % count;
   UpdatePendingProfileFromIndices();
+}
+
+static int FindResolutionPresetIndex(int width, int height) {
+  if (g_resolutionPresets.empty()) return -1;
+  for (size_t i = 0; i < g_resolutionPresets.size(); ++i) {
+    if (g_resolutionPresets[i].width == width && g_resolutionPresets[i].height == height) {
+      return static_cast<int>(i);
+    }
+  }
+  int bestIndex = 0;
+  int64_t bestDiff = LLONG_MAX;
+  const int64_t targetPixels = static_cast<int64_t>(width) * height;
+  for (size_t i = 0; i < g_resolutionPresets.size(); ++i) {
+    const int64_t pixels = static_cast<int64_t>(g_resolutionPresets[i].width) * g_resolutionPresets[i].height;
+    const int64_t diff = pixels > targetPixels ? (pixels - targetPixels) : (targetPixels - pixels);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestIndex = static_cast<int>(i);
+    }
+  }
+  return bestIndex;
+}
+
+static int FindClosestFpsIndex(int fps) {
+  int bestIndex = 0;
+  int bestDiff = INT_MAX;
+  for (size_t i = 0; i < kFpsPresets.size(); ++i) {
+    const int diff = std::abs(kFpsPresets[i] - fps);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestIndex = static_cast<int>(i);
+    }
+  }
+  return bestIndex;
+}
+
+static int FindClosestBitrateIndex(int bitrate) {
+  const int currentMbps = std::max(1, (bitrate + 500'000) / 1'000'000);
+  int bestIndex = 0;
+  int bestDiff = INT_MAX;
+  for (size_t i = 0; i < kBitratePresetsMbps.size(); ++i) {
+    const int diff = std::abs(kBitratePresetsMbps[i] - currentMbps);
+    if (diff < bestDiff) {
+      bestDiff = diff;
+      bestIndex = static_cast<int>(i);
+    }
+  }
+  return bestIndex;
+}
+
+static void SyncPendingProfileToIndices(const VideoProfile& profile) {
+  g_pendingProfile = profile;
+  const int resIndex = FindResolutionPresetIndex(profile.width, profile.height);
+  if (resIndex >= 0) g_resolutionIndex = resIndex;
+  g_fpsIndex = FindClosestFpsIndex(profile.fps);
+  g_bitrateIndex = FindClosestBitrateIndex(profile.bitrate);
 }
 
 static bool WriteProfileFile(const std::wstring& profileFile, const VideoProfile& profile) {
@@ -934,7 +1020,7 @@ static void UpdateOverlayLayout() {
   ApplyRoundedRegion(g_toolbarHwnd, 28);
 
   if (g_menuHwnd && IsWindowVisible(g_menuHwnd)) {
-    int x = toolbarX + 35;
+    int x = toolbarX + 28;
     int y = toolbarY + kToolbarHeight + 8;
     ClampToMonitor(x, y, kMenuWidth, kMenuHeight);
     SetWindowPos(g_menuHwnd, HWND_TOPMOST, x, y, kMenuWidth, kMenuHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -942,7 +1028,7 @@ static void UpdateOverlayLayout() {
   }
 
   if (g_statsHwnd && IsWindowVisible(g_statsHwnd)) {
-    int x = toolbarX - 30;
+    int x = toolbarX + std::max(0, kToolbarWidth - kStatsWidth);
     int y = toolbarY + kToolbarHeight + 8;
     ClampToMonitor(x, y, kStatsWidth, kStatsHeight);
     SetWindowPos(g_statsHwnd, HWND_TOPMOST, x, y, kStatsWidth, kStatsHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -1030,8 +1116,9 @@ static void DrawSelectorButton(HDC hdc, RECT rc, bool left) {
 }
 
 static void DrawToolbar(HDC hdc, RECT rc) {
-  HBRUSH bg = CreateSolidBrush(RGB(247, 249, 250));
-  HPEN border = CreatePen(PS_SOLID, 1, RGB(218, 224, 230));
+  const NativeUiStats stats = CurrentUiStats();
+  HBRUSH bg = CreateSolidBrush(RGB(249, 251, 253));
+  HPEN border = CreatePen(PS_SOLID, 1, RGB(219, 225, 232));
   HBRUSH oldBrush = reinterpret_cast<HBRUSH>(SelectObject(hdc, bg));
   HPEN oldPen = reinterpret_cast<HPEN>(SelectObject(hdc, border));
   RoundRect(hdc, 0, 0, rc.right, rc.bottom, 24, 24);
@@ -1040,20 +1127,28 @@ static void DrawToolbar(HDC hdc, RECT rc) {
   DeleteObject(border);
   DeleteObject(bg);
 
+  HBRUSH closeFill = CreateSolidBrush(RGB(242, 245, 248));
+  HPEN closeBorder = CreatePen(PS_SOLID, 1, RGB(224, 229, 235));
+  HBRUSH oldCloseFill = reinterpret_cast<HBRUSH>(SelectObject(hdc, closeFill));
+  HPEN oldCloseBorder = reinterpret_cast<HPEN>(SelectObject(hdc, closeBorder));
+  Ellipse(hdc, 14, 12, 48, 46);
+  SelectObject(hdc, oldCloseBorder);
+  SelectObject(hdc, oldCloseFill);
+  DeleteObject(closeBorder);
+  DeleteObject(closeFill);
+
   HPEN ink = CreatePen(PS_SOLID, 2, RGB(22, 30, 40));
   HPEN oldInk = reinterpret_cast<HPEN>(SelectObject(hdc, ink));
-  MoveToEx(hdc, 24, 20, nullptr); LineTo(hdc, 38, 34);
-  MoveToEx(hdc, 38, 20, nullptr); LineTo(hdc, 24, 34);
-  MoveToEx(hdc, 82, 27, nullptr); LineTo(hdc, 100, 27);
-  MoveToEx(hdc, 91, 18, nullptr); LineTo(hdc, 91, 36);
+  MoveToEx(hdc, 25, 22, nullptr); LineTo(hdc, 37, 34);
+  MoveToEx(hdc, 37, 22, nullptr); LineTo(hdc, 25, 34);
   SelectObject(hdc, oldInk);
   DeleteObject(ink);
 
-  HBRUSH controlPill = CreateSolidBrush(RGB(221, 226, 231));
+  HBRUSH controlPill = CreateSolidBrush(RGB(236, 241, 246));
   HBRUSH oldControlPill = reinterpret_cast<HBRUSH>(SelectObject(hdc, controlPill));
-  HPEN controlPen = CreatePen(PS_SOLID, 1, RGB(221, 226, 231));
+  HPEN controlPen = CreatePen(PS_SOLID, 1, RGB(218, 225, 233));
   HPEN oldControlPen = reinterpret_cast<HPEN>(SelectObject(hdc, controlPen));
-  RoundRect(hdc, 120, 7, 286, 49, 16, 16);
+  RoundRect(hdc, 64, 8, 274, 52, 18, 18);
   SelectObject(hdc, oldControlPen);
   SelectObject(hdc, oldControlPill);
   DeleteObject(controlPen);
@@ -1061,34 +1156,70 @@ static void DrawToolbar(HDC hdc, RECT rc) {
 
   HPEN controlInk = CreatePen(PS_SOLID, 2, RGB(24, 33, 44));
   HPEN oldControlInk = reinterpret_cast<HPEN>(SelectObject(hdc, controlInk));
-  RoundRect(hdc, 138, 16, 160, 24, 4, 4);
-  RoundRect(hdc, 138, 31, 160, 39, 4, 4);
-  MoveToEx(hdc, 143, 20, nullptr); LineTo(hdc, 155, 20);
-  MoveToEx(hdc, 143, 35, nullptr); LineTo(hdc, 155, 35);
+  RoundRect(hdc, 82, 16, 104, 24, 4, 4);
+  RoundRect(hdc, 82, 31, 104, 39, 4, 4);
+  MoveToEx(hdc, 87, 20, nullptr); LineTo(hdc, 99, 20);
+  MoveToEx(hdc, 87, 35, nullptr); LineTo(hdc, 99, 35);
   SelectObject(hdc, oldControlInk);
   DeleteObject(controlInk);
 
   HFONT controlFont = CreateUiFont(16, FW_SEMIBOLD);
-  RECT controlRc{170, 11, 276, 45};
+  HFONT controlSubFont = CreateUiFont(12, FW_NORMAL);
+  RECT controlRc{114, 11, 262, 30};
+  RECT controlSubRc{114, 28, 262, 46};
+  std::wstring controlSummary = FormatResolution(g_cfg.width, g_cfg.height)
+                              + L" / " + std::to_wstring(g_cfg.fps) + L" fps / "
+                              + FormatBitrate(g_currentBitrate.load(std::memory_order_relaxed));
   DrawTextRect(hdc, L"显示控制", controlRc, RGB(18, 24, 34), controlFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+  DrawTextRect(hdc, controlSummary, controlSubRc, RGB(104, 114, 126), controlSubFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
   DeleteObject(controlFont);
+  DeleteObject(controlSubFont);
 
-  HBRUSH pill = CreateSolidBrush(RGB(221, 226, 231));
+  HBRUSH pill = CreateSolidBrush(RGB(236, 245, 240));
   HBRUSH oldPill = reinterpret_cast<HBRUSH>(SelectObject(hdc, pill));
-  HPEN noPen = CreatePen(PS_SOLID, 1, RGB(221, 226, 231));
+  HPEN noPen = CreatePen(PS_SOLID, 1, RGB(210, 228, 217));
   HPEN oldNoPen = reinterpret_cast<HPEN>(SelectObject(hdc, noPen));
-  RoundRect(hdc, 302, 7, 362, 49, 16, 16);
+  RoundRect(hdc, 286, 8, 430, 52, 18, 18);
   SelectObject(hdc, oldNoPen);
   SelectObject(hdc, oldPill);
   DeleteObject(noPen);
   DeleteObject(pill);
 
-  DrawSignalBars(hdc, 318, 15, RGB(17, 190, 122));
+  DrawSignalBars(hdc, 304, 14, RGB(17, 190, 122));
 
-  HFONT font = CreateUiFont(18, FW_SEMIBOLD);
-  RECT timeRc{376, 11, 462, 45};
-  DrawTextRect(hdc, FormatElapsed(), timeRc, RGB(82, 87, 94), font, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-  DeleteObject(font);
+  wchar_t statsText[96];
+  if (stats.rxToPresentMs > 0.0 || stats.mbps > 0.0) {
+    swprintf_s(statsText, L"%s · %.0f ms · %.1f Mbps", g_cfg.udpVideo ? L"UDP" : L"TCP", stats.rxToPresentMs, stats.mbps);
+  } else {
+    swprintf_s(statsText, L"%s 直连", g_cfg.udpVideo ? L"UDP" : L"TCP");
+  }
+  HFONT statsFont = CreateUiFont(14, FW_SEMIBOLD);
+  HFONT statsSubFont = CreateUiFont(11, FW_NORMAL);
+  RECT statsRc{346, 11, 418, 28};
+  RECT statsSubRc{346, 28, 418, 45};
+  DrawTextRect(hdc, L"链路概览", statsRc, RGB(24, 92, 52), statsFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+  DrawTextRect(hdc, statsText, statsSubRc, RGB(72, 118, 90), statsSubFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+  DeleteObject(statsFont);
+  DeleteObject(statsSubFont);
+
+  HBRUSH timerFill = CreateSolidBrush(RGB(243, 246, 250));
+  HPEN timerBorder = CreatePen(PS_SOLID, 1, RGB(222, 228, 235));
+  HBRUSH oldTimerFill = reinterpret_cast<HBRUSH>(SelectObject(hdc, timerFill));
+  HPEN oldTimerBorder = reinterpret_cast<HPEN>(SelectObject(hdc, timerBorder));
+  RoundRect(hdc, 442, 8, 546, 52, 18, 18);
+  SelectObject(hdc, oldTimerBorder);
+  SelectObject(hdc, oldTimerFill);
+  DeleteObject(timerBorder);
+  DeleteObject(timerFill);
+
+  HFONT timeFont = CreateUiFont(18, FW_SEMIBOLD);
+  HFONT timeSubFont = CreateUiFont(11, FW_NORMAL);
+  RECT timeRc{454, 14, 534, 34};
+  RECT timeSubRc{454, 30, 534, 46};
+  DrawTextRect(hdc, FormatElapsed(), timeRc, RGB(48, 58, 72), timeFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+  DrawTextRect(hdc, L"本次会话", timeSubRc, RGB(123, 133, 144), timeSubFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+  DeleteObject(timeFont);
+  DeleteObject(timeSubFont);
 }
 
 static void DrawMenuRow(HDC hdc, int y, int icon, const std::wstring& label, const std::wstring& value, bool chevron, bool danger = false) {
@@ -1097,16 +1228,16 @@ static void DrawMenuRow(HDC hdc, int y, int icon, const std::wstring& label, con
   DrawMenuIcon(hdc, icon, 24, y + 9, ink);
   HFONT labelFont = CreateUiFont(17, FW_SEMIBOLD);
   HFONT valueFont = CreateUiFont(13, FW_NORMAL);
-  RECT labelRc{62, y + 6, 238, y + 34};
+  RECT labelRc{62, y + 6, 250, y + 34};
   DrawTextRect(hdc, label, labelRc, ink, labelFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
   if (!value.empty()) {
-    RECT valueRc{220, y + 9, chevron ? 356 : 382, y + 34};
+    RECT valueRc{214, y + 9, chevron ? 390 : 412, y + 34};
     DrawTextRect(hdc, value, valueRc, subtle, valueFont, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
   }
   if (chevron) {
     HPEN pen = CreatePen(PS_SOLID, 3, RGB(26, 34, 44));
     HPEN oldPen = reinterpret_cast<HPEN>(SelectObject(hdc, pen));
-    MoveToEx(hdc, 368, y + 14, nullptr); LineTo(hdc, 376, y + 21); LineTo(hdc, 368, y + 28);
+    MoveToEx(hdc, 402, y + 14, nullptr); LineTo(hdc, 410, y + 21); LineTo(hdc, 402, y + 28);
     SelectObject(hdc, oldPen);
     DeleteObject(pen);
   }
@@ -1118,15 +1249,15 @@ static void DrawMenuSelectorRow(HDC hdc, int y, int icon, const std::wstring& la
   DrawMenuIcon(hdc, icon, 24, y + 9, RGB(28, 37, 48));
   HFONT labelFont = CreateUiFont(17, FW_SEMIBOLD);
   HFONT valueFont = CreateUiFont(13, FW_NORMAL);
-  RECT labelRc{62, y + 6, 172, y + 34};
+  RECT labelRc{62, y + 6, 180, y + 34};
   DrawTextRect(hdc, label, labelRc, RGB(28, 37, 48), labelFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-  RECT leftRc{224, y + 4, 254, y + 34};
-  RECT rightRc{360, y + 4, 390, y + 34};
+  RECT leftRc{238, y + 4, 270, y + 34};
+  RECT rightRc{376, y + 4, 408, y + 34};
   DrawSelectorButton(hdc, leftRc, true);
   DrawSelectorButton(hdc, rightRc, false);
 
-  RECT valueRc{262, y + 6, 350, y + 34};
+  RECT valueRc{280, y + 6, 366, y + 34};
   DrawTextRect(hdc, value, valueRc, RGB(110, 120, 132), valueFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
   DeleteObject(labelFont);
   DeleteObject(valueFont);
@@ -1155,8 +1286,8 @@ static void DrawMenu(HDC hdc, RECT rc) {
   const VideoProfile activeProfile = CurrentVideoProfile();
   const bool pendingChanges = !SameVideoProfile(activeProfile, g_pendingProfile);
 
-  HBRUSH bg = CreateSolidBrush(RGB(237, 248, 249));
-  HPEN border = CreatePen(PS_SOLID, 1, RGB(196, 210, 216));
+  HBRUSH bg = CreateSolidBrush(RGB(250, 252, 254));
+  HPEN border = CreatePen(PS_SOLID, 1, RGB(214, 221, 228));
   HBRUSH oldBrush = reinterpret_cast<HBRUSH>(SelectObject(hdc, bg));
   HPEN oldPen = reinterpret_cast<HPEN>(SelectObject(hdc, border));
   RoundRect(hdc, 0, 0, rc.right, rc.bottom, 18, 18);
@@ -1166,31 +1297,31 @@ static void DrawMenu(HDC hdc, RECT rc) {
   DeleteObject(bg);
 
   DrawMenuRow(hdc, 18, 0, DisplayLabel(), FormatCompactProfile(activeProfile), false);
-  DrawSeparator(hdc, 72);
-  DrawMenuSelectorRow(hdc, 86, 0, L"分辨率", FormatResolution(g_pendingProfile.width, g_pendingProfile.height));
-  DrawMenuSelectorRow(hdc, 134, 1, L"帧率", std::to_wstring(g_pendingProfile.fps) + L" fps");
-  DrawMenuSelectorRow(hdc, 182, 4, L"码率", FormatProfileBitrate(g_pendingProfile.bitrate));
-  DrawSeparator(hdc, 238);
-  DrawMenuRow(hdc, 252, 6, L"应用并重连", pendingChanges ? L"切换到新配置" : L"当前配置", false);
+  DrawSeparator(hdc, 76);
+  DrawMenuSelectorRow(hdc, 94, 0, L"分辨率", FormatResolution(g_pendingProfile.width, g_pendingProfile.height));
+  DrawMenuSelectorRow(hdc, 148, 1, L"帧率", std::to_wstring(g_pendingProfile.fps) + L" fps");
+  DrawMenuSelectorRow(hdc, 202, 4, L"码率", FormatProfileBitrate(g_pendingProfile.bitrate));
+  DrawSeparator(hdc, 258);
+  DrawMenuRow(hdc, 276, 6, L"应用并重连", pendingChanges ? FormatCompactProfile(g_pendingProfile) : L"当前已生效", false);
   wchar_t statsValue[64];
-  if (stats.rxToPresentMs > 0.0 || stats.mbps > 0.0) {
-    swprintf_s(statsValue, L"%.0f ms / %.1f Mbps", stats.rxToPresentMs, stats.mbps);
+  if (stats.presentFps > 0.1 || stats.rxToPresentMs > 0.0) {
+    swprintf_s(statsValue, L"%.0f fps / %.0f ms", stats.presentFps, stats.rxToPresentMs);
   } else {
     swprintf_s(statsValue, L"%s", g_cfg.udpVideo ? L"UDP 直连" : L"TCP 直连");
   }
-  DrawMenuRow(hdc, 300, 5, L"链路统计", statsValue, true);
-  DrawMenuRow(hdc, 348, 7, g_cfg.fullscreen ? L"退出全屏幕" : L"进入全屏幕", L"F11", false);
-  DrawSeparator(hdc, 404);
-  DrawMenuRow(hdc, 414, 8, L"退出远控", L"", false, true);
+  DrawMenuRow(hdc, 330, 5, L"链路统计", statsValue, true);
+  DrawMenuRow(hdc, 384, 7, g_cfg.fullscreen ? L"退出全屏幕" : L"进入全屏幕", L"F11", false);
+  DrawSeparator(hdc, 438);
+  DrawMenuRow(hdc, 448, 8, L"退出远控", L"", false, true);
 }
 
 static void DrawStatsRow(HDC hdc, int y, const std::wstring& label, const std::wstring& value) {
   HFONT labelFont = CreateUiFont(16, FW_SEMIBOLD);
   HFONT valueFont = CreateUiFont(18, FW_NORMAL);
   RECT labelRc{32, y, 205, y + 32};
-  RECT valueRc{230, y, kStatsWidth - 32, y + 32};
+  RECT valueRc{232, y, kStatsWidth - 32, y + 32};
   DrawTextRect(hdc, label, labelRc, RGB(146, 151, 160), labelFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-  DrawTextRect(hdc, value, valueRc, RGB(18, 24, 36), valueFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+  DrawTextRect(hdc, value, valueRc, RGB(18, 24, 36), valueFont, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
   DeleteObject(labelFont);
   DeleteObject(valueFont);
 }
@@ -1221,35 +1352,38 @@ static void DrawStats(HDC hdc, RECT rc) {
   DeleteObject(line);
 
   DrawStatsRow(hdc, 126, L"收帧后延时:", stats.rxToPresentMs > 0.0 ? FormatDouble(stats.rxToPresentMs, L" ms", 0) : L"-- ms");
-  DrawStatsRow(hdc, 166, L"帧率:", stats.presentFps > 0.1 ? FormatDouble(stats.presentFps, L"", 0) : FormatDouble(g_cfg.fps, L"", 0));
-  DrawStatsRow(hdc, 206, L"带宽占用:", FormatDouble(stats.mbps, L" Mbps", 1));
-  DrawStatsRow(hdc, 246, L"丢帧率:", FormatDouble(stats.lossPct, L"%", 1));
+  DrawStatsRow(hdc, 166, L"显示帧率:", stats.presentFps > 0.1 ? FormatDouble(stats.presentFps, L"", 0) : FormatDouble(g_cfg.fps, L"", 0));
+  DrawStatsRow(hdc, 206, L"接收完整帧率:", stats.completeFps > 0.1 ? FormatDouble(stats.completeFps, L"", 0) : L"--");
+  DrawStatsRow(hdc, 246, L"带宽占用:", FormatDouble(stats.mbps, L" Mbps", 1));
+  DrawStatsRow(hdc, 286, L"客户端丢旧帧:", FormatDouble(stats.queueDropPct, L"%", 1));
 
-  DrawStatsSeparator(hdc, 292);
-  DrawStatsRow(hdc, 316, L"传输通道:", g_cfg.udpVideo ? L"UDP 局域网直连" : L"TCP 局域网直连");
-  DrawStatsRow(hdc, 356, L"被控端 IP:", g_cfg.hostIp);
-  DrawStatsRow(hdc, 396, L"控制端 IP:", g_localIp);
-  DrawStatsRow(hdc, 436, L"客户端版本:", kNativeClientVersion);
-  DrawStatsRow(hdc, 476, L"被控端系统:", PlatformLabel(g_cfg.hostPlatform));
+  DrawStatsSeparator(hdc, 332);
+  DrawStatsRow(hdc, 356, L"传输通道:", g_cfg.udpVideo ? L"UDP 局域网直连" : L"TCP 局域网直连");
+  DrawStatsRow(hdc, 396, L"被控端 IP:", g_cfg.hostIp);
+  DrawStatsRow(hdc, 436, L"控制端 IP:", g_localIp);
+  DrawStatsRow(hdc, 476, L"网络拼帧废弃:", FormatDouble(stats.networkDropPct, L"%", 1));
+  DrawStatsRow(hdc, 516, L"被控端系统:", PlatformLabel(g_cfg.hostPlatform));
 
-  DrawStatsSeparator(hdc, 522);
-  DrawStatsRow(hdc, 542, L"编解码器:", L"H.264 / Media Foundation");
-  DrawStatsRow(hdc, 576, L"编码模式:", stats.gpuFrames > 0 ? L"硬编 / 硬解" : L"硬编 / 硬解优先");
-  DrawStatsRow(hdc, 610, L"采集方式:", g_cfg.hostPlatform == L"win32" ? L"DXGI" : L"ScreenCaptureKit");
-  wchar_t target[96];
-  swprintf_s(target, L"%dx%d @ %d fps", g_cfg.width, g_cfg.height, g_cfg.fps);
-  DrawStatsRow(hdc, 644, L"目标配置:", target);
-  DrawStatsRow(hdc, 678, L"目标码率:", FormatBitrate(g_cfg.bitrate));
+  DrawStatsSeparator(hdc, 562);
+  DrawStatsRow(hdc, 586, L"当前发送码率:", FormatBitrate(g_currentBitrate.load(std::memory_order_relaxed)));
+  DrawStatsRow(hdc, 620, L"编解码器:", L"H.264 / Media Foundation");
+  DrawStatsRow(hdc, 654, L"编码模式:", stats.gpuFrames > 0 ? L"硬编 / 硬解" : L"硬编 / 硬解优先");
+  DrawStatsRow(hdc, 688, L"采集方式:", g_cfg.hostPlatform == L"win32" ? L"DXGI" : L"ScreenCaptureKit");
+  wchar_t target[128];
+  swprintf_s(target, L"%dx%d @ %d fps / %d Mbps",
+             g_cfg.width,
+             g_cfg.height,
+             g_cfg.fps,
+             std::max(1, (g_cfg.bitrate + 500'000) / 1'000'000));
+  DrawStatsRow(hdc, 722, L"目标档位:", target);
 }
 
 static void HandleToolbarClick(int x, int y) {
-  if (x >= 14 && x <= 50 && y >= 10 && y <= 42) {
+  if (x >= 14 && x <= 48 && y >= 12 && y <= 46) {
     PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
-  } else if (x >= 62 && x <= 110 && y >= 8 && y <= 48) {
+  } else if (x >= 64 && x <= 274 && y >= 8 && y <= 52) {
     TogglePopup(g_menuHwnd);
-  } else if (x >= 120 && x <= 286 && y >= 6 && y <= 50) {
-    TogglePopup(g_menuHwnd);
-  } else if (x >= 302 && x <= 362 && y >= 6 && y <= 50) {
+  } else if (x >= 286 && x <= 430 && y >= 8 && y <= 52) {
     TogglePopup(g_statsHwnd);
   }
 }
@@ -1257,42 +1391,87 @@ static void HandleToolbarClick(int x, int y) {
 static void SendVideoProfileCommand(const VideoProfile& profile) {
   const uint16_t bitrateMbps = static_cast<uint16_t>(std::clamp((profile.bitrate + 500'000) / 1'000'000, 1, 200));
   for (int i = 0; i < 3; ++i) {
-    SendInput(P2_INPUT_SET_VIDEO_PROFILE, 0, 0, profile.width, profile.height,
-              static_cast<uint16_t>(std::clamp(profile.fps, 30, 240)), bitrateMbps);
+    SendInputPacket(P2_INPUT_SET_VIDEO_PROFILE, 0, 0, profile.width, profile.height,
+                    static_cast<uint16_t>(std::clamp(profile.fps, 30, 240)), bitrateMbps);
     if (i < 2) Sleep(15);
   }
 }
 
-static void ApplyPendingVideoProfile() {
+static bool RequestProfileApply(const VideoProfile& requestedProfile, const wchar_t* reason, bool autoTriggered = false) {
+  VideoProfile profile = requestedProfile;
+  profile.width = ClampEven(profile.width, g_cfg.width);
+  profile.height = ClampEven(profile.height, g_cfg.height);
+  profile.fps = std::clamp(profile.fps, 30, 240);
+  profile.bitrate = std::clamp(profile.bitrate, 2'000'000, 80'000'000);
   const VideoProfile activeProfile = CurrentVideoProfile();
-  if (SameVideoProfile(activeProfile, g_pendingProfile)) {
-    HideNativePopups();
-    return;
+  if (SameVideoProfile(activeProfile, profile)) {
+    if (!autoTriggered) HideNativePopups();
+    return false;
   }
 
-  if (!WriteProfileFile(g_cfg.profileFile, g_pendingProfile)) {
-    MessageBoxW(g_hwnd, L"Failed to save the updated native-v2 profile.", L"P2P Native", MB_ICONERROR);
-    return;
+  SyncPendingProfileToIndices(profile);
+  if (!WriteProfileFile(g_cfg.profileFile, profile)) {
+    if (autoTriggered) {
+      Log(L"auto profile apply save failed: %dx%d@%d bitrate=%d (%s)",
+          profile.width, profile.height, profile.fps, profile.bitrate, reason ? reason : L"auto");
+    } else {
+      MessageBoxW(g_hwnd, L"Failed to save the updated native-v2 profile.", L"P2P Native", MB_ICONERROR);
+    }
+    return false;
   }
 
-  SendVideoProfileCommand(g_pendingProfile);
+  if (autoTriggered) {
+    g_lastAutoProfileChangeQpc.store(QpcNow(), std::memory_order_relaxed);
+  }
+  SendVideoProfileCommand(profile);
+  Log(L"profile apply requested: %dx%d@%d bitrate=%d (%s)",
+      profile.width, profile.height, profile.fps, profile.bitrate, reason ? reason : L"manual");
   g_exitCode = kProfileApplyExitCode;
+  HideNativePopups();
   PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+  return true;
+}
+
+static bool BuildLowerAutoProfile(const VideoProfile& activeProfile, VideoProfile& nextProfile) {
+  nextProfile = activeProfile;
+  const int liveBitrate = std::max(g_minAdaptiveBitrate.load(std::memory_order_relaxed),
+                                   g_currentBitrate.load(std::memory_order_relaxed));
+  nextProfile.bitrate = liveBitrate;
+
+  const int fpsIndex = FindClosestFpsIndex(activeProfile.fps);
+  if (fpsIndex > 0) {
+    nextProfile.fps = kFpsPresets[fpsIndex - 1];
+    return true;
+  }
+
+  const int resolutionIndex = FindResolutionPresetIndex(activeProfile.width, activeProfile.height);
+  if (resolutionIndex > 0) {
+    nextProfile.width = g_resolutionPresets[resolutionIndex - 1].width;
+    nextProfile.height = g_resolutionPresets[resolutionIndex - 1].height;
+    nextProfile.bitrate = std::max(g_minAdaptiveBitrate.load(std::memory_order_relaxed),
+                                   std::min(liveBitrate, AutoBitrateForPixels(nextProfile.width, nextProfile.height, liveBitrate)));
+    return true;
+  }
+  return false;
+}
+
+static void ApplyPendingVideoProfile() {
+  RequestProfileApply(g_pendingProfile, L"manual");
 }
 
 static bool HandleSelectorClick(int x, int y, int rowY, void (*cycleFn)(int)) {
   if (y < rowY || y >= rowY + 40) return false;
-  if (x >= 224 && x <= 254) {
+  if (x >= 238 && x <= 270) {
     cycleFn(-1);
     if (g_menuHwnd) InvalidateRect(g_menuHwnd, nullptr, FALSE);
     return true;
   }
-  if (x >= 360 && x <= 390) {
+  if (x >= 376 && x <= 408) {
     cycleFn(1);
     if (g_menuHwnd) InvalidateRect(g_menuHwnd, nullptr, FALSE);
     return true;
   }
-  if (x >= 262 && x <= 350) {
+  if (x >= 280 && x <= 366) {
     cycleFn(1);
     if (g_menuHwnd) InvalidateRect(g_menuHwnd, nullptr, FALSE);
     return true;
@@ -1301,17 +1480,17 @@ static bool HandleSelectorClick(int x, int y, int rowY, void (*cycleFn)(int)) {
 }
 
 static void HandleMenuClick(int x, int y) {
-  if (HandleSelectorClick(x, y, 86, CycleResolution)) return;
-  if (HandleSelectorClick(x, y, 134, CycleFps)) return;
-  if (HandleSelectorClick(x, y, 182, CycleBitrate)) return;
+  if (HandleSelectorClick(x, y, 94, CycleResolution)) return;
+  if (HandleSelectorClick(x, y, 148, CycleFps)) return;
+  if (HandleSelectorClick(x, y, 202, CycleBitrate)) return;
 
-  if (y >= 252 && y < 292) {
+  if (y >= 276 && y < 316) {
     ApplyPendingVideoProfile();
-  } else if (y >= 300 && y < 340) {
+  } else if (y >= 330 && y < 370) {
     ShowOnlyPopup(g_statsHwnd);
-  } else if (y >= 348 && y < 388) {
+  } else if (y >= 384 && y < 424) {
     ToggleNativeFullscreen();
-  } else if (y >= 414 && y < 448) {
+  } else if (y >= 448 && y < 480) {
     PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
   }
 }
@@ -1436,7 +1615,7 @@ class VideoReceiver {
         for (auto it = partials.begin(); it != partials.end();) {
           if (it->first < keepFrom || QpcDeltaUs(it->second.firstQpc, now) > 750'000) {
             it = partials.erase(it);
-            g_framesDropped.fetch_add(1, std::memory_order_relaxed);
+            RecordNetworkFrameDrop();
           } else {
             ++it;
           }
@@ -1455,7 +1634,7 @@ class VideoReceiver {
         partial.got.assign(h->fragCount, 0);
       } else if (partial.fragCount != h->fragCount || partial.frameBytes != h->frameBytes) {
         partials.erase(it);
-        g_framesDropped.fetch_add(1, std::memory_order_relaxed);
+        RecordNetworkFrameDrop();
         continue;
       }
 
@@ -1872,8 +2051,8 @@ static void DecoderThread() {
       std::unique_lock lk(g_encodedMu);
       g_encodedCv.wait(lk, [] { return !g_running.load() || !g_encodedQueue.empty(); });
       if (!g_running.load()) break;
-      encoded = std::move(g_encodedQueue.back());
-      g_encodedQueue.clear();
+      encoded = std::move(g_encodedQueue.front());
+      g_encodedQueue.pop_front();
     }
     DecodedFrame frame;
     if (decoder->Decode(encoded, frame)) {
@@ -1960,7 +2139,7 @@ static uint16_t VkToMacKeyCode(WPARAM vk) {
   }
 }
 
-static void SendInput(uint8_t kind, float x, float y, int32_t dx, int32_t dy, uint16_t button, uint16_t keyCode) {
+static void SendInputPacket(uint8_t kind, float x, float y, int32_t dx, int32_t dy, uint16_t button, uint16_t keyCode) {
   if (g_inputSock == INVALID_SOCKET) return;
   P2InputPacket p{};
   memcpy(p.magic, "P2I2", 4);
@@ -1972,13 +2151,29 @@ static void SendInput(uint8_t kind, float x, float y, int32_t dx, int32_t dy, ui
   sendto(g_inputSock, reinterpret_cast<const char*>(&p), sizeof(p), 0, reinterpret_cast<sockaddr*>(&g_inputAddr), sizeof(g_inputAddr));
 }
 
+static void SendVideoBitrateControl(int bitrate, const wchar_t* reason) {
+  if (g_inputSock == INVALID_SOCKET) return;
+  const int clamped = std::max(g_minAdaptiveBitrate.load(std::memory_order_relaxed),
+                               std::min(g_maxAdaptiveBitrate.load(std::memory_order_relaxed), bitrate));
+  const int current = g_currentBitrate.load(std::memory_order_relaxed);
+  if (clamped == current) return;
+  g_currentBitrate.store(clamped, std::memory_order_relaxed);
+  const uint64_t now = QpcNow();
+  g_lastBitrateControlQpc.store(now, std::memory_order_relaxed);
+  if (clamped > current) {
+    g_lastBitrateIncreaseQpc.store(now, std::memory_order_relaxed);
+  }
+  SendInputPacket(P2_INPUT_SET_VIDEO_BITRATE, 0, 0, static_cast<int32_t>(clamped), 0, 0, 0);
+  Log(L"adaptive bitrate request=%d (%s)", clamped, reason ? reason : L"adaptive");
+}
+
 static void EnterVideoRecovery(const wchar_t* reason) {
   g_waitingForKeyframe.store(true, std::memory_order_relaxed);
   g_decoderPrimed.store(false, std::memory_order_relaxed);
   {
     std::lock_guard lk(g_encodedMu);
     if (!g_encodedQueue.empty()) {
-      g_framesDropped.fetch_add(static_cast<uint64_t>(g_encodedQueue.size()), std::memory_order_relaxed);
+      RecordClientFrameDrop(static_cast<uint64_t>(g_encodedQueue.size()));
       g_encodedQueue.clear();
     }
   }
@@ -1989,7 +2184,12 @@ static void EnterVideoRecovery(const wchar_t* reason) {
   if (last && QpcDeltaUs(last, now) < 120'000) return;
   g_lastKeyframeRequestQpc.store(now, std::memory_order_relaxed);
   g_keyframeRequests.fetch_add(1, std::memory_order_relaxed);
-  SendInput(P2_INPUT_REQUEST_KEYFRAME, 0, 0, 0, 0, 0, 0);
+  const int current = g_currentBitrate.load(std::memory_order_relaxed);
+  const int reduced = std::max(g_minAdaptiveBitrate.load(std::memory_order_relaxed), current * 85 / 100);
+  if (reduced < current) {
+    SendVideoBitrateControl(reduced, L"recovery");
+  }
+  SendInputPacket(P2_INPUT_REQUEST_KEYFRAME, 0, 0, 0, 0, 0, 0);
   Log(L"requested keyframe recovery: %s", reason ? reason : L"unknown");
 }
 
@@ -2034,6 +2234,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       double packetAgeMs = double(QpcDeltaUs(g_lastPacketQpc.load(std::memory_order_relaxed), now)) / 1000.0;
       double frameAgeMs = double(QpcDeltaUs(g_lastCompleteQpc.load(std::memory_order_relaxed), now)) / 1000.0;
       uint64_t dropped = g_framesDropped.load(std::memory_order_relaxed);
+      uint64_t clientDropped = g_clientFramesDropped.load(std::memory_order_relaxed);
+      uint64_t networkDropped = g_networkFramesDropped.load(std::memory_order_relaxed);
       uint64_t decodeFails = g_decodeFails.load(std::memory_order_relaxed);
       uint64_t gpuRenderFails = g_gpuRenderFails.load(std::memory_order_relaxed);
       NativeUiStats stats{};
@@ -2045,22 +2247,65 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       stats.packetAgeMs = packetAgeMs;
       stats.frameAgeMs = frameAgeMs;
       stats.dropped = dropped;
+      stats.clientDropped = clientDropped;
+      stats.networkDropped = networkDropped;
       stats.decodeFails = decodeFails;
       stats.gpuRenderFails = gpuRenderFails;
       stats.gpuFrames = gpu;
       stats.cpuFrames = cpu;
-      const uint64_t knownFrames = complete + dropped;
-      stats.lossPct = knownFrames ? (double(dropped) * 100.0 / double(knownFrames)) : 0.0;
+      const uint64_t clientKnownFrames = complete + clientDropped;
+      const uint64_t networkKnownFrames = complete + networkDropped;
+      stats.queueDropPct = clientKnownFrames ? (double(clientDropped) * 100.0 / double(clientKnownFrames)) : 0.0;
+      stats.networkDropPct = networkKnownFrames ? (double(networkDropped) * 100.0 / double(networkKnownFrames)) : 0.0;
       StoreUiStats(stats);
 
+      if (g_cfg.udpVideo) {
+        double prevScore = g_recentDropScore.load(std::memory_order_relaxed);
+        double dropScore = prevScore * 0.72 + stats.queueDropPct * 0.28;
+        g_recentDropScore.store(dropScore, std::memory_order_relaxed);
+        const uint64_t lastCtlQpc = g_lastBitrateControlQpc.load(std::memory_order_relaxed);
+        const uint64_t lastUpQpc = g_lastBitrateIncreaseQpc.load(std::memory_order_relaxed);
+        const uint64_t lastProfileQpc = g_lastAutoProfileChangeQpc.load(std::memory_order_relaxed);
+        const uint64_t sinceCtl = lastCtlQpc ? QpcDeltaUs(lastCtlQpc, now) : UINT64_MAX;
+        const uint64_t sinceUp = lastUpQpc ? QpcDeltaUs(lastUpQpc, now) : UINT64_MAX;
+        const uint64_t sinceProfile = lastProfileQpc ? QpcDeltaUs(lastProfileQpc, now) : UINT64_MAX;
+        const bool canAdjust = sinceCtl >= 1'200'000;
+        const int current = g_currentBitrate.load(std::memory_order_relaxed);
+        const int bitrateFloor = g_minAdaptiveBitrate.load(std::memory_order_relaxed);
+        const bool overloaded = dropScore >= 8.0 || stats.frameAgeMs > 55.0 || stats.packetAgeMs > 40.0 || (stats.presentFps > 0.1 && stats.presentFps + 8.0 < double(g_cfg.fps));
+        const bool severeOverload = dropScore >= 16.0 || stats.frameAgeMs > 95.0 || stats.packetAgeMs > 75.0 || (stats.presentFps > 0.1 && stats.presentFps + 14.0 < double(g_cfg.fps));
+        const bool stable = dropScore <= 2.0 && stats.frameAgeMs < 20.0 && stats.packetAgeMs < 16.0 && stats.presentFps >= double(g_cfg.fps) - 2.0;
+        if (canAdjust) {
+          if (overloaded) {
+            const int reduced = std::max(bitrateFloor, current * 84 / 100);
+            if (reduced < current) {
+              SendVideoBitrateControl(reduced, L"overload");
+            }
+          } else if (stable && sinceUp >= 3'000'000) {
+            const int increased = std::min(g_maxAdaptiveBitrate.load(std::memory_order_relaxed), current + std::max(300'000, current / 14));
+            if (increased > current) {
+              SendVideoBitrateControl(increased, L"stable");
+            }
+          }
+        }
+        if (severeOverload && sinceProfile >= 12'000'000 && (current <= bitrateFloor + 600'000 || stats.presentFps + 18.0 < double(g_cfg.fps))) {
+          VideoProfile downgraded{};
+          if (BuildLowerAutoProfile(CurrentVideoProfile(), downgraded)) {
+            if (RequestProfileApply(downgraded, L"auto-overload", true)) {
+              return 0;
+            }
+          }
+        }
+      }
+
       wchar_t title[512];
-      swprintf_s(title, L"P2P Native v2 %s -> %s | present %.0f fps complete %.0f fps | %.1f Mbps %.0f pkt/s | last pkt %.0f ms frame %.0f ms | rx-present %.2f ms | drop %llu decfail %llu gpuerr %llu | GPU %llu CPU %llu",
+      swprintf_s(title, L"P2P Native v2 %s -> %s | present %.0f fps complete %.0f fps | %.1f Mbps %.0f pkt/s | last pkt %.0f ms frame %.0f ms | rx-present %.2f ms | drop local %llu net %llu | GPU %llu CPU %llu | bitrate %d Mbps",
                  g_cfg.udpVideo ? L"UDP" : L"TCP", g_cfg.hostIp.c_str(), fps, cfps, mbps, pps, packetAgeMs, frameAgeMs, rxMs,
-                 static_cast<unsigned long long>(dropped),
-                 static_cast<unsigned long long>(decodeFails),
-                 static_cast<unsigned long long>(gpuRenderFails),
+                 static_cast<unsigned long long>(clientDropped),
+                 static_cast<unsigned long long>(networkDropped),
                  static_cast<unsigned long long>(gpu),
-                 static_cast<unsigned long long>(cpu));
+                 static_cast<unsigned long long>(cpu),
+                 std::max(1, g_currentBitrate.load(std::memory_order_relaxed) / 1'000'000));
       SetWindowTextW(hwnd, title);
       if (g_toolbarHwnd) InvalidateRect(g_toolbarHwnd, nullptr, FALSE);
       if (g_menuHwnd && IsWindowVisible(g_menuHwnd)) InvalidateRect(g_menuHwnd, nullptr, FALSE);
@@ -2097,28 +2342,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_MOUSEMOVE: {
       float x, y; NormalizedPoint(hwnd, lp, x, y);
       uint16_t b = (wp & MK_RBUTTON) ? 2 : ((wp & MK_MBUTTON) ? 1 : 0);
-      SendInput(P2_INPUT_MOVE, x, y, 0, 0, b, 0);
+      SendInputPacket(P2_INPUT_MOVE, x, y, 0, 0, b, 0);
       return 0;
     }
     case WM_LBUTTONDOWN: case WM_MBUTTONDOWN: case WM_RBUTTONDOWN: {
       SetCapture(hwnd); SetFocus(hwnd);
       float x, y; NormalizedPoint(hwnd, lp, x, y);
       uint16_t b = msg == WM_RBUTTONDOWN ? 2 : (msg == WM_MBUTTONDOWN ? 1 : 0);
-      SendInput(P2_INPUT_DOWN, x, y, 0, 0, b, 0);
+      SendInputPacket(P2_INPUT_DOWN, x, y, 0, 0, b, 0);
       return 0;
     }
     case WM_LBUTTONUP: case WM_MBUTTONUP: case WM_RBUTTONUP: {
       ReleaseCapture();
       float x, y; NormalizedPoint(hwnd, lp, x, y);
       uint16_t b = msg == WM_RBUTTONUP ? 2 : (msg == WM_MBUTTONUP ? 1 : 0);
-      SendInput(P2_INPUT_UP, x, y, 0, 0, b, 0);
+      SendInputPacket(P2_INPUT_UP, x, y, 0, 0, b, 0);
       return 0;
     }
     case WM_MOUSEWHEEL: {
       POINT pt{GET_X_LPARAM(lp), GET_Y_LPARAM(lp)}; ScreenToClient(hwnd, &pt);
       LPARAM clp = MAKELPARAM(pt.x, pt.y);
       float x, y; NormalizedPoint(hwnd, clp, x, y);
-      SendInput(P2_INPUT_WHEEL, x, y, 0, -GET_WHEEL_DELTA_WPARAM(wp), 0, 0);
+      SendInputPacket(P2_INPUT_WHEEL, x, y, 0, -GET_WHEEL_DELTA_WPARAM(wp), 0, 0);
       return 0;
     }
     case WM_KEYDOWN: case WM_SYSKEYDOWN: {
@@ -2131,12 +2376,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
       }
       uint16_t mac = VkToMacKeyCode(wp);
-      if (mac != 0xffff) SendInput(P2_INPUT_KEY_DOWN, 0, 0, 0, 0, 0, mac);
+      if (mac != 0xffff) SendInputPacket(P2_INPUT_KEY_DOWN, 0, 0, 0, 0, 0, mac);
       return 0;
     }
     case WM_KEYUP: case WM_SYSKEYUP: {
       uint16_t mac = VkToMacKeyCode(wp);
-      if (mac != 0xffff) SendInput(P2_INPUT_KEY_UP, 0, 0, 0, 0, 0, mac);
+      if (mac != 0xffff) SendInputPacket(P2_INPUT_KEY_UP, 0, 0, 0, 0, 0, mac);
       return 0;
     }
     case WM_PAINT: {
@@ -2209,6 +2454,14 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     MessageBoxW(nullptr, L"Bad --host-ip or input socket init failed", L"P2P Native", MB_ICONERROR);
     return 1;
   }
+  const int initialBitrate = std::max(2'000'000, g_cfg.bitrate > 0 ? g_cfg.bitrate : 14'000'000);
+  g_currentBitrate.store(initialBitrate, std::memory_order_relaxed);
+  const int adaptiveCeiling = std::max({initialBitrate, AutoBitrateForPixels(g_cfg.width, g_cfg.height, initialBitrate), 20'000'000});
+  g_maxAdaptiveBitrate.store(std::min(80'000'000, adaptiveCeiling), std::memory_order_relaxed);
+  g_minAdaptiveBitrate.store(std::max(2'000'000, initialBitrate / 3), std::memory_order_relaxed);
+  g_recentDropScore.store(0.0, std::memory_order_relaxed);
+  g_lastBitrateControlQpc.store(0, std::memory_order_relaxed);
+  g_lastBitrateIncreaseQpc.store(0, std::memory_order_relaxed);
 
   WNDCLASSW wc{};
   wc.lpfnWndProc = WndProc;

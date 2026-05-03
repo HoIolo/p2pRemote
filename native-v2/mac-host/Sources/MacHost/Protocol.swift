@@ -8,6 +8,7 @@ let maxUdpPayloadBytes = 1200
 let maxVideoFragmentPayload = maxUdpPayloadBytes - p2VideoHeaderBytes
 let p2InputRequestKeyframe: UInt8 = 7
 let p2InputSetVideoProfile: UInt8 = 8
+let p2InputSetVideoBitrate: UInt8 = 9
 
 final class NativeStats {
     static let shared = NativeStats()
@@ -47,9 +48,9 @@ struct NativeHostConfig {
     var width: Int = 1920
     var height: Int = 1080
     var fps: Int = 60
-    var bitrate: Int = 25_000_000
+    var bitrate: Int = 14_000_000
     var keyframeSeconds: Int = 1
-    var transport: String = "tcp"
+    var transport: String = "udp"
 
     static func parse() -> NativeHostConfig {
         var cfg = NativeHostConfig()
@@ -120,10 +121,16 @@ final class UdpVideoSender {
     private var addr = sockaddr_in()
     private var frameId: UInt64 = 1
     private let sendLock = NSLock()
+    private let paceLock = NSLock()
+    private var nextSendDeadlineUs: UInt64 = nowUs()
+    private let fps: Int
+    private var targetBitrateBps: Int
 
-    init(clientIP: String, port: UInt16) throws {
+    init(clientIP: String, port: UInt16, fps: Int, bitrate: Int) throws {
         fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { throw POSIXError(.ENOTSOCK) }
+        self.fps = max(30, fps)
+        self.targetBitrateBps = max(2_000_000, bitrate)
 
         var one: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
@@ -141,6 +148,12 @@ final class UdpVideoSender {
 
     deinit { close(fd) }
 
+    func updateTargetBitrate(_ bitrate: Int) {
+        paceLock.lock()
+        targetBitrateBps = max(2_000_000, min(80_000_000, bitrate))
+        paceLock.unlock()
+    }
+
     func sendFrame(_ frame: Data, keyframe: Bool, configIncluded: Bool, ptsUs: UInt64) {
         sendLock.lock()
         defer { sendLock.unlock() }
@@ -153,7 +166,22 @@ final class UdpVideoSender {
         var sentPackets: UInt64 = 0
         var sentBytes: UInt64 = 0
         var sendErrors: UInt64 = 0
+        paceLock.lock()
+        let currentBitrate = targetBitrateBps
+        paceLock.unlock()
+        let framePeriodUs = max<UInt64>(4_000, 1_000_000 / UInt64(max(1, fps)))
+        let paceRate = max(20_000_000, currentBitrate * 2)
+        let frameBudgetUs = UInt64(max(1_000, min(Int(framePeriodUs), Int(Double(frame.count * 8) * 1_000_000.0 / Double(max(1, paceRate))))))
+        let packetBudgetUs = max<UInt64>(40, frameBudgetUs / UInt64(max(1, Int(fragCount))))
+        let startUs = nowUs()
+        if nextSendDeadlineUs < startUs {
+            nextSendDeadlineUs = startUs
+        }
         while offset < frame.count {
+            let beforeSendUs = nowUs()
+            if nextSendDeadlineUs > beforeSendUs {
+                usleep(useconds_t(min<UInt64>(20_000, nextSendDeadlineUs - beforeSendUs)))
+            }
             let n = min(maxVideoFragmentPayload, frame.count - offset)
             var packet = Data(capacity: p2VideoHeaderBytes + n)
             packet.append(contentsOf: [0x50, 0x32, 0x56, 0x32]) // P2V2
@@ -187,6 +215,11 @@ final class UdpVideoSender {
             }
             offset += n
             fragIndex &+= 1
+            nextSendDeadlineUs &+= packetBudgetUs
+        }
+        let endUs = nowUs()
+        if endUs > nextSendDeadlineUs + 20_000 {
+            nextSendDeadlineUs = endUs
         }
         NativeStats.shared.recordFrame(frameId: id, packets: sentPackets, bytes: sentBytes, errors: sendErrors)
     }

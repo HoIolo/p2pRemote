@@ -18,12 +18,14 @@ final class H264LowLatencyEncoder {
     private let controlLock = NSLock()
     private var pendingForcedKeyframe = false
     private var reportedFirstEncodedFrame = false
+    private var currentBitrate: Int
 
     init(width: Int, height: Int, fps: Int, bitrate: Int, keyframeSeconds: Int, onFrame: @escaping (Data, Bool, Bool, UInt64) -> Void) throws {
         self.width = Int32(width)
         self.height = Int32(height)
         self.fps = fps
         self.bitrate = bitrate
+        self.currentBitrate = bitrate
         self.keyframeSeconds = keyframeSeconds
         self.onFrame = onFrame
         try createSession()
@@ -58,8 +60,15 @@ final class H264LowLatencyEncoder {
         set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse)
         set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_H264_Baseline_AutoLevel)
         set(kVTCompressionPropertyKey_AverageBitRate, bitrate as CFTypeRef)
+        setDataRateLimits(bitrate: bitrate)
         set(kVTCompressionPropertyKey_MaxKeyFrameInterval, (fps * keyframeSeconds) as CFTypeRef)
         set(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, keyframeSeconds as CFTypeRef)
+        if #available(macOS 11.0, *) {
+            set(kVTCompressionPropertyKey_MaximizePowerEfficiency, kCFBooleanFalse)
+        }
+        if #available(macOS 12.0, *) {
+            set(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue)
+        }
         if #available(macOS 10.13, *) {
             set(kVTCompressionPropertyKey_ExpectedFrameRate, fps as CFTypeRef)
         }
@@ -75,11 +84,33 @@ final class H264LowLatencyEncoder {
         }
     }
 
+    private func setDataRateLimits(bitrate: Int) {
+        guard bitrate > 0 else { return }
+        let bytesPerSecond = max(1, bitrate / 8)
+        let limits: [Any] = [bytesPerSecond as NSNumber, 1.0 as NSNumber]
+        set(kVTCompressionPropertyKey_DataRateLimits, limits as CFArray)
+    }
+
     func requestKeyframe(reason: String = "client recovery") {
         controlLock.lock()
         pendingForcedKeyframe = true
         controlLock.unlock()
         logLine("[encoder] keyframe requested: \(reason)")
+    }
+
+    func updateBitrate(_ newBitrate: Int, reason: String = "adaptive") {
+        let clamped = max(2_000_000, min(80_000_000, newBitrate))
+        controlLock.lock()
+        if clamped == currentBitrate {
+            controlLock.unlock()
+            return
+        }
+        currentBitrate = clamped
+        controlLock.unlock()
+        set(kVTCompressionPropertyKey_AverageBitRate, clamped as CFTypeRef)
+        setDataRateLimits(bitrate: clamped)
+        requestKeyframe(reason: "\(reason) bitrate=\(clamped)")
+        logLine("[encoder] bitrate updated: \(clamped)")
     }
 
     func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, forceKeyframe: Bool = false) {

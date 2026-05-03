@@ -42,6 +42,11 @@ final actor NativeHostRuntime {
         encoder.requestKeyframe(reason: reason)
     }
 
+    func updateBitrate(_ bitrate: Int, reason: String) {
+        encoder.updateBitrate(bitrate, reason: reason)
+        udpSender?.updateTargetBitrate(bitrate)
+    }
+
     func reconfigureVideo(width: Int, height: Int, fps: Int, bitrateMbps: Int) async {
         if reconfiguring {
             logLine("[control] video profile change ignored: reconfiguration already in progress")
@@ -67,6 +72,7 @@ final actor NativeHostRuntime {
             let newPipeline = try await makePipeline(cfg: nextCfg, encoder: newEncoder)
             cfg = nextCfg
             encoder = newEncoder
+            udpSender?.updateTargetBitrate(nextCfg.bitrate)
             output = newPipeline.output
             capturer = newPipeline.capturer
             logLine("[control] video profile applied \(nextCfg.width)x\(nextCfg.height)@\(nextCfg.fps) bitrate=\(nextCfg.bitrate)")
@@ -76,6 +82,7 @@ final actor NativeHostRuntime {
                 let restorePipeline = try await makePipeline(cfg: previousCfg, encoder: previousEncoder)
                 cfg = previousCfg
                 encoder = previousEncoder
+                udpSender?.updateTargetBitrate(previousCfg.bitrate)
                 output = restorePipeline.output
                 capturer = restorePipeline.capturer
                 logLine("[control] restored previous video profile \(previousCfg.width)x\(previousCfg.height)@\(previousCfg.fps) bitrate=\(previousCfg.bitrate)")
@@ -100,15 +107,19 @@ final actor NativeHostRuntime {
 
     private func autoBitrate(width: Int, height: Int, fallback: Int) -> Int {
         let pixels = width * height
-        var bitrate = fallback
+        var bitrate = max(8_000_000, fallback)
         if pixels <= 1280 * 720 {
-            bitrate = max(bitrate, 16_000_000)
+            bitrate = max(bitrate, 8_000_000)
+        } else if pixels <= 1600 * 900 {
+            bitrate = max(bitrate, 10_000_000)
         } else if pixels <= 1920 * 1080 {
-            bitrate = max(bitrate, 28_000_000)
+            bitrate = max(bitrate, 12_000_000)
+        } else if pixels <= 1920 * 1200 {
+            bitrate = max(bitrate, 14_000_000)
         } else if pixels <= 2560 * 1440 {
-            bitrate = max(bitrate, 40_000_000)
+            bitrate = max(bitrate, 18_000_000)
         } else {
-            bitrate = max(bitrate, 60_000_000)
+            bitrate = max(bitrate, 24_000_000)
         }
         return bitrate
     }
@@ -173,7 +184,7 @@ struct MacHostMain {
             let tcpServer: TcpVideoServer?
             let udpSender: UdpVideoSender?
             if cfg.transport == "udp" {
-                udpSender = try UdpVideoSender(clientIP: cfg.clientIP, port: cfg.videoPort)
+                udpSender = try UdpVideoSender(clientIP: cfg.clientIP, port: cfg.videoPort, fps: cfg.fps, bitrate: cfg.bitrate)
                 tcpServer = nil
             } else {
                 tcpServer = try TcpVideoServer(port: cfg.videoPort)
@@ -206,6 +217,11 @@ struct MacHostMain {
                 onVideoProfileRequest: { width, height, fps, bitrateMbps in
                     Task {
                         await gRuntime?.reconfigureVideo(width: width, height: height, fps: fps, bitrateMbps: bitrateMbps)
+                    }
+                },
+                onBitrateRequest: { bitrate in
+                    Task {
+                        await gRuntime?.updateBitrate(bitrate, reason: "windows adaptive control")
                     }
                 }
             )
