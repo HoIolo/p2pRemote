@@ -29,9 +29,11 @@ app.commandLine.appendSwitch('enable-features', 'WebRtcAllowInputVolumeAdjustmen
 
 function resolveRole() {
   if (process.argv.includes('--host')) return 'host';
-  if (process.argv.includes('--client')) return 'client';
+  // Legacy flag: the old standalone client UI has been removed.
+  // Keep --client working, but route it to the new dashboard shell.
+  if (process.argv.includes('--client')) return 'dashboard';
   if (process.env.P2P_REMOTE_ROLE === 'host') return 'host';
-  if (process.env.P2P_REMOTE_ROLE === 'client') return 'client';
+  if (process.env.P2P_REMOTE_ROLE === 'client') return 'dashboard';
 
   return 'dashboard';
 }
@@ -807,10 +809,6 @@ async function startHost() {
   startDiscovery();
 }
 
-async function startClient() {
-  win = createWindow('client.html', { title: 'P2P Remote LAN - Windows Client', frame: true });
-}
-
 async function startDashboard() {
   signalRendererReady = false;
   pendingSignalMessages.length = 0;
@@ -973,13 +971,11 @@ app.whenReady().then(async () => {
   registerDisplayMediaHandler();
 
   if (ROLE === 'host') await startHost();
-  else if (ROLE === 'client') await startClient();
   else await startDashboard();
 
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) {
       if (ROLE === 'host') startHost();
-      else if (ROLE === 'client') startClient();
       else startDashboard();
     }
   });
