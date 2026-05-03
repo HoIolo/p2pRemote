@@ -142,7 +142,7 @@ function clampEven(value, fallback = 2) {
   return number % 2 === 0 ? number : number - 1;
 }
 
-function scaleResolution(width, height, maxLongEdge = 3840) {
+function scaleResolution(width, height, maxLongEdge = 1920) {
   const longEdge = Math.max(width, height);
   if (!longEdge || longEdge <= maxLongEdge) {
     return { width: clampEven(width, 1920), height: clampEven(height, 1080) };
@@ -170,10 +170,11 @@ function nativeV2DisplayOptions(device) {
   const sourceHeight = clampEven(display.height * scaleFactor, defaults.height || 1080);
   const scaled = scaleResolution(sourceWidth, sourceHeight);
   const pixels = scaled.width * scaled.height;
-  let bitrate = defaults.bitrate || 45_000_000;
-  if (pixels <= 1920 * 1080) bitrate = Math.max(bitrate, 30_000_000);
-  else if (pixels <= 2560 * 1440) bitrate = Math.max(bitrate, 50_000_000);
-  else bitrate = Math.max(bitrate, 65_000_000);
+  let bitrate = defaults.bitrate || 20_000_000;
+  if (pixels <= 1280 * 720) bitrate = Math.max(bitrate, 12_000_000);
+  else if (pixels <= 1920 * 1080) bitrate = Math.max(bitrate, 20_000_000);
+  else if (pixels <= 2560 * 1440) bitrate = Math.max(bitrate, 28_000_000);
+  else bitrate = Math.max(bitrate, 38_000_000);
 
   return {
     width: scaled.width,

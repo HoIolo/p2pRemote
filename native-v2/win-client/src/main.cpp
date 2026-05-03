@@ -107,8 +107,10 @@ static std::atomic<uint64_t> g_bytesRx{0};
 static std::atomic<uint64_t> g_framesComplete{0};
 static std::atomic<uint64_t> g_framesDropped{0};
 static std::atomic<uint64_t> g_decodeFails{0};
+static std::atomic<uint64_t> g_gpuRenderFails{0};
 static std::atomic<uint64_t> g_lastPacketQpc{0};
 static std::atomic<uint64_t> g_lastCompleteQpc{0};
+static std::atomic<bool> g_decoderPrimed{false};
 
 static uint64_t QpcNow() {
   LARGE_INTEGER q{};
@@ -164,12 +166,29 @@ static std::string WideToUtf8(const std::wstring& s) {
 }
 
 static void PushEncoded(EncodedFrame&& f) {
+  bool queued = false;
   {
     std::lock_guard lk(g_encodedMu);
-    g_encodedQueue.clear(); // latency policy: keep newest complete frame only
+    // Until the decoder has successfully produced a frame, keep the newest
+    // keyframe around and drop delta frames that would otherwise starve sync.
+    if (!g_decoderPrimed.load(std::memory_order_relaxed) && !f.keyframe) {
+      g_framesDropped.fetch_add(1, std::memory_order_relaxed);
+      return;
+    }
+
+    if (!g_encodedQueue.empty()) {
+      const EncodedFrame& pending = g_encodedQueue.back();
+      if (pending.keyframe && !f.keyframe) {
+        g_framesDropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+    }
+
+    g_encodedQueue.clear(); // latency policy: keep newest decodable frame only
     g_encodedQueue.emplace_back(std::move(f));
+    queued = true;
   }
-  g_encodedCv.notify_one();
+  if (queued) g_encodedCv.notify_one();
 }
 
 class D3DRenderer {
@@ -943,12 +962,23 @@ static void DecoderThread() {
   SetThreadDescription(GetCurrentThread(), L"P2P H264 decode + present");
   CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   MFStartup(MF_VERSION, MFSTARTUP_LITE);
-  MfDecoder decoder;
-  ID3D11Device* renderDevice = g_renderer ? g_renderer->Device() : nullptr;
-  if (!decoder.Init(g_cfg.width, g_cfg.height, g_cfg.fps, renderDevice)) {
+  const bool sharedDeviceAvailable = g_renderer && g_renderer->Device();
+  bool useSharedDevice = sharedDeviceAvailable;
+  auto createDecoder = [&](bool preferSharedDevice) -> std::unique_ptr<MfDecoder> {
+    auto decoder = std::make_unique<MfDecoder>();
+    ID3D11Device* renderDevice = (preferSharedDevice && g_renderer) ? g_renderer->Device() : nullptr;
+    if (!decoder->Init(g_cfg.width, g_cfg.height, g_cfg.fps, renderDevice)) return nullptr;
+    return decoder;
+  };
+
+  auto decoder = createDecoder(useSharedDevice);
+  if (!decoder) {
     MessageBoxW(nullptr, L"Failed to initialize Media Foundation H.264 decoder", L"P2P Native", MB_ICONERROR);
+    MFShutdown();
+    CoUninitialize();
     return;
   }
+  uint32_t gpuPresentFailStreak = 0;
 
   while (g_running.load()) {
     EncodedFrame encoded;
@@ -960,11 +990,31 @@ static void DecoderThread() {
       g_encodedQueue.clear();
     }
     DecodedFrame frame;
-    if (decoder.Decode(encoded, frame)) {
+    if (decoder->Decode(encoded, frame)) {
+      g_decoderPrimed.store(true, std::memory_order_relaxed);
       bool presented = false;
       if (g_renderer) {
-        if (frame.gpu) presented = g_renderer->Render(frame.dxgi);
-        else presented = g_renderer->Render(frame.nv12);
+        if (frame.gpu) {
+          presented = g_renderer->Render(frame.dxgi);
+          if (!presented) {
+            g_gpuRenderFails.fetch_add(1, std::memory_order_relaxed);
+            ++gpuPresentFailStreak;
+            if (useSharedDevice && sharedDeviceAvailable && gpuPresentFailStreak >= 4) {
+              Log(L"GPU present failed %u times, falling back to CPU-copy decode", gpuPresentFailStreak);
+              if (auto fallback = createDecoder(false)) {
+                decoder = std::move(fallback);
+                useSharedDevice = false;
+                gpuPresentFailStreak = 0;
+                g_decoderPrimed.store(false, std::memory_order_relaxed);
+              }
+            }
+          } else {
+            gpuPresentFailStreak = 0;
+          }
+        } else {
+          presented = g_renderer->Render(frame.nv12);
+          if (presented) gpuPresentFailStreak = 0;
+        }
         if (presented) {
           g_framesPresented.fetch_add(1, std::memory_order_relaxed);
           if (frame.gpu) g_gpuFrames.fetch_add(1, std::memory_order_relaxed);
@@ -1077,11 +1127,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       double frameAgeMs = double(QpcDeltaUs(g_lastCompleteQpc.load(std::memory_order_relaxed), now)) / 1000.0;
       uint64_t dropped = g_framesDropped.load(std::memory_order_relaxed);
       uint64_t decodeFails = g_decodeFails.load(std::memory_order_relaxed);
+      uint64_t gpuRenderFails = g_gpuRenderFails.load(std::memory_order_relaxed);
       wchar_t title[512];
-      swprintf_s(title, L"P2P Native v2 %s -> %s | present %.0f fps complete %.0f fps | %.1f Mbps %.0f pkt/s | last pkt %.0f ms frame %.0f ms | rx-present %.2f ms | drop %llu decfail %llu | GPU %llu CPU %llu",
+      swprintf_s(title, L"P2P Native v2 %s -> %s | present %.0f fps complete %.0f fps | %.1f Mbps %.0f pkt/s | last pkt %.0f ms frame %.0f ms | rx-present %.2f ms | drop %llu decfail %llu gpuerr %llu | GPU %llu CPU %llu",
                  g_cfg.udpVideo ? L"UDP" : L"TCP", g_cfg.hostIp.c_str(), fps, cfps, mbps, pps, packetAgeMs, frameAgeMs, rxMs,
                  static_cast<unsigned long long>(dropped),
                  static_cast<unsigned long long>(decodeFails),
+                 static_cast<unsigned long long>(gpuRenderFails),
                  static_cast<unsigned long long>(gpu),
                  static_cast<unsigned long long>(cpu));
       SetWindowTextW(hwnd, title);
@@ -1240,6 +1292,5 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
   timeEndPeriod(1);
   return 0;
 }
-
 
 

@@ -188,6 +188,7 @@ final class TcpVideoServer {
     private let fd: Int32
     private let queue = DispatchQueue(label: "p2p.native.tcp-video", qos: .userInteractive)
     private let lock = NSLock()
+    private let sendLock = NSLock()
     private var clients = [Int32]()
     private var frameId: UInt64 = 1
     private var running = true
@@ -264,6 +265,8 @@ final class TcpVideoServer {
     }
 
     func sendFrame(_ frame: Data, keyframe: Bool, configIncluded: Bool, ptsUs: UInt64) {
+        sendLock.lock()
+        defer { sendLock.unlock() }
         if frame.isEmpty { return }
         let id = frameId
         frameId &+= 1
