@@ -45,9 +45,21 @@ final class ScreenCapturer {
 
     func start() async throws -> CGRect {
         let content = try await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true)
-        guard let display = content.displays.first else {
+        let available = content.displays
+        guard !available.isEmpty else {
             throw NSError(domain: "P2PNative", code: 1, userInfo: [NSLocalizedDescriptionKey: "No capturable display found"])
         }
+        let mainId = CGMainDisplayID()
+        for item in available {
+            let bounds = CGDisplayBounds(CGDirectDisplayID(item.displayID))
+            print("[capture] candidate display=\(item.displayID) \(Int(bounds.width))x\(Int(bounds.height))")
+        }
+        let display = available.first(where: { CGDirectDisplayID($0.displayID) == mainId })
+          ?? available.max(by: {
+              let lhs = CGDisplayBounds(CGDirectDisplayID($0.displayID))
+              let rhs = CGDisplayBounds(CGDirectDisplayID($1.displayID))
+              return lhs.width * lhs.height < rhs.width * rhs.height
+          })!
 
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
         let streamCfg = SCStreamConfiguration()
@@ -66,7 +78,7 @@ final class ScreenCapturer {
         stream = newStream
 
         let bounds = CGDisplayBounds(CGDirectDisplayID(display.displayID))
-        print("[capture] display=\(display.displayID) bounds=\(Int(bounds.width))x\(Int(bounds.height)) stream=\(cfg.width)x\(cfg.height)@\(cfg.fps)")
+        print("[capture] selected display=\(display.displayID) main=\(mainId) bounds=\(Int(bounds.width))x\(Int(bounds.height)) stream=\(cfg.width)x\(cfg.height)@\(cfg.fps)")
         return bounds
     }
 }
