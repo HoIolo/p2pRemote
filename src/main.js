@@ -461,6 +461,10 @@ function startNativeV2Host(options = {}) {
   if (process.platform !== 'darwin') {
     throw new Error('Native v2 macOS host can only run on macOS');
   }
+  const allowUdpVideo = options.allowUdpVideo === true || process.env.P2P_NATIVE_V2_ALLOW_UDP === '1';
+  if (options.transport === 'udp' && !allowUdpVideo) {
+    throw new Error('Windows 端仍在请求 UDP 视频。请在 Windows 端拉取最新 main 并重新打包/安装；新版默认使用 TCP 45000 视频，避免黑屏。');
+  }
   if (!options.clientIp) {
     throw new Error('Native v2 host needs the Windows client IP address');
   }
@@ -480,6 +484,7 @@ function startNativeV2Host(options = {}) {
   const fps = normalizeNativeV2Number(options.fps, 120, 30, 240);
   const bitrate = normalizeNativeV2Number(options.bitrate, 20_000_000, 1_000_000, 200_000_000);
   const keyint = normalizeNativeV2Number(options.keyint, 1, 1, 300);
+  const transport = options.transport === 'udp' && allowUdpVideo ? 'udp' : 'tcp';
   const args = [
     '--client-ip', String(options.clientIp),
     '--video-port', String(videoPort),
@@ -489,7 +494,7 @@ function startNativeV2Host(options = {}) {
     '--fps', String(fps),
     '--bitrate', String(bitrate),
     '--keyint', String(keyint),
-    '--transport', options.transport === 'udp' ? 'udp' : 'tcp',
+    '--transport', transport,
   ];
 
   nativeV2HostProcess = spawn(exePath, args, {
@@ -501,7 +506,7 @@ function startNativeV2Host(options = {}) {
   const pid = nativeV2HostProcess.pid;
   sendToMainWindow('host-log', {
     level: 'info',
-    message: `native-v2 host started pid=${pid} client=${options.clientIp}:${videoPort} transport=${options.transport === 'udp' ? 'udp' : 'tcp'}`,
+    message: `native-v2 host started pid=${pid} client=${options.clientIp}:${videoPort} transport=${transport}`,
   });
 
   proc.stdout?.on('data', (chunk) => {
@@ -535,6 +540,7 @@ function startNativeV2Host(options = {}) {
     fps,
     bitrate,
     keyint,
+    transport,
   };
 }
 

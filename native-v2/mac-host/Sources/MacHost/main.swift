@@ -67,7 +67,7 @@ struct MacHostMain {
             }
             let capturerRef = RefBox<ScreenCapturer?>(nil)
             let output = ScreenCaptureOutput(encoder: encoder) {
-                capturerRef.value??.markFirstFrame()
+                capturerRef.value?.markFirstFrame()
             }
             let capturer = ScreenCapturer(cfg: cfg, output: output)
             capturerRef.value = capturer

@@ -25,7 +25,7 @@ final class ScreenCaptureOutput: NSObject, SCStreamOutput {
             reportedFirstFrame = true
             let width = CVPixelBufferGetWidth(pixelBuffer)
             let height = CVPixelBufferGetHeight(pixelBuffer)
-            print("[capture] first frame \(width)x\(height)")
+            logLine("[capture] first frame \(width)x\(height)")
             firstFrameCallback()
         }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -96,7 +96,6 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
         selectedDisplayId = CGDirectDisplayID(display.displayID)
         selectedBounds = bounds
         armFirstFrameWatchdog()
-        print("[capture] selected display=\(display.displayID) main=\(mainId) bounds=\(Int(bounds.width))x\(Int(bounds.height)) stream=\(cfg.width)x\(cfg.height)@\(cfg.fps)")
         return bounds
     }
 
@@ -105,7 +104,7 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
             if self.sawFirstFrame { return }
-            print("[capture] warning: no first frame within 3000 ms; selected=\(self.selectedDisplayId) bounds=\(Int(self.selectedBounds.width))x\(Int(self.selectedBounds.height)) stream=\(self.cfg.width)x\(self.cfg.height)@\(self.cfg.fps)")
+            logLine("[capture] warning: no first frame within 3000 ms; selected=\(self.selectedDisplayId) bounds=\(Int(self.selectedBounds.width))x\(Int(self.selectedBounds.height)) stream=\(self.cfg.width)x\(self.cfg.height)@\(self.cfg.fps)")
         }
         firstFrameWatchdog = work
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3.0, execute: work)
@@ -119,6 +118,6 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {
-        print("[capture] stream stopped with error: \(error.localizedDescription)")
+        logLine("[capture] stream stopped with error: \(error.localizedDescription)")
     }
 }

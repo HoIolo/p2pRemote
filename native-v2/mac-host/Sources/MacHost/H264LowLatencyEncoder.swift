@@ -17,6 +17,7 @@ final class H264LowLatencyEncoder {
     private var frameIndex: Int64 = 0
     private let controlLock = NSLock()
     private var pendingForcedKeyframe = false
+    private var reportedFirstEncodedFrame = false
 
     init(width: Int, height: Int, fps: Int, bitrate: Int, keyframeSeconds: Int, onFrame: @escaping (Data, Bool, Bool, UInt64) -> Void) throws {
         self.width = Int32(width)
@@ -156,6 +157,10 @@ final class H264LowLatencyEncoder {
                 out.append(baseAddress + offset, count: nalLength)
                 offset += nalLength
             }
+        }
+        if !reportedFirstEncodedFrame {
+            reportedFirstEncodedFrame = true
+            logLine("[encoder] first h264 frame bytes=\(out.count) keyframe=\(keyframe) config=\(configIncluded)")
         }
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)

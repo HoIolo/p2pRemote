@@ -254,7 +254,7 @@ final class TcpVideoServer {
             lock.lock()
             clients.append(client)
             lock.unlock()
-            print("[tcp] Windows video client connected")
+            logLine("[tcp] Windows video client connected")
         }
     }
 
@@ -302,7 +302,7 @@ final class TcpVideoServer {
                 sentClients += 1
             } else {
                 close(c)
-                print("[tcp] Windows video client disconnected")
+                logLine("[tcp] Windows video client disconnected")
             }
         }
         clients = next
