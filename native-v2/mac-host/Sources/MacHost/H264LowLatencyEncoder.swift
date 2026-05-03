@@ -2,6 +2,7 @@ import Foundation
 import VideoToolbox
 import CoreMedia
 import CoreVideo
+import Darwin
 
 final class H264LowLatencyEncoder {
     private let width: Int32
@@ -69,6 +70,7 @@ final class H264LowLatencyEncoder {
         let status = VTSessionSetProperty(session, key: key, value: value)
         if status != noErr {
             fputs("[encoder] property \(key) failed: \(status)\n", stderr)
+            fflush(stderr)
         }
     }
 
@@ -76,7 +78,7 @@ final class H264LowLatencyEncoder {
         controlLock.lock()
         pendingForcedKeyframe = true
         controlLock.unlock()
-        print("[encoder] keyframe requested: \(reason)")
+        logLine("[encoder] keyframe requested: \(reason)")
     }
 
     func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, forceKeyframe: Bool = false) {
@@ -103,6 +105,7 @@ final class H264LowLatencyEncoder {
         )
         if status != noErr {
             fputs("[encoder] encode failed: \(status)\n", stderr)
+            fflush(stderr)
         }
     }
 
@@ -127,6 +130,7 @@ final class H264LowLatencyEncoder {
         }
         guard copyStatus == kCMBlockBufferNoErr else {
             fputs("[encoder] copy bitstream failed: \(copyStatus)\n", stderr)
+            fflush(stderr)
             return
         }
 

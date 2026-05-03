@@ -37,7 +37,7 @@ final class ScreenCaptureOutput: NSObject, SCStreamOutput {
         if frames % 300 == 0 {
             let elapsed = Double(nowUs() - started) / 1_000_000.0
             let fps = Double(frames) / max(0.001, elapsed)
-            print(String(format: "[capture] %.1f fps", fps))
+            logLine(String(format: "[capture] %.1f fps", fps))
         }
     }
 }
@@ -66,7 +66,7 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
         let mainId = CGMainDisplayID()
         for item in available {
             let bounds = CGDisplayBounds(CGDirectDisplayID(item.displayID))
-            print("[capture] candidate display=\(item.displayID) \(Int(bounds.width))x\(Int(bounds.height))")
+            logLine("[capture] candidate display=\(item.displayID) \(Int(bounds.width))x\(Int(bounds.height))")
         }
         let display = available.first(where: { CGDirectDisplayID($0.displayID) == mainId })
           ?? available.max(by: {
@@ -92,6 +92,7 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
         stream = newStream
 
         let bounds = CGDisplayBounds(CGDirectDisplayID(display.displayID))
+        logLine("[capture] selected display=\(display.displayID) main=\(mainId) bounds=\(Int(bounds.width))x\(Int(bounds.height)) stream=\(cfg.width)x\(cfg.height)@\(cfg.fps)")
         selectedDisplayId = CGDirectDisplayID(display.displayID)
         selectedBounds = bounds
         armFirstFrameWatchdog()

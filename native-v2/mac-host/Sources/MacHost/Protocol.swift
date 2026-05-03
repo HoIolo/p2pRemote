@@ -31,8 +31,8 @@ final class NativeStats {
             let elapsed = Double(now - started) / 1_000_000.0
             let fps = Double(encodedFrames) / max(0.001, elapsed)
             let mbps = Double(sentBytes) * 8.0 / max(0.001, elapsed) / 1_000_000.0
-            print(String(format: "[video] encoded=%.1f fps sent=%.1f Mbps packets=%llu errors=%llu lastFrame=%llu",
-                         fps, mbps, sentPackets, sendErrors, lastFrameId))
+            logLine(String(format: "[video] encoded=%.1f fps sent=%.1f Mbps packets=%llu errors=%llu lastFrame=%llu",
+                           fps, mbps, sentPackets, sendErrors, lastFrameId))
             lastLog = now
         }
         lock.unlock()
@@ -109,6 +109,11 @@ func nowUs() -> UInt64 {
     UInt64(DispatchTime.now().uptimeNanoseconds / 1_000)
 }
 
+func logLine(_ message: String) {
+    print(message)
+    fflush(stdout)
+}
+
 final class UdpVideoSender {
     private let fd: Int32
     private var addr = sockaddr_in()
@@ -130,6 +135,7 @@ final class UdpVideoSender {
         addr.sin_port = in_port_t(port).bigEndian
         let ok = clientIP.withCString { inet_pton(AF_INET, $0, &addr.sin_addr) }
         guard ok == 1 else { throw POSIXError(.EDESTADDRREQ) }
+        logLine("[udp] sending video to \(clientIP):\(port)")
     }
 
     deinit { close(fd) }
@@ -213,7 +219,7 @@ final class TcpVideoServer {
         }
         guard bindResult == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
         guard listen(fd, 4) == 0 else { throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO) }
-        print("[tcp] listening on 0.0.0.0:\(port)")
+        logLine("[tcp] listening on 0.0.0.0:\(port)")
     }
 
     deinit {

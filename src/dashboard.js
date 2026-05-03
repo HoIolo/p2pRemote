@@ -186,6 +186,7 @@ function nativeV2DisplayOptions(device) {
 function nativeV2ClientOptions(device) {
   const defaults = nativeV2Status?.defaults || {};
   const display = nativeV2DisplayOptions(device);
+  const transport = defaults.transport || 'tcp';
   return {
     hostIp: device.address,
     hostName: device.name,
@@ -197,7 +198,7 @@ function nativeV2ClientOptions(device) {
     fps: defaults.fps || 60,
     bitrate: display.bitrate,
     fullscreen: true,
-    transport: 'udp',
+    transport,
   };
 }
 
@@ -205,6 +206,7 @@ function nativeV2HostOptions(device) {
   const defaults = nativeV2Status?.defaults || {};
   const clientIp = appInfo?.device?.addresses?.[0] || '';
   const display = nativeV2DisplayOptions(device);
+  const transport = defaults.transport || 'tcp';
   return {
     clientIp: nativeV2Status?.platform === 'win32' ? clientIp : device.address,
     videoPort: defaults.videoPort || 45000,
@@ -214,7 +216,7 @@ function nativeV2HostOptions(device) {
     fps: defaults.fps || 60,
     bitrate: display.bitrate,
     keyint: defaults.keyint || 1,
-    transport: 'udp',
+    transport,
   };
 }
 
@@ -224,7 +226,7 @@ function nativeV2MacHostCommand(device, routeAddress = '') {
   const display = nativeV2DisplayOptions(device);
   return [
     'cd native-v2/mac-host',
-    `CLIENT_IP=${clientIp} VIDEO_PORT=${defaults.videoPort || 45000} INPUT_PORT=${defaults.inputPort || 45001} WIDTH=${display.width} HEIGHT=${display.height} FPS=${defaults.fps || 60} BITRATE=${display.bitrate} TRANSPORT=udp ./run-ultra.sh`,
+    `CLIENT_IP=${clientIp} VIDEO_PORT=${defaults.videoPort || 45000} INPUT_PORT=${defaults.inputPort || 45001} WIDTH=${display.width} HEIGHT=${display.height} FPS=${defaults.fps || 60} BITRATE=${display.bitrate} TRANSPORT=${defaults.transport || 'tcp'} ./run-ultra.sh`,
   ].join('\n');
 }
 
@@ -315,12 +317,12 @@ async function openNativeV2Device(device) {
       }
       const options = nativeV2ClientOptions(device);
       const hostOptions = await resolveNativeV2HostOptions(device);
-      setNativeV2StatusText('正在先启动 Windows Native v2 接收端，避免 Mac 首帧/关键帧丢失...');
+      setNativeV2StatusText(`正在先启动 Windows Native v2 接收端（${options.transport.toUpperCase()} 视频），避免 Mac 首帧/关键帧丢失...`);
       const result = await window.lanRemote.startNativeV2Client(options);
-      log(`native-v2 client started pid=${result.pid}; host=${options.hostIp}:${options.videoPort}; ${options.width}x${options.height}@${options.fps}`);
+      log(`native-v2 client started pid=${result.pid}; host=${options.hostIp}:${options.videoPort}; ${options.width}x${options.height}@${options.fps}; transport=${options.transport}`);
       if (device.pin && device.port) {
         setNativeV2StatusText(`正在请求 Mac 启动 Native v2 Host：${device.address}:${device.port}`);
-        log(`requesting Mac native-v2 host ${device.address}:${device.port} -> client ${hostOptions.clientIp}:${hostOptions.videoPort}`);
+        log(`requesting Mac native-v2 host ${device.address}:${device.port} -> client ${hostOptions.clientIp}:${hostOptions.videoPort}; transport=${hostOptions.transport}`);
         try {
           await window.lanRemote.requestNativeV2RemoteHost(device, hostOptions);
           log('Mac native-v2 host accepted start request');
@@ -343,9 +345,9 @@ async function openNativeV2Device(device) {
         return;
       }
       const options = await resolveNativeV2HostOptions(device);
-      setNativeV2StatusText(`正在启动 macOS Native v2 Host，等待 Windows 客户端 ${options.clientIp}...`);
+      setNativeV2StatusText(`正在启动 macOS Native v2 Host（${options.transport.toUpperCase()} 视频），等待 Windows 客户端 ${options.clientIp}...`);
       const result = await window.lanRemote.startNativeV2Host(options);
-      log(`native-v2 host started pid=${result.pid}; client=${options.clientIp}:${options.videoPort}; ${options.width}x${options.height}@${options.fps}`);
+      log(`native-v2 host started pid=${result.pid}; client=${options.clientIp}:${options.videoPort}; ${options.width}x${options.height}@${options.fps}; transport=${options.transport}`);
       setNativeV2StatusText(`macOS Native v2 Host 已启动，pid=${result.pid}`);
       return;
     }

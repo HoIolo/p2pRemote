@@ -345,6 +345,7 @@ function nativeV2StatusPayload() {
       fps: 60,
       bitrate: 20_000_000,
       keyint: 1,
+      transport: 'tcp',
     },
   };
 }
@@ -419,7 +420,7 @@ function startNativeV2Client(options = {}) {
   const pid = nativeV2ClientProcess.pid;
   sendToMainWindow('host-log', {
     level: 'info',
-    message: `native-v2 client started pid=${pid} host=${options.hostIp}:${videoPort}`,
+    message: `native-v2 client started pid=${pid} host=${options.hostIp}:${videoPort} transport=${options.transport === 'udp' ? 'udp' : 'tcp'}`,
   });
 
   proc.stdout?.on('data', (chunk) => {
@@ -500,7 +501,7 @@ function startNativeV2Host(options = {}) {
   const pid = nativeV2HostProcess.pid;
   sendToMainWindow('host-log', {
     level: 'info',
-    message: `native-v2 host started pid=${pid} client=${options.clientIp}:${videoPort}`,
+    message: `native-v2 host started pid=${pid} client=${options.clientIp}:${videoPort} transport=${options.transport === 'udp' ? 'udp' : 'tcp'}`,
   });
 
   proc.stdout?.on('data', (chunk) => {

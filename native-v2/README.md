@@ -3,8 +3,8 @@
 这是绕开 Electron/WebRTC 的第二版低延迟链路，目标是 LAN 下比 WebRTC MVP 更低、更稳定：
 
 ```text
-macOS Host:    ScreenCaptureKit -> VideoToolbox H.264 hardware realtime -> UDP frame fragments
-Windows Client: UDP reassembly -> Media Foundation low-latency H.264/DXVA -> NV12 GPU shader -> D3D11 flip-model present
+macOS Host:    ScreenCaptureKit -> VideoToolbox H.264 hardware realtime -> TCP video stream by default
+Windows Client: TCP receive -> Media Foundation low-latency H.264/DXVA -> NV12 GPU shader -> D3D11 flip-model present
 Input:         Windows UDP binary input packets -> macOS CGEvent injection
 ```
 
@@ -37,7 +37,8 @@ swift build -c release
   --width 1920 \
   --height 1080 \
   --fps 120 \
-  --bitrate 45000000
+  --bitrate 45000000 \
+  --transport tcp
 ```
 
 macOS 权限：
@@ -64,6 +65,7 @@ cd native-v2\win-client
   --width 1920 `
   --height 1080 `
   --fps 120 `
+  --transport tcp `
   --fullscreen
 ```
 
@@ -73,7 +75,7 @@ cd native-v2\win-client
 .\run-ultra.ps1 -HostIp 192.168.1.20 -Width 1920 -Height 1080 -Fps 120
 ```
 
-Windows 防火墙需要允许 UDP 45000 入站。macOS 需要允许 UDP 45001 入站。
+默认视频走 TCP 45000，输入走 UDP 45001。若手动切到 UDP 视频，Windows 防火墙需要允许 UDP 45000 入站。
 
 ## 延迟目标和调参
 
@@ -86,7 +88,7 @@ Windows 防火墙需要允许 UDP 45000 入站。macOS 需要允许 UDP 45001 �
 
 低延迟策略：
 
-- 不做 TCP，不做重传；视频 UDP 丢包直接丢帧。
+- 默认视频走 TCP，先保证 Windows 端不会因为入站 UDP 被防火墙拦住而黑屏；需要极限低延迟时可手动切 UDP。
 - receiver 队列只保留最新完整帧。
 - VideoToolbox：Realtime、禁用 B 帧/重排序、1 秒关键帧。
 - Media Foundation：启用 decoder low-latency mode，并给 MFT 传和 renderer 相同的 D3D11 device manager 以争取 DXVA。

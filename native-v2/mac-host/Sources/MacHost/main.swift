@@ -44,8 +44,8 @@ struct MacHostMain {
     @available(macOS 13.0, *)
     private static func run() async {
         let cfg = NativeHostConfig.parse()
-        print("P2P Native v2 Mac Host")
-        print("client=\(cfg.clientIP):\(cfg.videoPort), input=0.0.0.0:\(cfg.inputPort), video=\(cfg.width)x\(cfg.height)@\(cfg.fps), bitrate=\(cfg.bitrate), transport=\(cfg.transport)")
+        logLine("P2P Native v2 Mac Host")
+        logLine("client=\(cfg.clientIP):\(cfg.videoPort), input=0.0.0.0:\(cfg.inputPort), video=\(cfg.width)x\(cfg.height)@\(cfg.fps), bitrate=\(cfg.bitrate), transport=\(cfg.transport)")
 
         do {
             let tcpServer: TcpVideoServer?
@@ -85,10 +85,11 @@ struct MacHostMain {
                 capturer: capturer,
                 input: input
             )
-            print("[ready] runtime retained encoder/output/capturer/input")
-            print("[ready] host streaming. Press Ctrl+C to stop.")
+            logLine("[ready] runtime retained encoder/output/capturer/input")
+            logLine("[ready] host streaming. Press Ctrl+C to stop.")
         } catch {
             fputs("[fatal] \(error)\n", stderr)
+            fflush(stderr)
             exit(1)
         }
     }
