@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import AppKit
 import Darwin
 
 @available(macOS 13.0, *)
@@ -34,6 +35,8 @@ struct MacHostMain {
 
         setbuf(__stdoutp, nil)
         setbuf(__stderrp, nil)
+        let app = NSApplication.shared
+        app.setActivationPolicy(.accessory)
 
         Task {
             await run()

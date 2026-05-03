@@ -15,6 +15,7 @@ let package = Package(
                 .unsafeFlags(["-parse-as-library"])
             ],
             linkerSettings: [
+                .linkedFramework("AppKit"),
                 .linkedFramework("ScreenCaptureKit"),
                 .linkedFramework("VideoToolbox"),
                 .linkedFramework("CoreMedia"),
