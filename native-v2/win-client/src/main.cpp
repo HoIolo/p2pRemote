@@ -1138,21 +1138,15 @@ class VideoReceiver {
       if (newestFrameId && h->frameId + 120 < newestFrameId) continue;
       if (h->frameId > newestFrameId) newestFrameId = h->frameId;
 
-      if (!partials.empty()) {
+      if (partials.size() > 24) {
         uint64_t keepFrom = newestFrameId > 24 ? newestFrameId - 24 : 0;
-        bool droppedPartial = false;
         for (auto it = partials.begin(); it != partials.end();) {
-          if (it->first < keepFrom || QpcDeltaUs(it->second.firstQpc, now) > 250'000) {
+          if (it->first < keepFrom || QpcDeltaUs(it->second.firstQpc, now) > 750'000) {
             it = partials.erase(it);
             g_framesDropped.fetch_add(1, std::memory_order_relaxed);
-            droppedPartial = true;
           } else {
             ++it;
           }
-        }
-        if (droppedPartial) {
-          partials.clear();
-          EnterVideoRecovery(L"udp partial timeout");
         }
       }
 
@@ -1168,9 +1162,7 @@ class VideoReceiver {
         partial.got.assign(h->fragCount, 0);
       } else if (partial.fragCount != h->fragCount || partial.frameBytes != h->frameBytes) {
         partials.erase(it);
-        partials.clear();
         g_framesDropped.fetch_add(1, std::memory_order_relaxed);
-        EnterVideoRecovery(L"udp fragment mismatch");
         continue;
       }
 
