@@ -7,13 +7,20 @@ final class InputReceiver {
     private let fd: Int32
     private let displayBounds: CGRect
     private let onKeyframeRequest: () -> Void
+    private let onVideoProfileRequest: (Int, Int, Int, Int) -> Void
     private let queue = DispatchQueue(label: "p2p.native.input", qos: .userInteractive)
     private var running = true
     private var downButtons = Set<Int>()
 
-    init(port: UInt16, displayBounds: CGRect, onKeyframeRequest: @escaping () -> Void = {}) throws {
+    init(
+        port: UInt16,
+        displayBounds: CGRect,
+        onKeyframeRequest: @escaping () -> Void = {},
+        onVideoProfileRequest: @escaping (Int, Int, Int, Int) -> Void = { _, _, _, _ in }
+    ) throws {
         self.displayBounds = displayBounds
         self.onKeyframeRequest = onKeyframeRequest
+        self.onVideoProfileRequest = onVideoProfileRequest
         fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { throw POSIXError(.ENOTSOCK) }
 
@@ -98,6 +105,12 @@ final class InputReceiver {
             postKey(code: keyCode, down: false)
         case p2InputRequestKeyframe:
             onKeyframeRequest()
+        case p2InputSetVideoProfile:
+            let width = max(640, Int(dx))
+            let height = max(360, Int(dy))
+            let fps = max(30, button)
+            let bitrateMbps = max(0, Int(keyCode))
+            onVideoProfileRequest(width, height, fps, bitrateMbps)
         default:
             return
         }

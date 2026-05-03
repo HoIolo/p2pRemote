@@ -17,6 +17,8 @@ const connectionModeEl = $('connectionMode');
 const nativeV2StatusTextEl = $('nativeV2StatusText');
 const logEl = $('log');
 
+const CONNECTION_MODE_KEY = 'p2p-remote-dashboard-connection-mode-v1';
+
 let devices = [];
 let selectedId = null;
 let nativeV2Status = null;
@@ -30,6 +32,15 @@ function iconSvg(name, className = 'icon') {
 function log(message) {
   const line = `[${new Date().toLocaleTimeString()}] ${message}`;
   logEl.textContent = `${line}\n${logEl.textContent}`;
+}
+
+function clearLegacyDashboardControlProfile() {
+  localStorage.removeItem('p2p-remote-dashboard-controls-v1');
+  localStorage.removeItem('captureWidth');
+  localStorage.removeItem('captureHeight');
+  localStorage.removeItem('maxFps');
+  localStorage.removeItem('maxBitrate');
+  localStorage.removeItem('captureHint');
 }
 
 function setNativeV2StatusText(message) {
@@ -105,9 +116,9 @@ function updateNativeV2Status(status) {
 
   if (isWindows) {
     if (winClient.running) {
-      nativeV2StatusTextEl.textContent = `Windows Native v2 客户端运行中，pid=${winClient.pid}`;
+      nativeV2StatusTextEl.textContent = `Windows Native v2 客户端运行中，pid=${winClient.pid}；连接后可在顶部状态栏切换分辨率、帧率和码率。`;
     } else if (winClient.available) {
-      nativeV2StatusTextEl.textContent = 'Windows Native v2 客户端已就绪，Mac 端先启动 Host 后可一键进入极速模式。';
+      nativeV2StatusTextEl.textContent = 'Windows Native v2 客户端已就绪；连接后可在顶部状态栏切换分辨率、帧率和码率。';
     } else {
       nativeV2StatusTextEl.textContent = 'Windows Native v2 客户端未构建；先执行 npm run v2:win:build，当前可继续使用 WebRTC。';
     }
@@ -154,15 +165,26 @@ function scaleResolution(width, height, maxLongEdge = 1920) {
   };
 }
 
+function autoBitrateForPixels(pixels, fallbackBitrate) {
+  let bitrate = fallbackBitrate;
+  if (pixels <= 1280 * 720) bitrate = Math.max(bitrate, 16_000_000);
+  else if (pixels <= 1920 * 1080) bitrate = Math.max(bitrate, 28_000_000);
+  else if (pixels <= 2560 * 1440) bitrate = Math.max(bitrate, 40_000_000);
+  else bitrate = Math.max(bitrate, 60_000_000);
+  return bitrate;
+}
+
 function nativeV2DisplayOptions(device) {
   const defaults = nativeV2Status?.defaults || {};
   const display = device?.display;
   const scaleFactor = Number(device?.scaleFactor || 1);
   if (!display?.width || !display?.height) {
+    const width = clampEven(defaults.width || 1920, 1920);
+    const height = clampEven(defaults.height || 1080, 1080);
     return {
-      width: clampEven(defaults.width || 1920, 1920),
-      height: clampEven(defaults.height || 1080, 1080),
-      bitrate: defaults.bitrate || 20_000_000,
+      width,
+      height,
+      bitrate: autoBitrateForPixels(width * height, defaults.bitrate || 28_000_000),
     };
   }
 
@@ -170,11 +192,7 @@ function nativeV2DisplayOptions(device) {
   const sourceHeight = clampEven(display.height * scaleFactor, defaults.height || 1080);
   const scaled = scaleResolution(sourceWidth, sourceHeight);
   const pixels = scaled.width * scaled.height;
-  let bitrate = defaults.bitrate || 20_000_000;
-  if (pixels <= 1280 * 720) bitrate = Math.max(bitrate, 12_000_000);
-  else if (pixels <= 1920 * 1080) bitrate = Math.max(bitrate, 20_000_000);
-  else if (pixels <= 2560 * 1440) bitrate = Math.max(bitrate, 28_000_000);
-  else bitrate = Math.max(bitrate, 38_000_000);
+  const bitrate = autoBitrateForPixels(pixels, defaults.bitrate || 28_000_000);
 
   return {
     width: scaled.width,
@@ -333,7 +351,7 @@ async function openNativeV2Device(device) {
       } else {
         log(`manual native-v2: 请先在 Mac 端启动 Host：\n${nativeV2MacHostCommand(device, hostOptions.clientIp)}`);
       }
-      setNativeV2StatusText(`Native v2 客户端已启动，pid=${result.pid}`);
+      setNativeV2StatusText(`Native v2 客户端已启动，pid=${result.pid}；连接后可在顶部状态栏切换分辨率、帧率和码率。`);
       return;
     }
 
@@ -377,6 +395,11 @@ async function manualNativeV2Connect(address) {
 }
 
 async function initApp() {
+  const savedMode = localStorage.getItem(CONNECTION_MODE_KEY);
+  if (savedMode && connectionModeEl?.querySelector(`option[value="${savedMode}"]`)) {
+    connectionModeEl.value = savedMode;
+  }
+  clearLegacyDashboardControlProfile();
   const info = await window.lanRemote.getAppInfo();
   appInfo = info;
   document.body.dataset.platform = info.device.platform;
@@ -421,6 +444,7 @@ connectSelectedBtn.addEventListener('click', openSelected);
 refreshDevicesBtn.addEventListener('click', refreshDevices);
 refreshTopBtn.addEventListener('click', refreshDevices);
 connectionModeEl?.addEventListener('change', () => {
+  localStorage.setItem(CONNECTION_MODE_KEY, connectionMode());
   renderDevices();
   log(`connection mode=${connectionMode()}`);
 });

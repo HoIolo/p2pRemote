@@ -56,11 +56,18 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
     private let cfg: NativeHostConfig
     private let output: ScreenCaptureOutput
     private let sampleQueue = DispatchQueue(label: "p2p.native.capture", qos: .userInteractive)
+    private let stateQueue = DispatchQueue(label: "p2p.native.capture.state")
+    private let preferredPixelFormats: [OSType] = [
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        kCVPixelFormatType_32BGRA,
+    ]
     private var stream: SCStream?
     private var firstFrameWatchdog: DispatchWorkItem?
     private var selectedDisplayId: CGDirectDisplayID = 0
     private var selectedBounds: CGRect = .zero
+    private var currentPixelFormat: OSType = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
     private var sawFirstFrame = false
+    private var firstFrameContinuation: CheckedContinuation<Bool, Never>?
 
     init(cfg: NativeHostConfig, output: ScreenCaptureOutput) {
         self.cfg = cfg
@@ -86,40 +93,125 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
               return lhs.width * lhs.height < rhs.width * rhs.height
           })!
 
+        let bounds = CGDisplayBounds(CGDirectDisplayID(display.displayID))
+        selectedDisplayId = CGDirectDisplayID(display.displayID)
+        selectedBounds = bounds
+        try await startStream(display: display, mainId: mainId, pixelFormat: preferredPixelFormats[0])
+        let gotFirstFrame = await waitForFirstFrame(timeoutMs: 1_500)
+        if preferredPixelFormats.count > 1 && !gotFirstFrame {
+            let fallback = preferredPixelFormats[1]
+            logLine("[capture] no first frame within 1500 ms using pixelFormat=\(pixelFormatName(currentPixelFormat)); retrying with pixelFormat=\(pixelFormatName(fallback))")
+            try await startStream(display: display, mainId: mainId, pixelFormat: fallback)
+            _ = await waitForFirstFrame(timeoutMs: 1_500)
+        }
+        armFirstFrameWatchdog()
+        return bounds
+    }
+
+    func stop() async {
+        firstFrameWatchdog?.cancel()
+        firstFrameWatchdog = nil
+        resetFirstFrameState()
+        if let stream {
+            try? await stream.stopCapture()
+            self.stream = nil
+        }
+    }
+
+    private func startStream(display: SCDisplay, mainId: CGDirectDisplayID, pixelFormat: OSType) async throws {
+        resetFirstFrameState()
+        if let oldStream = stream {
+            try? await oldStream.stopCapture()
+        }
+
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
         let streamCfg = SCStreamConfiguration()
         streamCfg.width = cfg.width
         streamCfg.height = cfg.height
         streamCfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(cfg.fps))
-        streamCfg.queueDepth = 1
+        streamCfg.queueDepth = 3
         streamCfg.showsCursor = false
         streamCfg.capturesAudio = false
-        streamCfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        streamCfg.pixelFormat = pixelFormat
         streamCfg.colorSpaceName = CGColorSpace.sRGB
 
         let newStream = SCStream(filter: filter, configuration: streamCfg, delegate: self)
         try newStream.addStreamOutput(output, type: .screen, sampleHandlerQueue: sampleQueue)
         try await newStream.startCapture()
         stream = newStream
-
-        let bounds = CGDisplayBounds(CGDirectDisplayID(display.displayID))
-        logLine("[capture] selected display=\(display.displayID) main=\(mainId) bounds=\(Int(bounds.width))x\(Int(bounds.height)) stream=\(cfg.width)x\(cfg.height)@\(cfg.fps)")
-        selectedDisplayId = CGDirectDisplayID(display.displayID)
-        selectedBounds = bounds
-        armFirstFrameWatchdog()
-        return bounds
+        currentPixelFormat = pixelFormat
+        logLine("[capture] selected display=\(display.displayID) main=\(mainId) bounds=\(Int(selectedBounds.width))x\(Int(selectedBounds.height)) stream=\(cfg.width)x\(cfg.height)@\(cfg.fps) pixelFormat=\(pixelFormatName(pixelFormat))")
     }
 
     private func armFirstFrameWatchdog() {
         firstFrameWatchdog?.cancel()
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
-            if self.sawFirstFrame { return }
+            if self.hasSeenFirstFrame() { return }
             let permission = CGPreflightScreenCaptureAccess() ? "granted" : "missing"
-            logLine("[capture] warning: no first frame within 3000 ms; permission=\(permission) selected=\(self.selectedDisplayId) bounds=\(Int(self.selectedBounds.width))x\(Int(self.selectedBounds.height)) stream=\(self.cfg.width)x\(self.cfg.height)@\(self.cfg.fps)")
+            logLine("[capture] warning: no first frame within 3000 ms; permission=\(permission) selected=\(self.selectedDisplayId) bounds=\(Int(self.selectedBounds.width))x\(Int(self.selectedBounds.height)) stream=\(self.cfg.width)x\(self.cfg.height)@\(self.cfg.fps) pixelFormat=\(self.pixelFormatName(self.currentPixelFormat))")
         }
         firstFrameWatchdog = work
         DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3.0, execute: work)
+    }
+
+    private func waitForFirstFrame(timeoutMs: UInt64) async -> Bool {
+        if hasSeenFirstFrame() {
+            return true
+        }
+
+        return await withCheckedContinuation { continuation in
+            var resolvedImmediately = false
+            stateQueue.sync {
+                if sawFirstFrame {
+                    resolvedImmediately = true
+                } else {
+                    firstFrameContinuation = continuation
+                }
+            }
+
+            if resolvedImmediately {
+                continuation.resume(returning: true)
+                return
+            }
+
+            Task {
+                try? await Task.sleep(nanoseconds: timeoutMs * 1_000_000)
+                let pending = self.stateQueue.sync { () -> CheckedContinuation<Bool, Never>? in
+                    let pending = self.firstFrameContinuation
+                    self.firstFrameContinuation = nil
+                    return pending
+                }
+                pending?.resume(returning: false)
+            }
+        }
+    }
+
+    private func resetFirstFrameState() {
+        firstFrameWatchdog?.cancel()
+        firstFrameWatchdog = nil
+        let pending = stateQueue.sync { () -> CheckedContinuation<Bool, Never>? in
+            sawFirstFrame = false
+            let pending = firstFrameContinuation
+            firstFrameContinuation = nil
+            return pending
+        }
+        pending?.resume(returning: false)
+    }
+
+    private func hasSeenFirstFrame() -> Bool {
+        stateQueue.sync { sawFirstFrame }
+    }
+
+    private func pixelFormatName(_ pixelFormat: OSType) -> String {
+        switch pixelFormat {
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
+            return "420v"
+        case kCVPixelFormatType_32BGRA:
+            return "BGRA"
+        default:
+            return String(format: "0x%08X", pixelFormat)
+        }
     }
 
     private func ensureScreenCapturePermission() async throws {
@@ -151,10 +243,18 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
     }
 
     func markFirstFrame() {
-        if sawFirstFrame { return }
-        sawFirstFrame = true
+        let pending = stateQueue.sync { () -> CheckedContinuation<Bool, Never>? in
+            if sawFirstFrame {
+                return nil
+            }
+            sawFirstFrame = true
+            let pending = firstFrameContinuation
+            firstFrameContinuation = nil
+            return pending
+        }
         firstFrameWatchdog?.cancel()
         firstFrameWatchdog = nil
+        pending?.resume(returning: true)
     }
 
     func stream(_ stream: SCStream, didStopWithError error: Error) {

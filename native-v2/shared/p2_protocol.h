@@ -56,4 +56,5 @@ enum P2InputKind : uint8_t {
   P2_INPUT_KEY_DOWN = 5,
   P2_INPUT_KEY_UP = 6,
   P2_INPUT_REQUEST_KEYFRAME = 7,
+  P2_INPUT_SET_VIDEO_PROFILE = 8,
 };

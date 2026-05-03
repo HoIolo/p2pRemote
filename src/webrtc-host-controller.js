@@ -14,6 +14,8 @@
     let localStream = null;
     let capturePromise = null;
     let disposed = false;
+    let stoppingCapture = false;
+    let idleStopTimer = 0;
     const peers = new Map();
     const pendingPeerCandidates = new Map();
 
@@ -84,7 +86,13 @@
     async function tuneCaptureTrack(track) {
       try {
         const maxFps = Number(localStorage.getItem('maxFps') || 60);
-        await track.applyConstraints({ frameRate: { ideal: maxFps } });
+        const captureWidth = Math.max(1280, Number(localStorage.getItem('captureWidth') || 3840));
+        const captureHeight = Math.max(720, Number(localStorage.getItem('captureHeight') || 2160));
+        await track.applyConstraints({
+          frameRate: { ideal: maxFps, max: maxFps },
+          width: { ideal: captureWidth, max: captureWidth },
+          height: { ideal: captureHeight, max: captureHeight },
+        });
       } catch (err) {
         writeLog(`capture constraints skipped: ${err.message}`);
       }
@@ -104,6 +112,46 @@
       } catch {}
     }
 
+    function clearIdleStopTimer() {
+      clearTimeout(idleStopTimer);
+      idleStopTimer = 0;
+    }
+
+    function resetCaptureState(statusText = '等待共享') {
+      localStream = null;
+      capturePromise = null;
+      setCaptureActive(false);
+      setStatus('warn', statusText);
+    }
+
+    function stopCapture(reason = '所有远程连接均已关闭') {
+      clearIdleStopTimer();
+      if (!localStream && !capturePromise) return;
+      const stream = localStream;
+      stoppingCapture = true;
+      resetCaptureState('等待共享');
+      if (reason) writeLog(`screen capture stopping: ${reason}`);
+      try {
+        stream?.getTracks?.().forEach((track) => cleanupTrack(track));
+      } catch {}
+      stoppingCapture = false;
+      onCaptureEnded(reason);
+    }
+
+    function stopCaptureIfIdle(reason, delayMs = 0) {
+      clearIdleStopTimer();
+      if (peers.size > 0) return;
+      if (!localStream && !capturePromise) return;
+      if (delayMs > 0) {
+        idleStopTimer = setTimeout(() => {
+          idleStopTimer = 0;
+          if (peers.size === 0) stopCapture(reason);
+        }, delayMs);
+        return;
+      }
+      stopCapture(reason);
+    }
+
     function closePeer(clientId) {
       const pc = peers.get(clientId);
       if (pc) {
@@ -113,11 +161,29 @@
       }
       peers.delete(clientId);
       pendingPeerCandidates.delete(clientId);
+      if (peers.size === 0) updatePeerState(null, '未连接');
     }
 
     function closeAllPeers() {
       for (const [clientId] of peers) closePeer(clientId);
       updatePeerState(null, '未连接');
+    }
+
+    function buildDisplayMediaConstraints() {
+      const maxFps = Math.max(30, Number(localStorage.getItem('maxFps') || 60));
+      const captureWidth = Math.max(1280, Number(localStorage.getItem('captureWidth') || 3840));
+      const captureHeight = Math.max(720, Number(localStorage.getItem('captureHeight') || 2160));
+      return {
+        audio: false,
+        video: {
+          displaySurface: 'monitor',
+          logicalSurface: true,
+          cursor: 'never',
+          frameRate: { ideal: maxFps, max: maxFps },
+          width: { ideal: captureWidth, max: captureWidth },
+          height: { ideal: captureHeight, max: captureHeight },
+        },
+      };
     }
 
     async function startCapture() {
@@ -126,18 +192,29 @@
 
       capturePromise = (async () => {
         setStatus('warn', '等待系统屏幕授权');
-        const stream = await withTimeout(
-          navigator.mediaDevices.getDisplayMedia({ audio: false, video: true }),
-          8000,
-          'Mac screen capture did not start within 8s; check Screen Recording permission and restart the Mac app',
-        );
+        const preferredConstraints = buildDisplayMediaConstraints();
+        let stream;
+        try {
+          stream = await withTimeout(
+            navigator.mediaDevices.getDisplayMedia(preferredConstraints),
+            8000,
+            'Mac screen capture did not start within 8s; check Screen Recording permission and restart the Mac app',
+          );
+        } catch (err) {
+          writeLog(`preferred capture request failed, retrying with basic constraints: ${err.message}`);
+          stream = await withTimeout(
+            navigator.mediaDevices.getDisplayMedia({ audio: false, video: true }),
+            8000,
+            'Mac screen capture did not start within 8s; check Screen Recording permission and restart the Mac app',
+          );
+        }
 
         const tracks = stream.getVideoTracks();
         if (tracks.length === 0) throw new Error('No screen video track returned');
 
         localStream = stream;
         for (const track of tracks) {
-          track.contentHint = 'motion';
+          track.contentHint = localStorage.getItem('captureHint') || 'detail';
           await tuneCaptureTrack(track);
           await waitForLiveTrack(track);
           const settings = track.getSettings?.() || {};
@@ -145,11 +222,9 @@
           track.addEventListener('mute', () => writeLog('screen track muted'));
           track.addEventListener('unmute', () => writeLog('screen track unmuted'));
           track.addEventListener('ended', () => {
+            if (stoppingCapture) return;
             writeLog('screen capture stopped');
-            setStatus('warn', '共享已停止');
-            localStream = null;
-            capturePromise = null;
-            setCaptureActive(false);
+            resetCaptureState('共享已停止');
             closeAllPeers();
             onCaptureEnded();
           });
@@ -189,10 +264,15 @@
       try {
         const params = sender.getParameters();
         if (!Array.isArray(params.encodings) || params.encodings.length === 0) params.encodings = [{}];
-        params.encodings[0].maxBitrate = Number(localStorage.getItem('maxBitrate') || 35_000_000);
+        params.encodings[0].maxBitrate = Number(localStorage.getItem('maxBitrate') || 60_000_000);
         params.encodings[0].maxFramerate = Number(localStorage.getItem('maxFps') || 60);
+        if ('priority' in params.encodings[0]) params.encodings[0].priority = 'high';
+        if ('networkPriority' in params.encodings[0]) params.encodings[0].networkPriority = 'high';
+        if ('active' in params.encodings[0]) params.encodings[0].active = true;
         if ('degradationPreference' in params) params.degradationPreference = 'maintain-framerate';
         await sender.setParameters(params);
+        const encoding = params.encodings[0] || {};
+        writeLog(`sender tuned: bitrate<=${encoding.maxBitrate || 0} fps<=${encoding.maxFramerate || 0} priority=${encoding.priority || 'default'}`);
       } catch (err) {
         writeLog(`sender tuning skipped: ${err.message}`);
       }
@@ -219,6 +299,10 @@
       pc.onconnectionstatechange = () => {
         updatePeerState(clientId, pc.connectionState);
         writeLog(`peer ${clientId.slice(0, 8)} state=${pc.connectionState}`);
+        if (pc.connectionState === 'failed' || pc.connectionState === 'closed') {
+          closePeer(clientId);
+          stopCaptureIfIdle(`peer ${clientId.slice(0, 8)} ${pc.connectionState}`, 250);
+        }
       };
 
       pc.oniceconnectionstatechange = () => {
@@ -386,11 +470,12 @@
 
     function disconnectClient(clientId) {
       closePeer(clientId);
-      updatePeerState(null, '未连接');
+      stopCaptureIfIdle(`peer ${clientId.slice(0, 8)} disconnected`, 250);
     }
 
     function dispose() {
       disposed = true;
+      clearIdleStopTimer();
       closeAllPeers();
       try {
         localStream?.getTracks?.().forEach((track) => track.stop());

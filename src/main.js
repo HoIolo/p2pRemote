@@ -58,6 +58,9 @@ let signalRendererReady = false;
 const pendingSignalMessages = [];
 let nativeV2ClientProcess = null;
 let nativeV2HostProcess = null;
+let nativeV2ClientLastOptions = null;
+let appIsQuitting = false;
+let nativeV2HostAutoStopTimer = null;
 
 function mainWindow() {
   if (win && !win.isDestroyed()) return win;
@@ -322,7 +325,38 @@ function nativeV2MacHostCandidates() {
   ];
 }
 
+function nativeV2ClientProfilePath() {
+  return path.join(app.getPath('userData'), 'native-v2-win-client-profile.json');
+}
+
+function readNativeV2ClientProfile(profileFile = nativeV2ClientProfilePath()) {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(profileFile, 'utf8'));
+    return {
+      width: Number(parsed.width) || undefined,
+      height: Number(parsed.height) || undefined,
+      fps: Number(parsed.fps) || undefined,
+      bitrate: Number(parsed.bitrate) || undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
+function writeNativeV2ClientProfile(profileFile = nativeV2ClientProfilePath(), profile = {}) {
+  const payload = {
+    width: Number(profile.width) || 1920,
+    height: Number(profile.height) || 1080,
+    fps: Number(profile.fps) || 60,
+    bitrate: Number(profile.bitrate) || 28_000_000,
+  };
+  fs.mkdirSync(path.dirname(profileFile), { recursive: true });
+  fs.writeFileSync(profileFile, JSON.stringify(payload, null, 2));
+  return payload;
+}
+
 function nativeV2StatusPayload() {
+  const savedClientProfile = readNativeV2ClientProfile();
   return {
     platform: process.platform,
     winClient: {
@@ -340,10 +374,10 @@ function nativeV2StatusPayload() {
     defaults: {
       videoPort: 45000,
       inputPort: 45001,
-      width: 1920,
-      height: 1080,
-      fps: 60,
-      bitrate: 20_000_000,
+      width: Number(savedClientProfile.width) || 1920,
+      height: Number(savedClientProfile.height) || 1080,
+      fps: Number(savedClientProfile.fps) || 60,
+      bitrate: Number(savedClientProfile.bitrate) || 28_000_000,
       keyint: 1,
       transport: 'tcp',
     },
@@ -357,9 +391,36 @@ function broadcastNativeV2Status(extra = {}) {
   });
 }
 
+function relayNativeV2ProcessOutput(kind, proc, chunk) {
+  const text = chunk.toString('utf8');
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    sendToMainWindow('host-log', { level: 'native-v2', message: line });
+    if (kind === 'host' && proc === nativeV2HostProcess && line.includes('[tcp] Windows video client connected')) {
+      if (nativeV2HostAutoStopTimer) {
+        clearTimeout(nativeV2HostAutoStopTimer);
+        nativeV2HostAutoStopTimer = null;
+      }
+    }
+    if (kind === 'host' && proc === nativeV2HostProcess && line.includes('[tcp] Windows video client disconnected')) {
+      if (nativeV2HostAutoStopTimer) clearTimeout(nativeV2HostAutoStopTimer);
+      sendToMainWindow('host-log', { level: 'info', message: 'native-v2 host will auto-stop in 5s unless the Windows client reconnects' });
+      nativeV2HostAutoStopTimer = setTimeout(() => {
+        nativeV2HostAutoStopTimer = null;
+        if (nativeV2HostProcess === proc && !proc.killed) stopNativeV2Process('host');
+      }, 5000);
+    }
+  }
+}
+
 function stopNativeV2Process(kind) {
   const proc = kind === 'host' ? nativeV2HostProcess : nativeV2ClientProcess;
   if (!proc || proc.killed) return false;
+  if (kind === 'host' && nativeV2HostAutoStopTimer) {
+    clearTimeout(nativeV2HostAutoStopTimer);
+    nativeV2HostAutoStopTimer = null;
+  }
   try {
     proc.kill();
     return true;
@@ -396,6 +457,8 @@ function startNativeV2Client(options = {}) {
   const height = normalizeNativeV2Number(options.height, 1080, 360, 4320);
   const fps = normalizeNativeV2Number(options.fps, 120, 30, 240);
   const bitrate = normalizeNativeV2Number(options.bitrate, 20_000_000, 0, 200_000_000);
+  const profileFile = String(options.profileFile || nativeV2ClientProfilePath());
+  writeNativeV2ClientProfile(profileFile, { width, height, fps, bitrate });
   const args = [
     '--host-ip', String(options.hostIp),
     '--host-name', String(options.hostName || 'Remote Device'),
@@ -406,9 +469,25 @@ function startNativeV2Client(options = {}) {
     '--height', String(height),
     '--fps', String(fps),
     '--bitrate', String(bitrate),
+    '--profile-file', profileFile,
   ];
   args.push('--transport', options.transport === 'udp' ? 'udp' : 'tcp');
   if (options.fullscreen !== false) args.push('--fullscreen');
+
+  nativeV2ClientLastOptions = {
+    hostIp: String(options.hostIp),
+    hostName: String(options.hostName || 'Remote Device'),
+    hostPlatform: String(options.hostPlatform || 'unknown'),
+    videoPort,
+    inputPort,
+    width,
+    height,
+    fps,
+    bitrate,
+    fullscreen: options.fullscreen !== false,
+    transport: options.transport === 'udp' ? 'udp' : 'tcp',
+    profileFile,
+  };
 
   nativeV2ClientProcess = spawn(exePath, args, {
     cwd: path.dirname(exePath),
@@ -424,14 +503,39 @@ function startNativeV2Client(options = {}) {
   });
 
   proc.stdout?.on('data', (chunk) => {
-    sendToMainWindow('host-log', { level: 'native-v2', message: chunk.toString('utf8').trim() });
+    relayNativeV2ProcessOutput('client', proc, chunk);
   });
   proc.stderr?.on('data', (chunk) => {
-    sendToMainWindow('host-log', { level: 'native-v2', message: chunk.toString('utf8').trim() });
+    relayNativeV2ProcessOutput('client', proc, chunk);
   });
   proc.once('exit', (code, signal) => {
     sendToMainWindow('host-log', { level: 'info', message: `native-v2 client exited code=${code ?? ''} signal=${signal ?? ''}` });
     if (nativeV2ClientProcess === proc) nativeV2ClientProcess = null;
+    if (code === 23 && !appIsQuitting && nativeV2ClientLastOptions?.hostIp) {
+      const savedProfile = readNativeV2ClientProfile(nativeV2ClientLastOptions.profileFile);
+      const nextOptions = {
+        ...nativeV2ClientLastOptions,
+        ...savedProfile,
+      };
+      sendToMainWindow('host-log', {
+        level: 'info',
+        message: `native-v2 client requested relaunch with updated profile ${nextOptions.width}x${nextOptions.height}@${nextOptions.fps} bitrate=${nextOptions.bitrate}`,
+      });
+      setTimeout(() => {
+        if (!appIsQuitting) {
+          try {
+            startNativeV2Client(nextOptions);
+          } catch (err) {
+            sendToMainWindow('host-log', {
+              level: 'error',
+              message: `native-v2 client relaunch failed: ${err.message || String(err)}`,
+            });
+            broadcastNativeV2Status({ error: err.message || String(err) });
+          }
+        }
+      }, 160);
+      return;
+    }
     broadcastNativeV2Status();
   });
   proc.once('error', (err) => {
@@ -454,6 +558,7 @@ function startNativeV2Client(options = {}) {
     fps,
     bitrate,
     fullscreen: options.fullscreen !== false,
+    profileFile,
   };
 }
 
@@ -510,13 +615,17 @@ function startNativeV2Host(options = {}) {
   });
 
   proc.stdout?.on('data', (chunk) => {
-    sendToMainWindow('host-log', { level: 'native-v2', message: chunk.toString('utf8').trim() });
+    relayNativeV2ProcessOutput('host', proc, chunk);
   });
   proc.stderr?.on('data', (chunk) => {
-    sendToMainWindow('host-log', { level: 'native-v2', message: chunk.toString('utf8').trim() });
+    relayNativeV2ProcessOutput('host', proc, chunk);
   });
   proc.once('exit', (code, signal) => {
     sendToMainWindow('host-log', { level: 'info', message: `native-v2 host exited code=${code ?? ''} signal=${signal ?? ''}` });
+    if (nativeV2HostAutoStopTimer) {
+      clearTimeout(nativeV2HostAutoStopTimer);
+      nativeV2HostAutoStopTimer = null;
+    }
     if (nativeV2HostProcess === proc) nativeV2HostProcess = null;
     broadcastNativeV2Status();
   });
@@ -647,6 +756,7 @@ function getScreenCaptureStatus() {
 }
 
 function registerDisplayMediaHandler() {
+  const preferSystemPicker = process.platform === 'darwin' && process.env.P2P_REMOTE_FORCE_CUSTOM_PICKER !== '1';
   session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
     try {
       if (!request.videoRequested) {
@@ -684,12 +794,16 @@ function registerDisplayMediaHandler() {
       callback({});
     }
   }, {
-    // For the LAN remote-desktop flow we already have an explicit app UI + PIN
-    // pairing. Using the macOS system picker can leave getDisplayMedia()
-    // pending in the background, so the Windows side can stay on "connecting
-    // video stream" forever. Always use our handler and pick the primary
-    // display directly.
-    useSystemPicker: false,
+    // On current macOS builds, the system picker is markedly more reliable than
+    // injecting a DesktopCapturer source directly. Keep our handler as a
+    // fallback for platforms/versions where the picker is unavailable, and
+    // allow forcing the old behavior via env for debugging.
+    useSystemPicker: preferSystemPicker,
+  });
+
+  sendToMainWindow('host-log', {
+    level: 'info',
+    message: `display media mode=${preferSystemPicker ? 'system-picker' : 'custom-source-handler'} platform=${process.platform}`,
   });
 }
 
@@ -1012,6 +1126,7 @@ app.on('window-all-closed', () => {
 });
 
 app.on('before-quit', () => {
+  appIsQuitting = true;
   stopNativeV2Process('client');
   stopNativeV2Process('host');
 });

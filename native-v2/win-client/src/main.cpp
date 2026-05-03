@@ -16,6 +16,9 @@
 #include <mmsystem.h>
 
 #include <atomic>
+#include <array>
+#include <climits>
+#include <cmath>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
@@ -49,6 +52,19 @@ struct Config {
   int bitrate = 0;
   bool fullscreen = false;
   bool udpVideo = false;
+  std::wstring profileFile;
+};
+
+struct VideoProfile {
+  int width = 1920;
+  int height = 1080;
+  int fps = 60;
+  int bitrate = 28'000'000;
+};
+
+struct ResolutionPreset {
+  int width = 0;
+  int height = 0;
 };
 
 struct EncodedFrame {
@@ -122,6 +138,15 @@ static std::atomic<uint64_t> g_lastKeyframeRequestQpc{0};
 static std::atomic<uint64_t> g_keyframeRequests{0};
 static uint64_t g_startedQpc = 0;
 static std::wstring g_localIp = L"-";
+static VideoProfile g_pendingProfile;
+static std::vector<ResolutionPreset> g_resolutionPresets;
+static int g_resolutionIndex = 0;
+static int g_fpsIndex = 0;
+static int g_bitrateIndex = 0;
+static int g_exitCode = 0;
+static constexpr int kProfileApplyExitCode = 23;
+static constexpr std::array<int, 4> kFpsPresets = {30, 60, 90, 120};
+static constexpr std::array<int, 5> kBitratePresetsMbps = {16, 28, 40, 60, 80};
 
 struct NativeUiStats {
   double presentFps = 0.0;
@@ -184,6 +209,7 @@ static Config ParseArgs() {
     else if (wcscmp(argv[i], L"--height") == 0) { if (auto v = next()) c.height = _wtoi(v); }
     else if (wcscmp(argv[i], L"--fps") == 0) { if (auto v = next()) c.fps = std::max(30, _wtoi(v)); }
     else if (wcscmp(argv[i], L"--bitrate") == 0) { if (auto v = next()) c.bitrate = std::max(0, _wtoi(v)); }
+    else if (wcscmp(argv[i], L"--profile-file") == 0) { if (auto v = next()) c.profileFile = v; }
     else if (wcscmp(argv[i], L"--fullscreen") == 0) { c.fullscreen = true; }
     else if (wcscmp(argv[i], L"--udp-video") == 0) { c.udpVideo = true; }
     else if (wcscmp(argv[i], L"--transport") == 0) { if (auto v = next()) c.udpVideo = (_wcsicmp(v, L"udp") == 0); }
@@ -555,10 +581,10 @@ float4 main(VSOut i) : SV_Target {
 
 static std::unique_ptr<D3DRenderer> g_renderer;
 
-static constexpr int kToolbarWidth = 500;
-static constexpr int kToolbarHeight = 64;
-static constexpr int kMenuWidth = 430;
-static constexpr int kMenuHeight = 518;
+static constexpr int kToolbarWidth = 470;
+static constexpr int kToolbarHeight = 56;
+static constexpr int kMenuWidth = 410;
+static constexpr int kMenuHeight = 458;
 static constexpr int kStatsWidth = 560;
 static constexpr int kStatsHeight = 720;
 static constexpr wchar_t kNativeClientVersion[] = L"native v2 0.1.0";
@@ -581,6 +607,171 @@ static std::wstring FormatDouble(double value, const wchar_t* suffix, int decima
 static std::wstring FormatBitrate(int bitrate) {
   if (bitrate <= 0) return L"-";
   return FormatDouble(double(bitrate) / 1'000'000.0, L" Mbps", 1);
+}
+
+static int ClampEven(int value, int fallback = 2) {
+  int number = std::max(2, static_cast<int>(std::lround(value)));
+  return (number % 2) == 0 ? number : number - 1;
+}
+
+static int AutoBitrateForPixels(int width, int height, int fallback) {
+  const int64_t pixels = static_cast<int64_t>(width) * height;
+  int bitrate = std::max(16'000'000, fallback);
+  if (pixels <= 1280ll * 720ll) bitrate = std::max(bitrate, 16'000'000);
+  else if (pixels <= 1920ll * 1080ll) bitrate = std::max(bitrate, 28'000'000);
+  else if (pixels <= 2560ll * 1440ll) bitrate = std::max(bitrate, 40'000'000);
+  else bitrate = std::max(bitrate, 60'000'000);
+  return bitrate;
+}
+
+static VideoProfile CurrentVideoProfile() {
+  VideoProfile profile;
+  profile.width = g_cfg.width;
+  profile.height = g_cfg.height;
+  profile.fps = g_cfg.fps;
+  profile.bitrate = g_cfg.bitrate > 0 ? g_cfg.bitrate : AutoBitrateForPixels(g_cfg.width, g_cfg.height, 28'000'000);
+  return profile;
+}
+
+static bool SameVideoProfile(const VideoProfile& lhs, const VideoProfile& rhs) {
+  return lhs.width == rhs.width && lhs.height == rhs.height && lhs.fps == rhs.fps && lhs.bitrate == rhs.bitrate;
+}
+
+static std::wstring FormatResolution(int width, int height) {
+  wchar_t buf[64];
+  swprintf_s(buf, L"%dx%d", width, height);
+  return buf;
+}
+
+static std::wstring FormatProfileBitrate(int bitrate) {
+  if (bitrate <= 0) return L"自动";
+  wchar_t buf[32];
+  swprintf_s(buf, L"%d Mbps", std::max(1, (bitrate + 500'000) / 1'000'000));
+  return buf;
+}
+
+static std::wstring FormatCompactProfile(const VideoProfile& profile) {
+  return FormatResolution(profile.width, profile.height) + L" / "
+       + std::to_wstring(profile.fps) + L" fps / "
+       + FormatProfileBitrate(profile.bitrate);
+}
+
+static void UpdatePendingProfileFromIndices() {
+  if (!g_resolutionPresets.empty()) {
+    g_resolutionIndex = std::clamp(g_resolutionIndex, 0, static_cast<int>(g_resolutionPresets.size()) - 1);
+    g_pendingProfile.width = g_resolutionPresets[g_resolutionIndex].width;
+    g_pendingProfile.height = g_resolutionPresets[g_resolutionIndex].height;
+  }
+  g_fpsIndex = std::clamp(g_fpsIndex, 0, static_cast<int>(kFpsPresets.size()) - 1);
+  g_bitrateIndex = std::clamp(g_bitrateIndex, 0, static_cast<int>(kBitratePresetsMbps.size()) - 1);
+  g_pendingProfile.fps = kFpsPresets[g_fpsIndex];
+  g_pendingProfile.bitrate = kBitratePresetsMbps[g_bitrateIndex] * 1'000'000;
+}
+
+static void InitVideoProfileUiState() {
+  g_pendingProfile = CurrentVideoProfile();
+  g_resolutionPresets.clear();
+
+  const int width = std::max(640, g_pendingProfile.width);
+  const int height = std::max(360, g_pendingProfile.height);
+  const bool landscape = width >= height;
+  const double longEdge = static_cast<double>(std::max(width, height));
+  const double shortEdge = static_cast<double>(std::max(1, std::min(width, height)));
+  const double aspect = longEdge / shortEdge;
+  const int longEdges[] = {1280, 1600, 1920, 2560, 3840};
+  for (int targetLong : longEdges) {
+    ResolutionPreset preset{};
+    if (landscape) {
+      preset.width = ClampEven(targetLong, width);
+      preset.height = ClampEven(static_cast<int>(std::lround(targetLong / aspect)), height);
+    } else {
+      preset.height = ClampEven(targetLong, height);
+      preset.width = ClampEven(static_cast<int>(std::lround(targetLong / aspect)), width);
+    }
+    if (preset.width < 640 || preset.height < 360) continue;
+    auto duplicate = std::find_if(g_resolutionPresets.begin(), g_resolutionPresets.end(), [&](const ResolutionPreset& item) {
+      return item.width == preset.width && item.height == preset.height;
+    });
+    if (duplicate == g_resolutionPresets.end()) {
+      g_resolutionPresets.push_back(preset);
+    }
+  }
+
+  auto currentIt = std::find_if(g_resolutionPresets.begin(), g_resolutionPresets.end(), [&](const ResolutionPreset& item) {
+    return item.width == g_pendingProfile.width && item.height == g_pendingProfile.height;
+  });
+  if (currentIt == g_resolutionPresets.end()) {
+    g_resolutionPresets.push_back({g_pendingProfile.width, g_pendingProfile.height});
+  }
+
+  std::sort(g_resolutionPresets.begin(), g_resolutionPresets.end(), [](const ResolutionPreset& lhs, const ResolutionPreset& rhs) {
+    const int64_t lhsPixels = static_cast<int64_t>(lhs.width) * lhs.height;
+    const int64_t rhsPixels = static_cast<int64_t>(rhs.width) * rhs.height;
+    if (lhsPixels != rhsPixels) return lhsPixels < rhsPixels;
+    return lhs.width < rhs.width;
+  });
+
+  for (size_t i = 0; i < g_resolutionPresets.size(); ++i) {
+    if (g_resolutionPresets[i].width == g_pendingProfile.width && g_resolutionPresets[i].height == g_pendingProfile.height) {
+      g_resolutionIndex = static_cast<int>(i);
+      break;
+    }
+  }
+
+  int bestFpsDistance = INT_MAX;
+  for (size_t i = 0; i < kFpsPresets.size(); ++i) {
+    int distance = std::abs(kFpsPresets[i] - g_pendingProfile.fps);
+    if (distance < bestFpsDistance) {
+      bestFpsDistance = distance;
+      g_fpsIndex = static_cast<int>(i);
+    }
+  }
+
+  int currentMbps = std::max(1, (g_pendingProfile.bitrate + 500'000) / 1'000'000);
+  int bestBitrateDistance = INT_MAX;
+  for (size_t i = 0; i < kBitratePresetsMbps.size(); ++i) {
+    int distance = std::abs(kBitratePresetsMbps[i] - currentMbps);
+    if (distance < bestBitrateDistance) {
+      bestBitrateDistance = distance;
+      g_bitrateIndex = static_cast<int>(i);
+    }
+  }
+
+  UpdatePendingProfileFromIndices();
+}
+
+static void CycleResolution(int delta) {
+  if (g_resolutionPresets.empty()) return;
+  const int count = static_cast<int>(g_resolutionPresets.size());
+  g_resolutionIndex = (g_resolutionIndex + delta + count) % count;
+  UpdatePendingProfileFromIndices();
+}
+
+static void CycleFps(int delta) {
+  const int count = static_cast<int>(kFpsPresets.size());
+  g_fpsIndex = (g_fpsIndex + delta + count) % count;
+  UpdatePendingProfileFromIndices();
+}
+
+static void CycleBitrate(int delta) {
+  const int count = static_cast<int>(kBitratePresetsMbps.size());
+  g_bitrateIndex = (g_bitrateIndex + delta + count) % count;
+  UpdatePendingProfileFromIndices();
+}
+
+static bool WriteProfileFile(const std::wstring& profileFile, const VideoProfile& profile) {
+  if (profileFile.empty()) return false;
+  FILE* file = nullptr;
+  if (_wfopen_s(&file, profileFile.c_str(), L"wb") != 0 || !file) return false;
+  std::string json = "{\n"
+                     "  \"width\": " + std::to_string(profile.width) + ",\n"
+                     "  \"height\": " + std::to_string(profile.height) + ",\n"
+                     "  \"fps\": " + std::to_string(profile.fps) + ",\n"
+                     "  \"bitrate\": " + std::to_string(profile.bitrate) + "\n"
+                     "}\n";
+  const size_t written = fwrite(json.data(), 1, json.size(), file);
+  fclose(file);
+  return written == json.size();
 }
 
 static std::wstring PlatformLabel(const std::wstring& platform) {
@@ -813,12 +1004,37 @@ static void ToggleNativeFullscreen() {
   SetNativeFullscreen(!g_cfg.fullscreen);
 }
 
+static void DrawMiniChevron(HDC hdc, int centerX, int centerY, bool left, COLORREF color) {
+  HPEN pen = CreatePen(PS_SOLID, 2, color);
+  HPEN oldPen = reinterpret_cast<HPEN>(SelectObject(hdc, pen));
+  if (left) {
+    MoveToEx(hdc, centerX + 3, centerY - 6, nullptr); LineTo(hdc, centerX - 3, centerY); LineTo(hdc, centerX + 3, centerY + 6);
+  } else {
+    MoveToEx(hdc, centerX - 3, centerY - 6, nullptr); LineTo(hdc, centerX + 3, centerY); LineTo(hdc, centerX - 3, centerY + 6);
+  }
+  SelectObject(hdc, oldPen);
+  DeleteObject(pen);
+}
+
+static void DrawSelectorButton(HDC hdc, RECT rc, bool left) {
+  HBRUSH fill = CreateSolidBrush(RGB(226, 232, 236));
+  HPEN border = CreatePen(PS_SOLID, 1, RGB(210, 217, 222));
+  HBRUSH oldBrush = reinterpret_cast<HBRUSH>(SelectObject(hdc, fill));
+  HPEN oldPen = reinterpret_cast<HPEN>(SelectObject(hdc, border));
+  RoundRect(hdc, rc.left, rc.top, rc.right, rc.bottom, 10, 10);
+  SelectObject(hdc, oldPen);
+  SelectObject(hdc, oldBrush);
+  DeleteObject(border);
+  DeleteObject(fill);
+  DrawMiniChevron(hdc, (rc.left + rc.right) / 2, (rc.top + rc.bottom) / 2, left, RGB(28, 37, 48));
+}
+
 static void DrawToolbar(HDC hdc, RECT rc) {
   HBRUSH bg = CreateSolidBrush(RGB(247, 249, 250));
   HPEN border = CreatePen(PS_SOLID, 1, RGB(218, 224, 230));
   HBRUSH oldBrush = reinterpret_cast<HBRUSH>(SelectObject(hdc, bg));
   HPEN oldPen = reinterpret_cast<HPEN>(SelectObject(hdc, border));
-  RoundRect(hdc, 0, 0, rc.right, rc.bottom, 28, 28);
+  RoundRect(hdc, 0, 0, rc.right, rc.bottom, 24, 24);
   SelectObject(hdc, oldPen);
   SelectObject(hdc, oldBrush);
   DeleteObject(border);
@@ -826,10 +1042,10 @@ static void DrawToolbar(HDC hdc, RECT rc) {
 
   HPEN ink = CreatePen(PS_SOLID, 2, RGB(22, 30, 40));
   HPEN oldInk = reinterpret_cast<HPEN>(SelectObject(hdc, ink));
-  MoveToEx(hdc, 26, 23, nullptr); LineTo(hdc, 42, 39);
-  MoveToEx(hdc, 42, 23, nullptr); LineTo(hdc, 26, 39);
-  MoveToEx(hdc, 92, 31, nullptr); LineTo(hdc, 112, 31);
-  MoveToEx(hdc, 102, 21, nullptr); LineTo(hdc, 102, 41);
+  MoveToEx(hdc, 24, 20, nullptr); LineTo(hdc, 38, 34);
+  MoveToEx(hdc, 38, 20, nullptr); LineTo(hdc, 24, 34);
+  MoveToEx(hdc, 82, 27, nullptr); LineTo(hdc, 100, 27);
+  MoveToEx(hdc, 91, 18, nullptr); LineTo(hdc, 91, 36);
   SelectObject(hdc, oldInk);
   DeleteObject(ink);
 
@@ -837,7 +1053,7 @@ static void DrawToolbar(HDC hdc, RECT rc) {
   HBRUSH oldControlPill = reinterpret_cast<HBRUSH>(SelectObject(hdc, controlPill));
   HPEN controlPen = CreatePen(PS_SOLID, 1, RGB(221, 226, 231));
   HPEN oldControlPen = reinterpret_cast<HPEN>(SelectObject(hdc, controlPen));
-  RoundRect(hdc, 138, 8, 304, 56, 18, 18);
+  RoundRect(hdc, 120, 7, 286, 49, 16, 16);
   SelectObject(hdc, oldControlPen);
   SelectObject(hdc, oldControlPill);
   DeleteObject(controlPen);
@@ -845,32 +1061,32 @@ static void DrawToolbar(HDC hdc, RECT rc) {
 
   HPEN controlInk = CreatePen(PS_SOLID, 2, RGB(24, 33, 44));
   HPEN oldControlInk = reinterpret_cast<HPEN>(SelectObject(hdc, controlInk));
-  RoundRect(hdc, 158, 19, 184, 28, 5, 5);
-  RoundRect(hdc, 158, 35, 184, 44, 5, 5);
-  MoveToEx(hdc, 164, 23, nullptr); LineTo(hdc, 178, 23);
-  MoveToEx(hdc, 164, 39, nullptr); LineTo(hdc, 178, 39);
+  RoundRect(hdc, 138, 16, 160, 24, 4, 4);
+  RoundRect(hdc, 138, 31, 160, 39, 4, 4);
+  MoveToEx(hdc, 143, 20, nullptr); LineTo(hdc, 155, 20);
+  MoveToEx(hdc, 143, 35, nullptr); LineTo(hdc, 155, 35);
   SelectObject(hdc, oldControlInk);
   DeleteObject(controlInk);
 
-  HFONT controlFont = CreateUiFont(21, FW_SEMIBOLD);
-  RECT controlRc{194, 14, 294, 50};
-  DrawTextRect(hdc, L"控制中心", controlRc, RGB(18, 24, 34), controlFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+  HFONT controlFont = CreateUiFont(16, FW_SEMIBOLD);
+  RECT controlRc{170, 11, 276, 45};
+  DrawTextRect(hdc, L"显示控制", controlRc, RGB(18, 24, 34), controlFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
   DeleteObject(controlFont);
 
   HBRUSH pill = CreateSolidBrush(RGB(221, 226, 231));
   HBRUSH oldPill = reinterpret_cast<HBRUSH>(SelectObject(hdc, pill));
   HPEN noPen = CreatePen(PS_SOLID, 1, RGB(221, 226, 231));
   HPEN oldNoPen = reinterpret_cast<HPEN>(SelectObject(hdc, noPen));
-  RoundRect(hdc, 318, 8, 384, 56, 18, 18);
+  RoundRect(hdc, 302, 7, 362, 49, 16, 16);
   SelectObject(hdc, oldNoPen);
   SelectObject(hdc, oldPill);
   DeleteObject(noPen);
   DeleteObject(pill);
 
-  DrawSignalBars(hdc, 336, 17, RGB(17, 190, 122));
+  DrawSignalBars(hdc, 318, 15, RGB(17, 190, 122));
 
-  HFONT font = CreateUiFont(24, FW_SEMIBOLD);
-  RECT timeRc{396, 15, 490, 52};
+  HFONT font = CreateUiFont(18, FW_SEMIBOLD);
+  RECT timeRc{376, 11, 462, 45};
   DrawTextRect(hdc, FormatElapsed(), timeRc, RGB(82, 87, 94), font, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
   DeleteObject(font);
 }
@@ -878,22 +1094,40 @@ static void DrawToolbar(HDC hdc, RECT rc) {
 static void DrawMenuRow(HDC hdc, int y, int icon, const std::wstring& label, const std::wstring& value, bool chevron, bool danger = false) {
   COLORREF ink = danger ? RGB(232, 62, 52) : RGB(28, 37, 48);
   COLORREF subtle = danger ? RGB(232, 62, 52) : RGB(120, 130, 142);
-  DrawMenuIcon(hdc, icon, 24, y + 10, ink);
-  HFONT labelFont = CreateUiFont(20, FW_SEMIBOLD);
-  HFONT valueFont = CreateUiFont(14, FW_NORMAL);
-  RECT labelRc{62, y + 7, 274, y + 38};
+  DrawMenuIcon(hdc, icon, 24, y + 9, ink);
+  HFONT labelFont = CreateUiFont(17, FW_SEMIBOLD);
+  HFONT valueFont = CreateUiFont(13, FW_NORMAL);
+  RECT labelRc{62, y + 6, 238, y + 34};
   DrawTextRect(hdc, label, labelRc, ink, labelFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
   if (!value.empty()) {
-    RECT valueRc{246, y + 10, chevron ? 374 : 400, y + 37};
+    RECT valueRc{220, y + 9, chevron ? 356 : 382, y + 34};
     DrawTextRect(hdc, value, valueRc, subtle, valueFont, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
   }
   if (chevron) {
     HPEN pen = CreatePen(PS_SOLID, 3, RGB(26, 34, 44));
     HPEN oldPen = reinterpret_cast<HPEN>(SelectObject(hdc, pen));
-    MoveToEx(hdc, 384, y + 17, nullptr); LineTo(hdc, 392, y + 24); LineTo(hdc, 384, y + 31);
+    MoveToEx(hdc, 368, y + 14, nullptr); LineTo(hdc, 376, y + 21); LineTo(hdc, 368, y + 28);
     SelectObject(hdc, oldPen);
     DeleteObject(pen);
   }
+  DeleteObject(labelFont);
+  DeleteObject(valueFont);
+}
+
+static void DrawMenuSelectorRow(HDC hdc, int y, int icon, const std::wstring& label, const std::wstring& value) {
+  DrawMenuIcon(hdc, icon, 24, y + 9, RGB(28, 37, 48));
+  HFONT labelFont = CreateUiFont(17, FW_SEMIBOLD);
+  HFONT valueFont = CreateUiFont(13, FW_NORMAL);
+  RECT labelRc{62, y + 6, 172, y + 34};
+  DrawTextRect(hdc, label, labelRc, RGB(28, 37, 48), labelFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+
+  RECT leftRc{224, y + 4, 254, y + 34};
+  RECT rightRc{360, y + 4, 390, y + 34};
+  DrawSelectorButton(hdc, leftRc, true);
+  DrawSelectorButton(hdc, rightRc, false);
+
+  RECT valueRc{262, y + 6, 350, y + 34};
+  DrawTextRect(hdc, value, valueRc, RGB(110, 120, 132), valueFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
   DeleteObject(labelFont);
   DeleteObject(valueFont);
 }
@@ -917,6 +1151,10 @@ static void DrawStatsSeparator(HDC hdc, int y) {
 }
 
 static void DrawMenu(HDC hdc, RECT rc) {
+  const NativeUiStats stats = CurrentUiStats();
+  const VideoProfile activeProfile = CurrentVideoProfile();
+  const bool pendingChanges = !SameVideoProfile(activeProfile, g_pendingProfile);
+
   HBRUSH bg = CreateSolidBrush(RGB(237, 248, 249));
   HPEN border = CreatePen(PS_SOLID, 1, RGB(196, 210, 216));
   HBRUSH oldBrush = reinterpret_cast<HBRUSH>(SelectObject(hdc, bg));
@@ -927,25 +1165,28 @@ static void DrawMenu(HDC hdc, RECT rc) {
   DeleteObject(border);
   DeleteObject(bg);
 
-  wchar_t displayValue[64];
-  swprintf_s(displayValue, L"%dx%d", g_cfg.width, g_cfg.height);
-  DrawMenuRow(hdc, 18, 0, DisplayLabel(), displayValue, true);
+  DrawMenuRow(hdc, 18, 0, DisplayLabel(), FormatCompactProfile(activeProfile), false);
   DrawSeparator(hdc, 72);
-  DrawMenuRow(hdc, 86, 1, L"画质", FormatDouble(g_cfg.fps, L" fps", 0), true);
-  DrawMenuRow(hdc, 134, 2, L"窗口", g_cfg.fullscreen ? L"全屏" : L"窗口", true);
-  DrawMenuRow(hdc, 182, 3, L"声音", L"未启用", true);
-  DrawMenuRow(hdc, 230, 4, L"安全", g_cfg.udpVideo ? L"UDP 直连" : L"TCP 直连", true);
-  DrawMenuRow(hdc, 278, 5, L"外设", L"键鼠", true);
-  DrawMenuRow(hdc, 326, 6, L"更多", L"Native v2", true);
-  DrawSeparator(hdc, 382);
-  DrawMenuRow(hdc, 396, 7, g_cfg.fullscreen ? L"退出全屏幕" : L"进入全屏幕", L"F11", false);
-  DrawSeparator(hdc, 452);
-  DrawMenuRow(hdc, 466, 8, L"退出远控", L"", false, true);
+  DrawMenuSelectorRow(hdc, 86, 0, L"分辨率", FormatResolution(g_pendingProfile.width, g_pendingProfile.height));
+  DrawMenuSelectorRow(hdc, 134, 1, L"帧率", std::to_wstring(g_pendingProfile.fps) + L" fps");
+  DrawMenuSelectorRow(hdc, 182, 4, L"码率", FormatProfileBitrate(g_pendingProfile.bitrate));
+  DrawSeparator(hdc, 238);
+  DrawMenuRow(hdc, 252, 6, L"应用并重连", pendingChanges ? L"切换到新配置" : L"当前配置", false);
+  wchar_t statsValue[64];
+  if (stats.rxToPresentMs > 0.0 || stats.mbps > 0.0) {
+    swprintf_s(statsValue, L"%.0f ms / %.1f Mbps", stats.rxToPresentMs, stats.mbps);
+  } else {
+    swprintf_s(statsValue, L"%s", g_cfg.udpVideo ? L"UDP 直连" : L"TCP 直连");
+  }
+  DrawMenuRow(hdc, 300, 5, L"链路统计", statsValue, true);
+  DrawMenuRow(hdc, 348, 7, g_cfg.fullscreen ? L"退出全屏幕" : L"进入全屏幕", L"F11", false);
+  DrawSeparator(hdc, 404);
+  DrawMenuRow(hdc, 414, 8, L"退出远控", L"", false, true);
 }
 
 static void DrawStatsRow(HDC hdc, int y, const std::wstring& label, const std::wstring& value) {
-  HFONT labelFont = CreateUiFont(19, FW_SEMIBOLD);
-  HFONT valueFont = CreateUiFont(21, FW_NORMAL);
+  HFONT labelFont = CreateUiFont(16, FW_SEMIBOLD);
+  HFONT valueFont = CreateUiFont(18, FW_NORMAL);
   RECT labelRc{32, y, 205, y + 32};
   RECT valueRc{230, y, kStatsWidth - 32, y + 32};
   DrawTextRect(hdc, label, labelRc, RGB(146, 151, 160), labelFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -967,7 +1208,7 @@ static void DrawStats(HDC hdc, RECT rc) {
   DeleteObject(bg);
 
   DrawSignalBars(hdc, 38, 34, RGB(17, 190, 122));
-  HFONT titleFont = CreateUiFont(24, FW_BOLD);
+  HFONT titleFont = CreateUiFont(20, FW_BOLD);
   std::wstring latency = stats.rxToPresentMs > 0.0 ? FormatDouble(stats.rxToPresentMs, L" ms", 0) : L"-- ms";
   RECT titleRc{92, 30, kStatsWidth - 30, 72};
   DrawTextRect(hdc, L"显示尾延时: " + latency, titleRc, RGB(15, 22, 36), titleFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
@@ -1002,24 +1243,76 @@ static void DrawStats(HDC hdc, RECT rc) {
 }
 
 static void HandleToolbarClick(int x, int y) {
-  if (x >= 18 && x <= 54 && y >= 14 && y <= 50) {
+  if (x >= 14 && x <= 50 && y >= 10 && y <= 42) {
     PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
-  } else if (x >= 76 && x <= 124 && y >= 10 && y <= 54) {
+  } else if (x >= 62 && x <= 110 && y >= 8 && y <= 48) {
     TogglePopup(g_menuHwnd);
-  } else if (x >= 138 && x <= 304 && y >= 6 && y <= 58) {
+  } else if (x >= 120 && x <= 286 && y >= 6 && y <= 50) {
     TogglePopup(g_menuHwnd);
-  } else if (x >= 318 && x <= 384 && y >= 6 && y <= 58) {
+  } else if (x >= 302 && x <= 362 && y >= 6 && y <= 50) {
     TogglePopup(g_statsHwnd);
   }
 }
 
+static void SendVideoProfileCommand(const VideoProfile& profile) {
+  const uint16_t bitrateMbps = static_cast<uint16_t>(std::clamp((profile.bitrate + 500'000) / 1'000'000, 1, 200));
+  for (int i = 0; i < 3; ++i) {
+    SendInput(P2_INPUT_SET_VIDEO_PROFILE, 0, 0, profile.width, profile.height,
+              static_cast<uint16_t>(std::clamp(profile.fps, 30, 240)), bitrateMbps);
+    if (i < 2) Sleep(15);
+  }
+}
+
+static void ApplyPendingVideoProfile() {
+  const VideoProfile activeProfile = CurrentVideoProfile();
+  if (SameVideoProfile(activeProfile, g_pendingProfile)) {
+    HideNativePopups();
+    return;
+  }
+
+  if (!WriteProfileFile(g_cfg.profileFile, g_pendingProfile)) {
+    MessageBoxW(g_hwnd, L"Failed to save the updated native-v2 profile.", L"P2P Native", MB_ICONERROR);
+    return;
+  }
+
+  SendVideoProfileCommand(g_pendingProfile);
+  g_exitCode = kProfileApplyExitCode;
+  PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+}
+
+static bool HandleSelectorClick(int x, int y, int rowY, void (*cycleFn)(int)) {
+  if (y < rowY || y >= rowY + 40) return false;
+  if (x >= 224 && x <= 254) {
+    cycleFn(-1);
+    if (g_menuHwnd) InvalidateRect(g_menuHwnd, nullptr, FALSE);
+    return true;
+  }
+  if (x >= 360 && x <= 390) {
+    cycleFn(1);
+    if (g_menuHwnd) InvalidateRect(g_menuHwnd, nullptr, FALSE);
+    return true;
+  }
+  if (x >= 262 && x <= 350) {
+    cycleFn(1);
+    if (g_menuHwnd) InvalidateRect(g_menuHwnd, nullptr, FALSE);
+    return true;
+  }
+  return false;
+}
+
 static void HandleMenuClick(int x, int y) {
-  if (y >= 396 && y < 444) {
-    ToggleNativeFullscreen();
-  } else if (y >= 466 && y < 512) {
-    PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
-  } else if (y >= 80 && y < 374) {
+  if (HandleSelectorClick(x, y, 86, CycleResolution)) return;
+  if (HandleSelectorClick(x, y, 134, CycleFps)) return;
+  if (HandleSelectorClick(x, y, 182, CycleBitrate)) return;
+
+  if (y >= 252 && y < 292) {
+    ApplyPendingVideoProfile();
+  } else if (y >= 300 && y < 340) {
     ShowOnlyPopup(g_statsHwnd);
+  } else if (y >= 348 && y < 388) {
+    ToggleNativeFullscreen();
+  } else if (y >= 414 && y < 448) {
+    PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
   }
 }
 
@@ -1770,6 +2063,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                  static_cast<unsigned long long>(cpu));
       SetWindowTextW(hwnd, title);
       if (g_toolbarHwnd) InvalidateRect(g_toolbarHwnd, nullptr, FALSE);
+      if (g_menuHwnd && IsWindowVisible(g_menuHwnd)) InvalidateRect(g_menuHwnd, nullptr, FALSE);
       if (g_statsHwnd && IsWindowVisible(g_statsHwnd)) InvalidateRect(g_statsHwnd, nullptr, FALSE);
       return 0;
     }
@@ -1883,7 +2177,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       if (g_toolbarHwnd) { DestroyWindow(g_toolbarHwnd); g_toolbarHwnd = nullptr; }
       if (g_menuHwnd) { DestroyWindow(g_menuHwnd); g_menuHwnd = nullptr; }
       if (g_statsHwnd) { DestroyWindow(g_statsHwnd); g_statsHwnd = nullptr; }
-      PostQuitMessage(0);
+      PostQuitMessage(g_exitCode);
       return 0;
   }
   return DefWindowProc(hwnd, msg, wp, lp);
@@ -1902,6 +2196,7 @@ static bool InitInputSocket() {
 
 int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
   g_cfg = ParseArgs();
+  InitVideoProfileUiState();
   QueryPerformanceFrequency(&g_qpcFreq);
   g_startedQpc = QpcNow();
   SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
@@ -1959,5 +2254,5 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
   if (g_inputSock != INVALID_SOCKET) closesocket(g_inputSock);
   WSACleanup();
   timeEndPeriod(1);
-  return 0;
+  return static_cast<int>(msg.wParam);
 }
