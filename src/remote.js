@@ -34,6 +34,8 @@ let answerTimer = 0;
 let offerSentAt = 0;
 let lastHostProgress = '';
 let pendingRemoteCandidates = [];
+let statsTimer = 0;
+let firstFrameLogged = false;
 
 function log(message) {
   const line = `[${new Date().toLocaleTimeString()}] ${message}`;
@@ -183,15 +185,51 @@ function sendInput(event) {
   inputChannel.send(JSON.stringify({ ...event, t: performance.now() }));
 }
 
+function clearStatsTimer() {
+  clearInterval(statsTimer);
+  statsTimer = 0;
+}
+
+async function logInboundVideoStats(reason = 'periodic') {
+  if (!pc || isClosing) return;
+  try {
+    const stats = await pc.getStats();
+    let inbound = null;
+    stats.forEach((report) => {
+      if (report.type === 'inbound-rtp' && report.kind === 'video') inbound = report;
+    });
+    if (!inbound) return;
+    const fps = inbound.framesPerSecond ? ` fps=${Math.round(inbound.framesPerSecond)}` : '';
+    const decoded = Number.isFinite(inbound.framesDecoded) ? ` decoded=${inbound.framesDecoded}` : '';
+    const dropped = Number.isFinite(inbound.framesDropped) ? ` dropped=${inbound.framesDropped}` : '';
+    const bytes = Number.isFinite(inbound.bytesReceived) ? ` bytes=${inbound.bytesReceived}` : '';
+    const jitter = Number.isFinite(inbound.jitter) ? ` jitter=${inbound.jitter.toFixed(4)}` : '';
+    const packetsLost = Number.isFinite(inbound.packetsLost) ? ` lost=${inbound.packetsLost}` : '';
+    const pli = Number.isFinite(inbound.pliCount) ? ` pli=${inbound.pliCount}` : '';
+    log(`video stats(${reason}):${decoded}${dropped}${fps}${bytes}${jitter}${packetsLost}${pli}`);
+  } catch (err) {
+    log(`video stats failed(${reason}): ${err.message}`);
+  }
+}
+
+function startStatsTimer() {
+  clearStatsTimer();
+  statsTimer = setInterval(() => {
+    logInboundVideoStats('5s').catch(() => {});
+  }, 5000);
+}
+
 function cleanupConnection() {
   isClosing = true;
   clearAnswerTimer();
+  clearStatsTimer();
   if (moveRaf) cancelAnimationFrame(moveRaf);
   moveRaf = 0;
   pendingMove = null;
   pendingRemoteCandidates = [];
   pressedKeys.clear();
   pointerDown = false;
+  firstFrameLogged = false;
   try {
     inputChannel?.close();
   } catch {}
@@ -217,16 +255,13 @@ function cleanupConnection() {
 function makePeer() {
   sawRemoteTrack = false;
   pendingRemoteCandidates = [];
+  firstFrameLogged = false;
   const iceTimeout = setTimeout(() => {
     if (!pc || ['connected', 'completed'].includes(pc.iceConnectionState) || isClosing) return;
-    log('ICE still checking after 5s; restarting ICE');
-    pc.restartIce?.();
+    log('ICE still checking after 5s');
   }, 5000);
   pc = new RTCPeerConnection({
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun.cloudflare.com:3478' },
-    ],
+    iceServers: [],
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
     iceCandidatePoolSize: 0,
@@ -253,6 +288,8 @@ function makePeer() {
     event.track.onunmute = () => {
       overlay.style.display = 'none';
       log('remote video unmuted');
+      startStatsTimer();
+      logInboundVideoStats('unmute').catch(() => {});
     };
     event.track.onmute = () => {
       overlay.style.display = 'grid';
@@ -433,11 +470,18 @@ video.addEventListener('loadedmetadata', () => log(`video metadata ${video.video
 video.addEventListener('loadeddata', () => {
   overlay.style.display = 'none';
   saveFirstFrame();
+  if (!firstFrameLogged) {
+    firstFrameLogged = true;
+    const elapsed = offerSentAt ? Math.round(performance.now() - offerSentAt) : 0;
+    log(`first frame loaded after ${elapsed}ms`);
+    logInboundVideoStats('loadeddata').catch(() => {});
+  }
 });
 video.addEventListener('playing', () => {
   overlay.style.display = 'none';
   setStatus('ok', '\u5df2\u8fde\u63a5');
   log('video playing');
+  logInboundVideoStats('playing').catch(() => {});
 });
 video.addEventListener('waiting', () => {
   if (!sawRemoteTrack) return;

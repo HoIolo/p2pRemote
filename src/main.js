@@ -185,6 +185,7 @@ function deviceName() {
 }
 
 function localDevicePayload() {
+  const primary = screen.getPrimaryDisplay();
   return {
     type: 'p2p-remote-lan:announce',
     version: 1,
@@ -194,6 +195,13 @@ function localDevicePayload() {
     port: SIGNAL_PORT,
     pin: PIN,
     addresses: lanAddresses().map((item) => item.address),
+    display: primary?.bounds ? {
+      x: primary.bounds.x,
+      y: primary.bounds.y,
+      width: primary.bounds.width,
+      height: primary.bounds.height,
+    } : null,
+    scaleFactor: primary?.scaleFactor || 1,
     ts: Date.now(),
   };
 }
@@ -207,6 +215,8 @@ function serializeDevice(device) {
     port: Number(device.port || SIGNAL_PORT),
     pin: String(device.pin || ''),
     addresses: device.addresses || [],
+    display: device.display || null,
+    scaleFactor: Number(device.scaleFactor || 1),
     lastSeen: device.lastSeen,
     preview: devicePreviews.get(device.id) || null,
   };
@@ -330,7 +340,7 @@ function nativeV2StatusPayload() {
       inputPort: 45001,
       width: 1920,
       height: 1080,
-      fps: 120,
+      fps: 60,
       bitrate: 45_000_000,
       keyint: 1,
     },

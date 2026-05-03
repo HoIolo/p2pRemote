@@ -19,12 +19,9 @@ const logEl = $('log');
 
 let devices = [];
 let selectedId = null;
-let localStream = null;
 let nativeV2Status = null;
 let appInfo = null;
 let nativeV2Connecting = false;
-const peers = new Map();
-const pendingPeerCandidates = new Map();
 
 function iconSvg(name, className = 'icon') {
   return `<svg class="${className}" aria-hidden="true"><use href="assets/icons.svg#${name}"></use></svg>`;
@@ -44,7 +41,7 @@ function friendlyNativeV2Error(err, device) {
   if (raw.includes('timed out') || raw.includes('closed before response')) {
     return [
       `Mac 端没有响应 Native v2 启动请求（${device?.address || 'unknown'}:7777）。`,
-      '请确认 Mac 上运行的是最新版本 App，并且 Mac 端已执行 npm run v2:mac:build；否则先切回“稳定 WebRTC”。',
+      '请确认 Mac 上运行的是最新版本 App，并且已执行 npm run v2:mac:build；否则先切回“稳定 WebRTC”。',
     ].join(' ');
   }
   if (raw.includes('还没有构建') || raw.includes('not built')) return raw;
@@ -84,8 +81,8 @@ function escapeHtml(value) {
     '<': '&lt;',
     '>': '&gt;',
     '"': '&quot;',
-    "'": '&#39;',
-  })[char]);
+    '\'': '&#39;',
+  }[char]));
 }
 
 function selectedDevice() {
@@ -110,7 +107,7 @@ function updateNativeV2Status(status) {
     if (winClient.running) {
       nativeV2StatusTextEl.textContent = `Windows Native v2 客户端运行中，pid=${winClient.pid}`;
     } else if (winClient.available) {
-      nativeV2StatusTextEl.textContent = 'Windows Native v2 客户端已就绪；Mac 端先启动 Host 后可一键进入极限模式。';
+      nativeV2StatusTextEl.textContent = 'Windows Native v2 客户端已就绪，Mac 端先启动 Host 后可一键进入极速模式。';
     } else {
       nativeV2StatusTextEl.textContent = 'Windows Native v2 客户端未构建；先执行 npm run v2:win:build，当前可继续使用 WebRTC。';
     }
@@ -121,7 +118,7 @@ function updateNativeV2Status(status) {
     if (macHost.running) {
       nativeV2StatusTextEl.textContent = `macOS Native v2 Host 运行中，pid=${macHost.pid}`;
     } else if (macHost.available) {
-      nativeV2StatusTextEl.textContent = 'macOS Native v2 Host 已构建；输入 Windows IP 后可启动极限 Host。';
+      nativeV2StatusTextEl.textContent = 'macOS Native v2 Host 已构建；输入 Windows IP 后可启动极速 Host。';
     } else {
       nativeV2StatusTextEl.textContent = 'macOS Native v2 Host 未构建；先执行 npm run v2:mac:build。';
     }
@@ -140,42 +137,90 @@ async function refreshNativeV2Status() {
   }
 }
 
+function clampEven(value, fallback = 2) {
+  const number = Math.max(2, Math.round(Number(value) || fallback));
+  return number % 2 === 0 ? number : number - 1;
+}
+
+function scaleResolution(width, height, maxLongEdge = 3840) {
+  const longEdge = Math.max(width, height);
+  if (!longEdge || longEdge <= maxLongEdge) {
+    return { width: clampEven(width, 1920), height: clampEven(height, 1080) };
+  }
+  const scale = maxLongEdge / longEdge;
+  return {
+    width: clampEven(width * scale, 1920),
+    height: clampEven(height * scale, 1080),
+  };
+}
+
+function nativeV2DisplayOptions(device) {
+  const defaults = nativeV2Status?.defaults || {};
+  const display = device?.display;
+  const scaleFactor = Number(device?.scaleFactor || 1);
+  if (!display?.width || !display?.height) {
+    return {
+      width: clampEven(defaults.width || 1920, 1920),
+      height: clampEven(defaults.height || 1080, 1080),
+      bitrate: defaults.bitrate || 45_000_000,
+    };
+  }
+
+  const sourceWidth = clampEven(display.width * scaleFactor, defaults.width || 1920);
+  const sourceHeight = clampEven(display.height * scaleFactor, defaults.height || 1080);
+  const scaled = scaleResolution(sourceWidth, sourceHeight);
+  const pixels = scaled.width * scaled.height;
+  let bitrate = defaults.bitrate || 45_000_000;
+  if (pixels <= 1920 * 1080) bitrate = Math.max(bitrate, 30_000_000);
+  else if (pixels <= 2560 * 1440) bitrate = Math.max(bitrate, 50_000_000);
+  else bitrate = Math.max(bitrate, 65_000_000);
+
+  return {
+    width: scaled.width,
+    height: scaled.height,
+    bitrate,
+  };
+}
+
 function nativeV2ClientOptions(device) {
   const defaults = nativeV2Status?.defaults || {};
+  const display = nativeV2DisplayOptions(device);
   return {
     hostIp: device.address,
     videoPort: defaults.videoPort || 45000,
     inputPort: defaults.inputPort || 45001,
-    width: defaults.width || 1920,
-    height: defaults.height || 1080,
-    fps: defaults.fps || 120,
+    width: display.width,
+    height: display.height,
+    fps: defaults.fps || 60,
     fullscreen: true,
-    transport: 'tcp',
+    transport: 'udp',
   };
 }
 
 function nativeV2HostOptions(device) {
   const defaults = nativeV2Status?.defaults || {};
   const clientIp = appInfo?.device?.addresses?.[0] || '';
+  const display = nativeV2DisplayOptions(device);
   return {
     clientIp: nativeV2Status?.platform === 'win32' ? clientIp : device.address,
     videoPort: defaults.videoPort || 45000,
     inputPort: defaults.inputPort || 45001,
-    width: defaults.width || 1920,
-    height: defaults.height || 1080,
-    fps: defaults.fps || 120,
-    bitrate: defaults.bitrate || 45_000_000,
+    width: display.width,
+    height: display.height,
+    fps: defaults.fps || 60,
+    bitrate: display.bitrate,
     keyint: defaults.keyint || 1,
-    transport: 'tcp',
+    transport: 'udp',
   };
 }
 
 function nativeV2MacHostCommand(device, routeAddress = '') {
   const defaults = nativeV2Status?.defaults || {};
   const clientIp = routeAddress || appInfo?.device?.addresses?.[0] || '<Windows_IP>';
+  const display = nativeV2DisplayOptions(device);
   return [
     'cd native-v2/mac-host',
-    `CLIENT_IP=${clientIp} VIDEO_PORT=${defaults.videoPort || 45000} INPUT_PORT=${defaults.inputPort || 45001} WIDTH=${defaults.width || 1920} HEIGHT=${defaults.height || 1080} FPS=${defaults.fps || 120} BITRATE=${defaults.bitrate || 45000000} TRANSPORT=tcp ./run-ultra.sh`,
+    `CLIENT_IP=${clientIp} VIDEO_PORT=${defaults.videoPort || 45000} INPUT_PORT=${defaults.inputPort || 45001} WIDTH=${display.width} HEIGHT=${display.height} FPS=${defaults.fps || 60} BITRATE=${display.bitrate} TRANSPORT=udp ./run-ultra.sh`,
   ].join('\n');
 }
 
@@ -220,7 +265,7 @@ function renderDevices() {
   previewImageEl.src = selected ? (selected.preview || defaultPreview(selected.platform)) : defaultPreview('win32');
   enterDesktopBtn.disabled = !selected || nativeV2Connecting;
   connectSelectedBtn.disabled = !selected || nativeV2Connecting;
-  const actionLabel = connectionMode() === 'native-v2' ? 'Native v2 极限' : '远程桌面';
+  const actionLabel = connectionMode() === 'native-v2' ? 'Native v2 极速' : '远程桌面';
   const enterText = enterDesktopBtn.querySelector('span');
   const connectText = connectSelectedBtn.querySelector('span');
   if (enterText) enterText.textContent = nativeV2Connecting ? '正在启动...' : (selected ? actionLabel : '进入桌面');
@@ -254,7 +299,7 @@ async function openNativeV2Device(device) {
     log('native-v2 start ignored: already connecting');
     return;
   }
-  setNativeV2Busy(true, `正在启动 Native v2：请求 ${device.address} 准备视频流...`);
+  setNativeV2Busy(true, `正在启动 Native v2：请等待 ${device.address} 准备视频流...`);
   try {
     await refreshNativeV2Status();
     if (nativeV2Status?.platform === 'win32') {
@@ -341,224 +386,14 @@ async function initApp() {
   await refreshDevices();
 }
 
-async function waitForLiveTrack(track, timeoutMs = 1500) {
-  if (track.readyState === 'live' && !track.muted) return;
-  await new Promise((resolve) => {
-    const timer = setTimeout(resolve, timeoutMs);
-    track.addEventListener('unmute', () => {
-      clearTimeout(timer);
-      resolve();
-    }, { once: true });
-  });
-}
-
-function withTimeout(promise, timeoutMs, message) {
-  let timer = null;
-  const timeout = new Promise((_, reject) => {
-    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
-  });
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
-}
-
-function sendSignalProgress(clientId, stage, detail = '') {
-  window.lanRemote.sendSignal({
-    clientId,
-    message: {
-      type: 'progress',
-      stage,
-      detail,
-      ts: Date.now(),
-    },
-  });
-}
-
-async function tuneCaptureTrack(track) {
-  try {
-    await track.applyConstraints({ frameRate: { ideal: 60 } });
-  } catch (err) {
-    log(`capture constraints skipped: ${err.message}`);
-  }
-}
-
-async function startCapture() {
-  if (localStream) return localStream;
-  localStream = await withTimeout(
-    navigator.mediaDevices.getDisplayMedia({ audio: false, video: true }),
-    8000,
-    'Mac screen capture did not start within 8s; check Screen Recording permission and restart the Mac app',
-  );
-  const tracks = localStream.getVideoTracks();
-  if (tracks.length === 0) throw new Error('No screen video track returned');
-
-  for (const track of tracks) {
-    track.contentHint = 'motion';
-    await tuneCaptureTrack(track);
-    await waitForLiveTrack(track);
-    const settings = track.getSettings?.() || {};
-    log(`screen track ready: ${settings.width || '?'}x${settings.height || '?'} muted=${track.muted} state=${track.readyState}`);
-    track.addEventListener('mute', () => log('screen track muted'));
-    track.addEventListener('unmute', () => log('screen track unmuted'));
-    track.addEventListener('ended', () => {
-      log('local screen capture stopped');
-      localStream = null;
-      for (const peer of peers.values()) peer.close();
-      peers.clear();
-      pendingPeerCandidates.clear();
-    });
-  }
-  log('local screen capture started');
-  return localStream;
-}
-
-function preferH264(pc, sender) {
-  try {
-    const caps = RTCRtpSender.getCapabilities('video');
-    const transceiver = pc.getTransceivers().find((item) => item.sender === sender);
-    if (!caps?.codecs || !transceiver?.setCodecPreferences) return;
-    const h264 = caps.codecs.filter((codec) => codec.mimeType.toLowerCase() === 'video/h264');
-    const rest = caps.codecs.filter((codec) => codec.mimeType.toLowerCase() !== 'video/h264');
-    if (h264.length) transceiver.setCodecPreferences([...h264, ...rest]);
-  } catch (err) {
-    log(`codec preference skipped: ${err.message}`);
-  }
-}
-
-async function tuneSender(sender) {
-  try {
-    const params = sender.getParameters();
-    if (!params.encodings || params.encodings.length === 0) params.encodings = [{}];
-    params.encodings[0].maxBitrate = 35_000_000;
-    params.encodings[0].maxFramerate = 60;
-    params.degradationPreference = 'maintain-framerate';
-    await sender.setParameters(params);
-  } catch (err) {
-    log(`sender tuning skipped: ${err.message}`);
-  }
-}
-
-function makeHostPeer(clientId) {
-  const pc = new RTCPeerConnection({
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun.cloudflare.com:3478' },
-    ],
-    bundlePolicy: 'max-bundle',
-    rtcpMuxPolicy: 'require',
-    iceCandidatePoolSize: 0,
-  });
-
-  pc.onicecandidate = (event) => {
-    if (event.candidate) {
-      window.lanRemote.sendSignal({ clientId, message: { type: 'candidate', candidate: event.candidate } });
-    }
-  };
-  pc.onconnectionstatechange = () => log(`incoming ${clientId.slice(0, 8)} state=${pc.connectionState}`);
-  pc.oniceconnectionstatechange = () => log(`incoming ${clientId.slice(0, 8)} ice=${pc.iceConnectionState}`);
-  pc.onnegotiationneeded = () => log(`incoming ${clientId.slice(0, 8)} negotiationneeded`);
-  pc.ondatachannel = (event) => {
-    const channel = event.channel;
-    channel.onmessage = (msg) => {
-      try {
-        window.lanRemote.sendInput(JSON.parse(msg.data));
-      } catch (err) {
-        log(`bad input packet: ${err.message}`);
-      }
-    };
-  };
-
-  peers.set(clientId, pc);
-  return pc;
-}
-
-async function addPeerCandidate(clientId, pc, candidate) {
-  if (!candidate) return;
-  if (!pc || !pc.remoteDescription) {
-    const pending = pendingPeerCandidates.get(clientId) || [];
-    pending.push(candidate);
-    pendingPeerCandidates.set(clientId, pending);
-    log(`queued ICE candidate from ${clientId.slice(0, 8)} (${pending.length}) until peer/offer is ready`);
-    return;
-  }
-  try {
-    await pc.addIceCandidate(candidate);
-    log(`ICE candidate applied from ${clientId.slice(0, 8)}`);
-  } catch (err) {
-    log(`addIceCandidate failed from ${clientId.slice(0, 8)}: ${err.message}`);
-  }
-}
-
-async function flushPeerCandidates(clientId, pc) {
-  if (!pc?.remoteDescription) return;
-  const pending = pendingPeerCandidates.get(clientId) || [];
-  if (!pending.length) return;
-  pendingPeerCandidates.delete(clientId);
-  log(`applying ${pending.length} queued ICE candidates from ${clientId.slice(0, 8)}`);
-  for (const candidate of pending) {
-    await addPeerCandidate(clientId, pc, candidate);
-  }
-}
-
-function ensureVideoSender(pc) {
-  let transceiver = pc.getTransceivers().find((item) => (
-    item.receiver?.track?.kind === 'video' || item.sender?.track?.kind === 'video'
-  ));
-  if (!transceiver) transceiver = pc.addTransceiver('video', { direction: 'sendonly' });
-  try {
-    transceiver.direction = 'sendonly';
-  } catch (err) {
-    log(`set video transceiver direction skipped: ${err.message}`);
-  }
-  return transceiver;
-}
-
-async function attachScreenStream(pc, stream, videoTransceiver) {
-  for (const track of stream.getTracks()) {
-    if (track.kind === 'video' && videoTransceiver?.sender) {
-      track.contentHint = 'detail';
-      await videoTransceiver.sender.replaceTrack(track);
-      await tuneSender(videoTransceiver.sender);
-      continue;
-    }
-    const sender = pc.addTrack(track, stream);
-    if (track.kind === 'video') await tuneSender(sender);
-  }
-}
-
-async function handleSignal({ clientId, message }) {
-  if (!message?.type) return;
-  let pc = peers.get(clientId);
-
-  if (message.type === 'offer') {
-    try {
-      log(`offer received from ${clientId.slice(0, 8)}; starting capture`);
-      sendSignalProgress(clientId, 'offer-received', 'Mac received offer, preparing WebRTC answer');
-      if (pc) pc.close();
-      pc = makeHostPeer(clientId);
-
-      await pc.setRemoteDescription(message.sdp);
-      await flushPeerCandidates(clientId, pc);
-      const videoTransceiver = ensureVideoSender(pc);
-      sendSignalProgress(clientId, 'capture-starting', 'Mac is starting screen capture');
-      const stream = await startCapture();
-      sendSignalProgress(clientId, 'capture-ready', 'Mac screen capture is ready');
-      await attachScreenStream(pc, stream, videoTransceiver);
-      log(`screen stream attached for ${clientId.slice(0, 8)}`);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      window.lanRemote.sendSignal({ clientId, message: { type: 'answer', sdp: pc.localDescription } });
-      sendSignalProgress(clientId, 'answer-sent', 'Mac sent WebRTC answer');
-      log(`answered remote desktop request from ${clientId.slice(0, 8)}`);
-    } catch (err) {
-      window.lanRemote.sendSignal({ clientId, message: { type: 'error', error: err.message } });
-      log(`screen share failed: ${err.message}`);
-    }
-    return;
-  }
-
-  if (message.type === 'candidate' && message.candidate) {
-    await addPeerCandidate(clientId, pc, message.candidate);
-  }
-}
+const controller = window.createWebRtcHostController({
+  log,
+  setStatus(_kind, _text) {},
+  updatePeerState(clientId, state) {
+    if (clientId) log(`incoming ${clientId.slice(0, 8)} state=${state}`);
+  },
+  setCaptureActive() {},
+});
 
 function wireWindowControls() {
   for (const button of document.querySelectorAll('[data-window-action]')) {
@@ -613,20 +448,17 @@ window.lanRemote.onDevicesUpdated((list) => {
   renderDevices();
 });
 window.lanRemote.onSignalMessage((payload) => {
-  handleSignal(payload).catch((err) => log(`signal error: ${err.stack || err.message}`));
+  controller.handleSignal(payload).catch((err) => log(`signal error: ${err.stack || err.message}`));
 });
 window.lanRemote.onClientConnected(({ clientId, remoteAddress }) => log(`incoming pair: ${clientId.slice(0, 8)} from ${remoteAddress}`));
 window.lanRemote.onClientDisconnected(({ clientId }) => {
-  const pc = peers.get(clientId);
-  if (pc) pc.close();
-  peers.delete(clientId);
-  pendingPeerCandidates.delete(clientId);
+  controller.disconnectClient(clientId);
   log(`incoming disconnected: ${clientId.slice(0, 8)}`);
 });
 window.lanRemote.onHostLog((entry) => log(`${entry.level || 'info'}: ${entry.message}`));
-window.lanRemote.onNativeV2Status?.((status) => {
-  updateNativeV2Status(status);
-});
+window.lanRemote.onNativeV2Status?.((status) => updateNativeV2Status(status));
+
+window.addEventListener('beforeunload', () => controller.dispose());
 
 wireWindowControls();
 window.lanRemote.hostRendererReady?.();

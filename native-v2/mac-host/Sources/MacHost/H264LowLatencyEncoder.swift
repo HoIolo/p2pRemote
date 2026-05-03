@@ -105,10 +105,17 @@ final class H264LowLatencyEncoder {
         }
 
         guard let block = CMSampleBufferGetDataBuffer(sampleBuffer) else { return }
-        var totalLength = 0
-        var dataPointer: UnsafeMutablePointer<Int8>?
-        let status = CMBlockBufferGetDataPointer(block, atOffset: 0, lengthAtOffsetOut: nil, totalLengthOut: &totalLength, dataPointerOut: &dataPointer)
-        guard status == kCMBlockBufferNoErr, let dataPointer else { return }
+        let totalLength = CMBlockBufferGetDataLength(block)
+        guard totalLength > 0 else { return }
+        var elementaryStream = Data(count: totalLength)
+        let copyStatus = elementaryStream.withUnsafeMutableBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress else { return kCMBlockBufferBadCustomBlockSourceErr }
+            return CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: totalLength, destination: baseAddress)
+        }
+        guard copyStatus == kCMBlockBufferNoErr else {
+            fputs("[encoder] copy bitstream failed: \(copyStatus)\n", stderr)
+            return
+        }
 
         var out = Data(capacity: totalLength + 128)
         if keyframe, !sps.isEmpty, !pps.isEmpty {
@@ -118,17 +125,20 @@ final class H264LowLatencyEncoder {
         }
 
         var offset = 0
-        while offset + 4 <= totalLength {
-            let b0 = UInt32(UInt8(bitPattern: dataPointer[offset]))
-            let b1 = UInt32(UInt8(bitPattern: dataPointer[offset + 1]))
-            let b2 = UInt32(UInt8(bitPattern: dataPointer[offset + 2]))
-            let b3 = UInt32(UInt8(bitPattern: dataPointer[offset + 3]))
-            let nalLength = Int((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
-            offset += 4
-            if nalLength <= 0 || offset + nalLength > totalLength { break }
-            out.append(contentsOf: [0, 0, 0, 1])
-            out.append(contentsOf: UnsafeRawBufferPointer(start: dataPointer + offset, count: nalLength))
-            offset += nalLength
+        elementaryStream.withUnsafeBytes { rawBuffer in
+            guard let baseAddress = rawBuffer.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            while offset + 4 <= totalLength {
+                let b0 = UInt32(baseAddress[offset])
+                let b1 = UInt32(baseAddress[offset + 1])
+                let b2 = UInt32(baseAddress[offset + 2])
+                let b3 = UInt32(baseAddress[offset + 3])
+                let nalLength = Int((b0 << 24) | (b1 << 16) | (b2 << 8) | b3)
+                offset += 4
+                if nalLength <= 0 || offset + nalLength > totalLength { break }
+                out.append(contentsOf: [0, 0, 0, 1])
+                out.append(baseAddress + offset, count: nalLength)
+                offset += nalLength
+            }
         }
 
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
