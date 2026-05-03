@@ -55,7 +55,7 @@ final class ScreenCapturer {
         streamCfg.height = cfg.height
         streamCfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(cfg.fps))
         streamCfg.queueDepth = 1
-        streamCfg.showsCursor = true
+        streamCfg.showsCursor = false
         streamCfg.capturesAudio = false
         streamCfg.pixelFormat = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
         streamCfg.colorSpaceName = CGColorSpace.sRGB

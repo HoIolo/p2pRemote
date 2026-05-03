@@ -117,6 +117,9 @@ static std::atomic<uint64_t> g_gpuRenderFails{0};
 static std::atomic<uint64_t> g_lastPacketQpc{0};
 static std::atomic<uint64_t> g_lastCompleteQpc{0};
 static std::atomic<bool> g_decoderPrimed{false};
+static std::atomic<bool> g_waitingForKeyframe{false};
+static std::atomic<uint64_t> g_lastKeyframeRequestQpc{0};
+static std::atomic<uint64_t> g_keyframeRequests{0};
 static uint64_t g_startedQpc = 0;
 static std::wstring g_localIp = L"-";
 
@@ -138,6 +141,8 @@ struct NativeUiStats {
 
 static std::mutex g_uiStatsMu;
 static NativeUiStats g_uiStats;
+
+static void EnterVideoRecovery(const wchar_t* reason);
 
 static uint64_t QpcNow() {
   LARGE_INTEGER q{};
@@ -227,6 +232,14 @@ static void PushEncoded(EncodedFrame&& f) {
   bool queued = false;
   {
     std::lock_guard lk(g_encodedMu);
+    if (g_waitingForKeyframe.load(std::memory_order_relaxed)) {
+      if (!f.keyframe) {
+        g_framesDropped.fetch_add(1, std::memory_order_relaxed);
+        return;
+      }
+      g_waitingForKeyframe.store(false, std::memory_order_relaxed);
+    }
+
     // Until the decoder has successfully produced a frame, keep the newest
     // keyframe around and drop delta frames that would otherwise starve sync.
     if (!g_decoderPrimed.load(std::memory_order_relaxed) && !f.keyframe) {
@@ -708,8 +721,12 @@ static void ClampToMonitor(int& x, int& y, int width, int height) {
   MONITORINFO mi{sizeof(mi)};
   GetMonitorInfoW(monitor, &mi);
   RECT r = mi.rcMonitor;
-  x = std::max(r.left + 12, std::min(x, r.right - width - 12));
-  y = std::max(r.top + 12, std::min(y, r.bottom - height - 12));
+  const int minX = static_cast<int>(r.left + 12);
+  const int maxX = static_cast<int>(r.right - width - 12);
+  const int minY = static_cast<int>(r.top + 12);
+  const int maxY = static_cast<int>(r.bottom - height - 12);
+  x = std::max(minX, std::min(x, maxX));
+  y = std::max(minY, std::min(y, maxY));
 }
 
 static void UpdateOverlayLayout() {
@@ -953,7 +970,7 @@ static void DrawStats(HDC hdc, RECT rc) {
   HFONT titleFont = CreateUiFont(24, FW_BOLD);
   std::wstring latency = stats.rxToPresentMs > 0.0 ? FormatDouble(stats.rxToPresentMs, L" ms", 0) : L"-- ms";
   RECT titleRc{92, 30, kStatsWidth - 30, 72};
-  DrawTextRect(hdc, L"网络延时: " + latency, titleRc, RGB(15, 22, 36), titleFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+  DrawTextRect(hdc, L"显示尾延时: " + latency, titleRc, RGB(15, 22, 36), titleFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
   DeleteObject(titleFont);
 
   HPEN line = CreatePen(PS_SOLID, 1, RGB(232, 235, 238));
@@ -962,10 +979,10 @@ static void DrawStats(HDC hdc, RECT rc) {
   SelectObject(hdc, oldLine);
   DeleteObject(line);
 
-  DrawStatsRow(hdc, 126, L"帧延时:", stats.rxToPresentMs > 0.0 ? FormatDouble(stats.rxToPresentMs, L" ms", 0) : L"-- ms");
+  DrawStatsRow(hdc, 126, L"收帧后延时:", stats.rxToPresentMs > 0.0 ? FormatDouble(stats.rxToPresentMs, L" ms", 0) : L"-- ms");
   DrawStatsRow(hdc, 166, L"帧率:", stats.presentFps > 0.1 ? FormatDouble(stats.presentFps, L"", 0) : FormatDouble(g_cfg.fps, L"", 0));
   DrawStatsRow(hdc, 206, L"带宽占用:", FormatDouble(stats.mbps, L" Mbps", 1));
-  DrawStatsRow(hdc, 246, L"丢包率:", FormatDouble(stats.lossPct, L"%", 1));
+  DrawStatsRow(hdc, 246, L"丢帧率:", FormatDouble(stats.lossPct, L"%", 1));
 
   DrawStatsSeparator(hdc, 292);
   DrawStatsRow(hdc, 316, L"传输通道:", g_cfg.udpVideo ? L"UDP 局域网直连" : L"TCP 局域网直连");
@@ -1121,15 +1138,21 @@ class VideoReceiver {
       if (newestFrameId && h->frameId + 120 < newestFrameId) continue;
       if (h->frameId > newestFrameId) newestFrameId = h->frameId;
 
-      if (partials.size() > 24) {
+      if (!partials.empty()) {
         uint64_t keepFrom = newestFrameId > 24 ? newestFrameId - 24 : 0;
+        bool droppedPartial = false;
         for (auto it = partials.begin(); it != partials.end();) {
           if (it->first < keepFrom || QpcDeltaUs(it->second.firstQpc, now) > 250'000) {
             it = partials.erase(it);
             g_framesDropped.fetch_add(1, std::memory_order_relaxed);
+            droppedPartial = true;
           } else {
             ++it;
           }
+        }
+        if (droppedPartial) {
+          partials.clear();
+          EnterVideoRecovery(L"udp partial timeout");
         }
       }
 
@@ -1145,7 +1168,9 @@ class VideoReceiver {
         partial.got.assign(h->fragCount, 0);
       } else if (partial.fragCount != h->fragCount || partial.frameBytes != h->frameBytes) {
         partials.erase(it);
+        partials.clear();
         g_framesDropped.fetch_add(1, std::memory_order_relaxed);
+        EnterVideoRecovery(L"udp fragment mismatch");
         continue;
       }
 
@@ -1614,6 +1639,7 @@ static void DecoderThread() {
       }
     } else {
       g_decodeFails.fetch_add(1, std::memory_order_relaxed);
+      EnterVideoRecovery(L"decode failed");
     }
   }
   MFShutdown();
@@ -1659,6 +1685,27 @@ static void SendInput(uint8_t kind, float x, float y, int32_t dx, int32_t dy, ui
   p.seq = g_inputSeq.fetch_add(1);
   p.x = x; p.y = y; p.dx = dx; p.dy = dy; p.button = button; p.keyCode = keyCode;
   sendto(g_inputSock, reinterpret_cast<const char*>(&p), sizeof(p), 0, reinterpret_cast<sockaddr*>(&g_inputAddr), sizeof(g_inputAddr));
+}
+
+static void EnterVideoRecovery(const wchar_t* reason) {
+  g_waitingForKeyframe.store(true, std::memory_order_relaxed);
+  g_decoderPrimed.store(false, std::memory_order_relaxed);
+  {
+    std::lock_guard lk(g_encodedMu);
+    if (!g_encodedQueue.empty()) {
+      g_framesDropped.fetch_add(static_cast<uint64_t>(g_encodedQueue.size()), std::memory_order_relaxed);
+      g_encodedQueue.clear();
+    }
+  }
+
+  if (!g_cfg.udpVideo) return;
+  const uint64_t now = QpcNow();
+  const uint64_t last = g_lastKeyframeRequestQpc.load(std::memory_order_relaxed);
+  if (last && QpcDeltaUs(last, now) < 120'000) return;
+  g_lastKeyframeRequestQpc.store(now, std::memory_order_relaxed);
+  g_keyframeRequests.fetch_add(1, std::memory_order_relaxed);
+  SendInput(P2_INPUT_REQUEST_KEYFRAME, 0, 0, 0, 0, 0, 0);
+  Log(L"requested keyframe recovery: %s", reason ? reason : L"unknown");
 }
 
 static void NormalizedPoint(HWND hwnd, LPARAM lp, float& x, float& y) {
@@ -1757,7 +1804,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     case WM_SETCURSOR:
       if (LOWORD(lp) == HTCLIENT && g_framesPresented.load(std::memory_order_relaxed) > 0) {
-        SetCursor(nullptr); // remote cursor is included in the captured stream; avoid double cursor
+        SetCursor(LoadCursor(nullptr, IDC_ARROW));
         return TRUE;
       }
       break;

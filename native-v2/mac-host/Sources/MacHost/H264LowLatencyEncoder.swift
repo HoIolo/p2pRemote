@@ -14,6 +14,8 @@ final class H264LowLatencyEncoder {
     private var sps = Data()
     private var pps = Data()
     private var frameIndex: Int64 = 0
+    private let controlLock = NSLock()
+    private var pendingForcedKeyframe = false
 
     init(width: Int, height: Int, fps: Int, bitrate: Int, keyframeSeconds: Int, onFrame: @escaping (Data, Bool, Bool, UInt64) -> Void) throws {
         self.width = Int32(width)
@@ -70,13 +72,24 @@ final class H264LowLatencyEncoder {
         }
     }
 
+    func requestKeyframe(reason: String = "client recovery") {
+        controlLock.lock()
+        pendingForcedKeyframe = true
+        controlLock.unlock()
+        print("[encoder] keyframe requested: \(reason)")
+    }
+
     func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, forceKeyframe: Bool = false) {
         guard let session else { return }
         var flags = VTEncodeInfoFlags()
         let index = frameIndex
         frameIndex += 1
+        controlLock.lock()
+        let forcedByControl = pendingForcedKeyframe
+        pendingForcedKeyframe = false
+        controlLock.unlock()
         var props: CFDictionary?
-        if forceKeyframe || index == 0 {
+        if forceKeyframe || forcedByControl || index == 0 {
             props = [kVTEncodeFrameOptionKey_ForceKeyFrame as String: true] as CFDictionary
         }
         let status = VTCompressionSessionEncodeFrame(

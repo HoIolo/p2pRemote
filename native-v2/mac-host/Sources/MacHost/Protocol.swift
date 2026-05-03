@@ -6,6 +6,7 @@ let p2TcpVideoHeaderBytes = 32
 let p2InputPacketBytes = 32
 let maxUdpPayloadBytes = 1200
 let maxVideoFragmentPayload = maxUdpPayloadBytes - p2VideoHeaderBytes
+let p2InputRequestKeyframe: UInt8 = 7
 
 final class NativeStats {
     static let shared = NativeStats()

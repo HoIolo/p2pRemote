@@ -6,12 +6,14 @@ import Darwin
 final class InputReceiver {
     private let fd: Int32
     private let displayBounds: CGRect
+    private let onKeyframeRequest: () -> Void
     private let queue = DispatchQueue(label: "p2p.native.input", qos: .userInteractive)
     private var running = true
     private var downButtons = Set<Int>()
 
-    init(port: UInt16, displayBounds: CGRect) throws {
+    init(port: UInt16, displayBounds: CGRect, onKeyframeRequest: @escaping () -> Void = {}) throws {
         self.displayBounds = displayBounds
+        self.onKeyframeRequest = onKeyframeRequest
         fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { throw POSIXError(.ENOTSOCK) }
 
@@ -94,6 +96,8 @@ final class InputReceiver {
             postKey(code: keyCode, down: true)
         case 6:
             postKey(code: keyCode, down: false)
+        case p2InputRequestKeyframe:
+            onKeyframeRequest()
         default:
             return
         }

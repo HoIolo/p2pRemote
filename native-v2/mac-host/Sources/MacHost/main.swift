@@ -65,7 +65,9 @@ struct MacHostMain {
             let capturer = ScreenCapturer(cfg: cfg, output: output)
             let displayBounds = try await capturer.start()
 
-            let input = try InputReceiver(port: cfg.inputPort, displayBounds: displayBounds)
+            let input = try InputReceiver(port: cfg.inputPort, displayBounds: displayBounds) {
+                encoder.requestKeyframe(reason: "windows client loss recovery")
+            }
             input.start()
             gRuntime = NativeHostRuntime(
                 tcpServer: tcpServer,
