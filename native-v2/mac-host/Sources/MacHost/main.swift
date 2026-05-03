@@ -1,5 +1,6 @@
 import Foundation
 import CoreGraphics
+import Darwin
 
 @available(macOS 13.0, *)
 final class NativeHostRuntime {
@@ -31,6 +32,9 @@ struct MacHostMain {
             exit(2)
         }
 
+        setbuf(__stdoutp, nil)
+        setbuf(__stderrp, nil)
+
         Task {
             await run()
         }
@@ -61,8 +65,12 @@ struct MacHostMain {
                     tcpServer?.sendFrame(frame, keyframe: keyframe, configIncluded: configIncluded, ptsUs: ptsUs)
                 }
             }
-            let output = ScreenCaptureOutput(encoder: encoder)
+            let capturerRef = RefBox<ScreenCapturer?>(nil)
+            let output = ScreenCaptureOutput(encoder: encoder) {
+                capturerRef.value??.markFirstFrame()
+            }
             let capturer = ScreenCapturer(cfg: cfg, output: output)
+            capturerRef.value = capturer
             let displayBounds = try await capturer.start()
 
             let input = try InputReceiver(port: cfg.inputPort, displayBounds: displayBounds) {
@@ -83,5 +91,12 @@ struct MacHostMain {
             fputs("[fatal] \(error)\n", stderr)
             exit(1)
         }
+    }
+}
+
+final class RefBox<T> {
+    var value: T
+    init(_ value: T) {
+        self.value = value
     }
 }
