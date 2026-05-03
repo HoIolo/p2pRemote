@@ -11,12 +11,25 @@ struct MacHostMain {
 
         let cfg = NativeHostConfig.parse()
         print("P2P Native v2 Mac Host")
-        print("client=\(cfg.clientIP):\(cfg.videoPort), input=0.0.0.0:\(cfg.inputPort), video=\(cfg.width)x\(cfg.height)@\(cfg.fps), bitrate=\(cfg.bitrate)")
+        print("client=\(cfg.clientIP):\(cfg.videoPort), input=0.0.0.0:\(cfg.inputPort), video=\(cfg.width)x\(cfg.height)@\(cfg.fps), bitrate=\(cfg.bitrate), transport=\(cfg.transport)")
 
         do {
-            let sender = try UdpVideoSender(clientIP: cfg.clientIP, port: cfg.videoPort)
+            let tcpServer: TcpVideoServer?
+            let udpSender: UdpVideoSender?
+            if cfg.transport == "udp" {
+                udpSender = try UdpVideoSender(clientIP: cfg.clientIP, port: cfg.videoPort)
+                tcpServer = nil
+            } else {
+                tcpServer = try TcpVideoServer(port: cfg.videoPort)
+                tcpServer?.start()
+                udpSender = nil
+            }
             let encoder = try H264LowLatencyEncoder(width: cfg.width, height: cfg.height, fps: cfg.fps, bitrate: cfg.bitrate, keyframeSeconds: cfg.keyframeSeconds) { frame, keyframe, configIncluded, ptsUs in
-                sender.sendFrame(frame, keyframe: keyframe, configIncluded: configIncluded, ptsUs: ptsUs)
+                if let udpSender {
+                    udpSender.sendFrame(frame, keyframe: keyframe, configIncluded: configIncluded, ptsUs: ptsUs)
+                } else {
+                    tcpServer?.sendFrame(frame, keyframe: keyframe, configIncluded: configIncluded, ptsUs: ptsUs)
+                }
             }
             let output = ScreenCaptureOutput(encoder: encoder)
             let capturer = ScreenCapturer(cfg: cfg, output: output)

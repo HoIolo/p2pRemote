@@ -52,7 +52,10 @@ function sendInput(event) {
 
 function makePeer() {
   pc = new RTCPeerConnection({
-    iceServers: [],
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
+    ],
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
     iceCandidatePoolSize: 0,

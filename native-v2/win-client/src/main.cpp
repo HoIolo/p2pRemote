@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <cstring>
 #include <memory>
+#include <unordered_map>
 
 #include "p2_protocol.h"
 
@@ -44,6 +45,7 @@ struct Config {
   int height = 1080;
   int fps = 60;
   bool fullscreen = false;
+  bool udpVideo = false;
 };
 
 struct EncodedFrame {
@@ -100,6 +102,13 @@ static std::atomic<uint64_t> g_lastPresentQpc{0};
 static std::atomic<uint64_t> g_lastRxToPresentUs{0};
 static std::atomic<uint64_t> g_gpuFrames{0};
 static std::atomic<uint64_t> g_cpuFrames{0};
+static std::atomic<uint64_t> g_packetsRx{0};
+static std::atomic<uint64_t> g_bytesRx{0};
+static std::atomic<uint64_t> g_framesComplete{0};
+static std::atomic<uint64_t> g_framesDropped{0};
+static std::atomic<uint64_t> g_decodeFails{0};
+static std::atomic<uint64_t> g_lastPacketQpc{0};
+static std::atomic<uint64_t> g_lastCompleteQpc{0};
 
 static uint64_t QpcNow() {
   LARGE_INTEGER q{};
@@ -139,6 +148,8 @@ static Config ParseArgs() {
     else if (wcscmp(argv[i], L"--height") == 0) { if (auto v = next()) c.height = _wtoi(v); }
     else if (wcscmp(argv[i], L"--fps") == 0) { if (auto v = next()) c.fps = std::max(30, _wtoi(v)); }
     else if (wcscmp(argv[i], L"--fullscreen") == 0) { c.fullscreen = true; }
+    else if (wcscmp(argv[i], L"--udp-video") == 0) { c.udpVideo = true; }
+    else if (wcscmp(argv[i], L"--transport") == 0) { if (auto v = next()) c.udpVideo = (_wcsicmp(v, L"udp") == 0); }
   }
   if (argv) LocalFree(argv);
   return c;
@@ -479,15 +490,21 @@ class VideoReceiver {
       return;
     }
 
+    struct PartialFrame {
+      uint32_t frameBytes = 0;
+      uint16_t fragCount = 0;
+      uint64_t ptsUs = 0;
+      uint16_t flags = 0;
+      uint64_t firstQpc = 0;
+      uint16_t received = 0;
+      std::vector<uint8_t> bytes;
+      std::vector<uint8_t> got;
+    };
+
     std::vector<uint8_t> packet(kMaxUdp);
-    uint64_t currentId = 0;
-    uint32_t frameBytes = 0;
-    uint16_t fragCount = 0;
-    uint64_t ptsUs = 0;
-    uint16_t flags = 0;
-    std::vector<uint8_t> frame;
-    std::vector<uint8_t> got;
-    uint16_t received = 0;
+    std::unordered_map<uint64_t, PartialFrame> partials;
+    partials.reserve(16);
+    uint64_t newestFrameId = 0;
 
     while (g_running.load()) {
       int n = recv(s, reinterpret_cast<char*>(packet.data()), static_cast<int>(packet.size()), 0);
@@ -501,39 +518,139 @@ class VideoReceiver {
       if (h->headerBytes != sizeof(P2VideoHeader) || h->payloadBytes + h->headerBytes > n) continue;
       if (h->fragCount == 0 || h->fragIndex >= h->fragCount || h->frameBytes > 8 * 1024 * 1024) continue;
 
-      if (h->frameId != currentId) {
-        if (h->frameId < currentId) continue;
-        currentId = h->frameId;
-        frameBytes = h->frameBytes;
-        fragCount = h->fragCount;
-        ptsUs = h->ptsUs;
-        flags = h->flags;
-        frame.assign(frameBytes, 0);
-        got.assign(fragCount, 0);
-        received = 0;
+      const uint64_t now = QpcNow();
+      g_packetsRx.fetch_add(1, std::memory_order_relaxed);
+      g_bytesRx.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
+      g_lastPacketQpc.store(now, std::memory_order_relaxed);
+
+      if (newestFrameId && h->frameId + 120 < newestFrameId) continue;
+      if (h->frameId > newestFrameId) newestFrameId = h->frameId;
+
+      if (partials.size() > 24) {
+        uint64_t keepFrom = newestFrameId > 24 ? newestFrameId - 24 : 0;
+        for (auto it = partials.begin(); it != partials.end();) {
+          if (it->first < keepFrom || QpcDeltaUs(it->second.firstQpc, now) > 250'000) {
+            it = partials.erase(it);
+            g_framesDropped.fetch_add(1, std::memory_order_relaxed);
+          } else {
+            ++it;
+          }
+        }
       }
-      if (h->fragCount != fragCount || h->frameBytes != frameBytes) continue;
-      if (got[h->fragIndex]) continue;
+
+      auto [it, inserted] = partials.try_emplace(h->frameId);
+      PartialFrame& partial = it->second;
+      if (inserted) {
+        partial.frameBytes = h->frameBytes;
+        partial.fragCount = h->fragCount;
+        partial.ptsUs = h->ptsUs;
+        partial.flags = h->flags;
+        partial.firstQpc = now;
+        partial.bytes.assign(h->frameBytes, 0);
+        partial.got.assign(h->fragCount, 0);
+      } else if (partial.fragCount != h->fragCount || partial.frameBytes != h->frameBytes) {
+        partials.erase(it);
+        g_framesDropped.fetch_add(1, std::memory_order_relaxed);
+        continue;
+      }
+
+      if (partial.got[h->fragIndex]) continue;
       size_t off = static_cast<size_t>(h->fragIndex) * kMaxVideoFragmentPayload;
-      if (off + h->payloadBytes > frame.size()) continue;
-      memcpy(frame.data() + off, packet.data() + h->headerBytes, h->payloadBytes);
-      got[h->fragIndex] = 1;
-      ++received;
-      if (received == fragCount) {
+      if (off + h->payloadBytes > partial.bytes.size()) continue;
+      memcpy(partial.bytes.data() + off, packet.data() + h->headerBytes, h->payloadBytes);
+      partial.got[h->fragIndex] = 1;
+      ++partial.received;
+      if (partial.received == partial.fragCount) {
         EncodedFrame out;
-        out.bytes = std::move(frame);
-        out.frameId = currentId;
-        out.ptsUs = ptsUs;
+        out.bytes = std::move(partial.bytes);
+        out.frameId = h->frameId;
+        out.ptsUs = partial.ptsUs;
         out.recvQpc = QpcNow();
-        out.keyframe = (flags & P2_FLAG_KEYFRAME) != 0;
+        out.keyframe = (partial.flags & P2_FLAG_KEYFRAME) != 0;
         PushEncoded(std::move(out));
-        currentId = 0;
+        g_framesComplete.fetch_add(1, std::memory_order_relaxed);
+        g_lastCompleteQpc.store(QpcNow(), std::memory_order_relaxed);
+        partials.erase(h->frameId);
       }
     }
     closesocket(s);
   }
 
  private:
+  uint16_t port_;
+};
+
+class TcpVideoReceiver {
+ public:
+  TcpVideoReceiver(std::wstring hostIp, uint16_t port) : hostIp_(std::move(hostIp)), port_(port) {}
+
+  void operator()() {
+    SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+    SetThreadDescription(GetCurrentThread(), L"P2P TCP video receiver");
+
+    while (g_running.load()) {
+      SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+      if (s == INVALID_SOCKET) return;
+
+      int one = 1;
+      setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
+      int rcvbuf = 8 * 1024 * 1024;
+      setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
+
+      sockaddr_in addr{};
+      addr.sin_family = AF_INET;
+      addr.sin_port = htons(port_);
+      std::string ip = WideToUtf8(hostIp_);
+      if (inet_pton(AF_INET, ip.c_str(), &addr.sin_addr) != 1) {
+        closesocket(s);
+        return;
+      }
+
+      if (connect(s, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        closesocket(s);
+        Sleep(200);
+        continue;
+      }
+
+      while (g_running.load()) {
+        P2TcpVideoHeader h{};
+        if (!RecvAll(s, reinterpret_cast<uint8_t*>(&h), sizeof(h))) break;
+        if (memcmp(h.magic, "P2T2", 4) != 0 || h.version != P2_VERSION || h.headerBytes != sizeof(P2TcpVideoHeader)) break;
+        if (h.frameBytes == 0 || h.frameBytes > 16 * 1024 * 1024) break;
+
+        EncodedFrame out;
+        out.bytes.resize(h.frameBytes);
+        if (!RecvAll(s, out.bytes.data(), h.frameBytes)) break;
+        out.frameId = h.frameId;
+        out.ptsUs = h.ptsUs;
+        out.recvQpc = QpcNow();
+        out.keyframe = (h.flags & P2_FLAG_KEYFRAME) != 0;
+
+        g_packetsRx.fetch_add(1, std::memory_order_relaxed);
+        g_bytesRx.fetch_add(static_cast<uint64_t>(sizeof(h)) + h.frameBytes, std::memory_order_relaxed);
+        g_framesComplete.fetch_add(1, std::memory_order_relaxed);
+        g_lastPacketQpc.store(out.recvQpc, std::memory_order_relaxed);
+        g_lastCompleteQpc.store(out.recvQpc, std::memory_order_relaxed);
+        PushEncoded(std::move(out));
+      }
+
+      closesocket(s);
+      if (g_running.load()) Sleep(200);
+    }
+  }
+
+ private:
+  bool RecvAll(SOCKET s, uint8_t* dst, size_t bytes) {
+    size_t off = 0;
+    while (off < bytes && g_running.load()) {
+      int n = recv(s, reinterpret_cast<char*>(dst + off), static_cast<int>(std::min<size_t>(bytes - off, 64 * 1024)), 0);
+      if (n <= 0) return false;
+      off += static_cast<size_t>(n);
+    }
+    return off == bytes;
+  }
+
+  std::wstring hostIp_;
   uint16_t port_;
 };
 
@@ -626,7 +743,20 @@ class MfDecoder {
       hr = mft_->ProcessInput(0, sample.Get(), 0);
     }
     if (FAILED(hr)) return false;
-    return DrainOne(decoded, encoded);
+
+    bool gotFrame = false;
+    DecodedFrame last;
+    for (int i = 0; i < 4; ++i) {
+      DecodedFrame one;
+      if (!DrainOne(one, encoded)) break;
+      last = std::move(one);
+      gotFrame = true;
+    }
+    if (gotFrame) {
+      decoded = std::move(last);
+      return true;
+    }
+    return false;
   }
 
  private:
@@ -856,6 +986,8 @@ static void DecoderThread() {
         }
         InvalidateRect(g_hwnd, nullptr, FALSE);
       }
+    } else {
+      g_decodeFails.fetch_add(1, std::memory_order_relaxed);
     }
   }
   MFShutdown();
@@ -919,19 +1051,37 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     case WM_TIMER: {
       static uint64_t lastFrames = 0;
+      static uint64_t lastComplete = 0;
+      static uint64_t lastPackets = 0;
+      static uint64_t lastBytes = 0;
       static uint64_t lastQpc = QpcNow();
       uint64_t now = QpcNow();
       uint64_t frames = g_framesPresented.load(std::memory_order_relaxed);
+      uint64_t complete = g_framesComplete.load(std::memory_order_relaxed);
+      uint64_t packets = g_packetsRx.load(std::memory_order_relaxed);
+      uint64_t bytes = g_bytesRx.load(std::memory_order_relaxed);
       double seconds = double(QpcDeltaUs(lastQpc, now)) / 1'000'000.0;
       double fps = seconds > 0.001 ? double(frames - lastFrames) / seconds : 0.0;
+      double cfps = seconds > 0.001 ? double(complete - lastComplete) / seconds : 0.0;
+      double pps = seconds > 0.001 ? double(packets - lastPackets) / seconds : 0.0;
+      double mbps = seconds > 0.001 ? double(bytes - lastBytes) * 8.0 / seconds / 1'000'000.0 : 0.0;
       lastFrames = frames;
+      lastComplete = complete;
+      lastPackets = packets;
+      lastBytes = bytes;
       lastQpc = now;
       uint64_t gpu = g_gpuFrames.load(std::memory_order_relaxed);
       uint64_t cpu = g_cpuFrames.load(std::memory_order_relaxed);
       double rxMs = double(g_lastRxToPresentUs.load(std::memory_order_relaxed)) / 1000.0;
-      wchar_t title[256];
-      swprintf_s(title, L"P2P Native v2 -> %s | %.0f fps | rx-present %.2f ms | GPU %llu CPU %llu",
-                 g_cfg.hostIp.c_str(), fps, rxMs,
+      double packetAgeMs = double(QpcDeltaUs(g_lastPacketQpc.load(std::memory_order_relaxed), now)) / 1000.0;
+      double frameAgeMs = double(QpcDeltaUs(g_lastCompleteQpc.load(std::memory_order_relaxed), now)) / 1000.0;
+      uint64_t dropped = g_framesDropped.load(std::memory_order_relaxed);
+      uint64_t decodeFails = g_decodeFails.load(std::memory_order_relaxed);
+      wchar_t title[512];
+      swprintf_s(title, L"P2P Native v2 %s -> %s | present %.0f fps complete %.0f fps | %.1f Mbps %.0f pkt/s | last pkt %.0f ms frame %.0f ms | rx-present %.2f ms | drop %llu decfail %llu | GPU %llu CPU %llu",
+                 g_cfg.udpVideo ? L"UDP" : L"TCP", g_cfg.hostIp.c_str(), fps, cfps, mbps, pps, packetAgeMs, frameAgeMs, rxMs,
+                 static_cast<unsigned long long>(dropped),
+                 static_cast<unsigned long long>(decodeFails),
                  static_cast<unsigned long long>(gpu),
                  static_cast<unsigned long long>(cpu));
       SetWindowTextW(hwnd, title);
@@ -1069,7 +1219,9 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     MessageBoxW(g_hwnd, L"D3D11 flip-model renderer failed; falling back to GDI.", L"P2P Native", MB_ICONWARNING);
   }
 
-  std::thread rx(VideoReceiver(g_cfg.videoPort));
+  std::thread rx = g_cfg.udpVideo
+    ? std::thread(VideoReceiver(g_cfg.videoPort))
+    : std::thread(TcpVideoReceiver(g_cfg.hostIp, g_cfg.videoPort));
   std::thread dec(DecoderThread);
 
   MSG msg{};

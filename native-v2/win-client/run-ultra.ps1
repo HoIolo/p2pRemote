@@ -5,6 +5,7 @@
   [int]$Fps = 120,
   [int]$VideoPort = 45000,
   [int]$InputPort = 45001,
+  [ValidateSet('tcp','udp')][string]$Transport = 'tcp',
   [switch]$NoFullscreen
 )
 $ErrorActionPreference = 'Stop'
@@ -19,7 +20,8 @@ $args = @(
   '--input-port', $InputPort,
   '--width', $Width,
   '--height', $Height,
-  '--fps', $Fps
+  '--fps', $Fps,
+  '--transport', $Transport
 )
 if (!$NoFullscreen) { $args += '--fullscreen' }
 & $exe @args

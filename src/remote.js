@@ -217,8 +217,16 @@ function cleanupConnection() {
 function makePeer() {
   sawRemoteTrack = false;
   pendingRemoteCandidates = [];
+  const iceTimeout = setTimeout(() => {
+    if (!pc || ['connected', 'completed'].includes(pc.iceConnectionState) || isClosing) return;
+    log('ICE still checking after 5s; restarting ICE');
+    pc.restartIce?.();
+  }, 5000);
   pc = new RTCPeerConnection({
-    iceServers: [],
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
+    ],
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
     iceCandidatePoolSize: 0,
@@ -258,7 +266,10 @@ function makePeer() {
   };
   pc.onconnectionstatechange = () => {
     log(`peer state=${pc.connectionState}`);
-    if (pc.connectionState === 'connected') setStatus('ok', sawRemoteTrack ? '\u5df2\u8fde\u63a5' : '\u5df2\u8fde\u63a5\uff0c\u7b49\u5f85\u89c6\u9891');
+    if (pc.connectionState === 'connected') {
+      clearTimeout(iceTimeout);
+      setStatus('ok', sawRemoteTrack ? '\u5df2\u8fde\u63a5' : '\u5df2\u8fde\u63a5\uff0c\u7b49\u5f85\u89c6\u9891');
+    }
     if (['failed', 'closed', 'disconnected'].includes(pc.connectionState)) {
       setStatus('warn', pc.connectionState);
       overlay.style.display = 'grid';

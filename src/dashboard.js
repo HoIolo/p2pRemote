@@ -150,6 +150,7 @@ function nativeV2ClientOptions(device) {
     height: defaults.height || 1080,
     fps: defaults.fps || 120,
     fullscreen: true,
+    transport: 'tcp',
   };
 }
 
@@ -165,16 +166,33 @@ function nativeV2HostOptions(device) {
     fps: defaults.fps || 120,
     bitrate: defaults.bitrate || 45_000_000,
     keyint: defaults.keyint || 1,
+    transport: 'tcp',
   };
 }
 
-function nativeV2MacHostCommand(device) {
+function nativeV2MacHostCommand(device, routeAddress = '') {
   const defaults = nativeV2Status?.defaults || {};
-  const clientIp = appInfo?.device?.addresses?.[0] || '<Windows_IP>';
+  const clientIp = routeAddress || appInfo?.device?.addresses?.[0] || '<Windows_IP>';
   return [
     'cd native-v2/mac-host',
-    `CLIENT_IP=${clientIp} VIDEO_PORT=${defaults.videoPort || 45000} INPUT_PORT=${defaults.inputPort || 45001} WIDTH=${defaults.width || 1920} HEIGHT=${defaults.height || 1080} FPS=${defaults.fps || 120} BITRATE=${defaults.bitrate || 45000000} ./run-ultra.sh`,
+    `CLIENT_IP=${clientIp} VIDEO_PORT=${defaults.videoPort || 45000} INPUT_PORT=${defaults.inputPort || 45001} WIDTH=${defaults.width || 1920} HEIGHT=${defaults.height || 1080} FPS=${defaults.fps || 120} BITRATE=${defaults.bitrate || 45000000} TRANSPORT=tcp ./run-ultra.sh`,
   ].join('\n');
+}
+
+async function resolveNativeV2HostOptions(device) {
+  const options = nativeV2HostOptions(device);
+  if (nativeV2Status?.platform === 'win32' && window.lanRemote.getNativeV2RouteLocalAddress) {
+    try {
+      const route = await window.lanRemote.getNativeV2RouteLocalAddress(device.address);
+      if (route?.address) {
+        options.clientIp = route.address;
+        log(`native-v2 route selected: Mac ${device.address} -> Windows ${route.address} (${route.name || 'unknown'}, ${route.reason || 'route'})`);
+      }
+    } catch (err) {
+      log(`native-v2 route detection failed: ${err.message}`);
+    }
+  }
+  return options;
 }
 
 function renderDevices() {
@@ -247,18 +265,23 @@ async function openNativeV2Device(device) {
         return;
       }
       const options = nativeV2ClientOptions(device);
-      const hostOptions = nativeV2HostOptions(device);
+      const hostOptions = await resolveNativeV2HostOptions(device);
+      setNativeV2StatusText('正在先启动 Windows Native v2 接收端，避免 Mac 首帧/关键帧丢失...');
+      const result = await window.lanRemote.startNativeV2Client(options);
+      log(`native-v2 client started pid=${result.pid}; host=${options.hostIp}:${options.videoPort}; ${options.width}x${options.height}@${options.fps}`);
       if (device.pin && device.port) {
         setNativeV2StatusText(`正在请求 Mac 启动 Native v2 Host：${device.address}:${device.port}`);
         log(`requesting Mac native-v2 host ${device.address}:${device.port} -> client ${hostOptions.clientIp}:${hostOptions.videoPort}`);
-        await window.lanRemote.requestNativeV2RemoteHost(device, hostOptions);
-        log('Mac native-v2 host accepted start request');
+        try {
+          await window.lanRemote.requestNativeV2RemoteHost(device, hostOptions);
+          log('Mac native-v2 host accepted start request');
+        } catch (err) {
+          await window.lanRemote.stopNativeV2Client?.();
+          throw err;
+        }
       } else {
-        log(`manual native-v2: 请先在 Mac 端启动 Host：\n${nativeV2MacHostCommand(device)}`);
+        log(`manual native-v2: 请先在 Mac 端启动 Host：\n${nativeV2MacHostCommand(device, hostOptions.clientIp)}`);
       }
-      setNativeV2StatusText('Mac 已准备好，正在启动 Windows Native v2 客户端...');
-      const result = await window.lanRemote.startNativeV2Client(options);
-      log(`native-v2 client started pid=${result.pid}; host=${options.hostIp}:${options.videoPort}; ${options.width}x${options.height}@${options.fps}`);
       setNativeV2StatusText(`Native v2 客户端已启动，pid=${result.pid}`);
       return;
     }
@@ -270,7 +293,7 @@ async function openNativeV2Device(device) {
         setNativeV2StatusText(message);
         return;
       }
-      const options = nativeV2HostOptions(device);
+      const options = await resolveNativeV2HostOptions(device);
       setNativeV2StatusText(`正在启动 macOS Native v2 Host，等待 Windows 客户端 ${options.clientIp}...`);
       const result = await window.lanRemote.startNativeV2Host(options);
       log(`native-v2 host started pid=${result.pid}; client=${options.clientIp}:${options.videoPort}; ${options.width}x${options.height}@${options.fps}`);
@@ -415,7 +438,10 @@ async function tuneSender(sender) {
 
 function makeHostPeer(clientId) {
   const pc = new RTCPeerConnection({
-    iceServers: [],
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun.cloudflare.com:3478' },
+    ],
     bundlePolicy: 'max-bundle',
     rtcpMuxPolicy: 'require',
     iceCandidatePoolSize: 0,
@@ -485,48 +511,11 @@ function ensureVideoSender(pc) {
   return transceiver;
 }
 
-function createPlaceholderTrack() {
-  const canvas = document.createElement('canvas');
-  canvas.width = 1280;
-  canvas.height = 720;
-  const ctx = canvas.getContext('2d');
-  const draw = () => {
-    ctx.fillStyle = '#0f172a';
-    ctx.fillRect(0, 0, canvas.width, canvas.height);
-    ctx.fillStyle = '#93c5fd';
-    ctx.font = '600 42px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
-    ctx.textAlign = 'center';
-    ctx.fillText('P2P Remote LAN', canvas.width / 2, canvas.height / 2 - 20);
-    ctx.fillStyle = '#e5e7eb';
-    ctx.font = '28px -apple-system, BlinkMacSystemFont, Segoe UI, sans-serif';
-    ctx.fillText('Mac 正在准备屏幕画面...', canvas.width / 2, canvas.height / 2 + 32);
-  };
-  draw();
-  const timer = setInterval(draw, 1000);
-  const stream = canvas.captureStream?.(2);
-  const track = stream?.getVideoTracks?.()[0] || null;
-  if (track) {
-    track.contentHint = 'detail';
-    track._p2pCleanup = () => clearInterval(timer);
-  } else {
-    clearInterval(timer);
-  }
-  return track;
-}
-
-function cleanupTrack(track) {
-  try {
-    track?._p2pCleanup?.();
-    track?.stop?.();
-  } catch {}
-}
-
 async function attachScreenStream(pc, stream, videoTransceiver) {
   for (const track of stream.getTracks()) {
     if (track.kind === 'video' && videoTransceiver?.sender) {
-      const previousTrack = videoTransceiver.sender.track;
+      track.contentHint = 'detail';
       await videoTransceiver.sender.replaceTrack(track);
-      if (previousTrack && previousTrack !== track) cleanupTrack(previousTrack);
       await tuneSender(videoTransceiver.sender);
       continue;
     }
@@ -549,20 +538,16 @@ async function handleSignal({ clientId, message }) {
       await pc.setRemoteDescription(message.sdp);
       await flushPeerCandidates(clientId, pc);
       const videoTransceiver = ensureVideoSender(pc);
-      const placeholderTrack = createPlaceholderTrack();
-      if (placeholderTrack) await videoTransceiver.sender.replaceTrack(placeholderTrack);
-      preferH264(pc, videoTransceiver.sender);
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      window.lanRemote.sendSignal({ clientId, message: { type: 'answer', sdp: pc.localDescription } });
-      sendSignalProgress(clientId, 'answer-sent', 'Mac sent WebRTC answer');
-      log(`answered remote desktop request from ${clientId.slice(0, 8)}`);
-
       sendSignalProgress(clientId, 'capture-starting', 'Mac is starting screen capture');
       const stream = await startCapture();
       sendSignalProgress(clientId, 'capture-ready', 'Mac screen capture is ready');
       await attachScreenStream(pc, stream, videoTransceiver);
       log(`screen stream attached for ${clientId.slice(0, 8)}`);
+      const answer = await pc.createAnswer();
+      await pc.setLocalDescription(answer);
+      window.lanRemote.sendSignal({ clientId, message: { type: 'answer', sdp: pc.localDescription } });
+      sendSignalProgress(clientId, 'answer-sent', 'Mac sent WebRTC answer');
+      log(`answered remote desktop request from ${clientId.slice(0, 8)}`);
     } catch (err) {
       window.lanRemote.sendSignal({ clientId, message: { type: 'error', error: err.message } });
       log(`screen share failed: ${err.message}`);

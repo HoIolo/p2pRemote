@@ -25,6 +25,7 @@ app.commandLine.appendSwitch('disable-background-timer-throttling');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
 app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns');
 app.commandLine.appendSwitch('force-webrtc-ip-handling-policy', 'default_public_and_private_interfaces');
+app.commandLine.appendSwitch('enable-features', 'WebRtcAllowInputVolumeAdjustment');
 
 function resolveRole() {
   if (process.argv.includes('--host')) return 'host';
@@ -112,10 +113,37 @@ function lanAddresses() {
   const out = [];
   for (const [name, addrs] of Object.entries(os.networkInterfaces())) {
     for (const addr of addrs || []) {
-      if (addr.family === 'IPv4' && !addr.internal) out.push({ name, address: addr.address });
+      if (addr.family === 'IPv4' && !addr.internal) out.push({ name, address: addr.address, netmask: addr.netmask || '' });
     }
   }
   return out;
+}
+
+function ipv4ToInt(address) {
+  const parts = String(address || '').split('.').map((part) => Number(part));
+  if (parts.length !== 4 || parts.some((n) => !Number.isInteger(n) || n < 0 || n > 255)) return null;
+  return (((parts[0] << 24) >>> 0) | (parts[1] << 16) | (parts[2] << 8) | parts[3]) >>> 0;
+}
+
+function sameSubnet(address, target, netmask) {
+  const ip = ipv4ToInt(address);
+  const dst = ipv4ToInt(target);
+  const mask = ipv4ToInt(netmask);
+  if (ip === null || dst === null || mask === null) return false;
+  return (ip & mask) === (dst & mask);
+}
+
+function routeLocalAddressForTarget(targetIp, fallbackIp = '') {
+  const target = String(targetIp || '').trim();
+  const fallback = String(fallbackIp || '').trim();
+  const addrs = lanAddresses();
+  const subnetMatch = addrs.find((addr) => addr.netmask && sameSubnet(addr.address, target, addr.netmask));
+  if (subnetMatch) return { ...subnetMatch, reason: 'same-subnet' };
+  if (fallback && addrs.some((addr) => addr.address === fallback)) {
+    const item = addrs.find((addr) => addr.address === fallback);
+    return { ...item, reason: 'provided' };
+  }
+  return addrs[0] ? { ...addrs[0], reason: 'first-interface' } : null;
 }
 
 function subnetBroadcast(address, netmask) {
@@ -362,6 +390,7 @@ function startNativeV2Client(options = {}) {
     '--height', String(height),
     '--fps', String(fps),
   ];
+  args.push('--transport', options.transport === 'udp' ? 'udp' : 'tcp');
   if (options.fullscreen !== false) args.push('--fullscreen');
 
   nativeV2ClientProcess = spawn(exePath, args, {
@@ -442,6 +471,7 @@ function startNativeV2Host(options = {}) {
     '--fps', String(fps),
     '--bitrate', String(bitrate),
     '--keyint', String(keyint),
+    '--transport', options.transport === 'udp' ? 'udp' : 'tcp',
   ];
 
   nativeV2HostProcess = spawn(exePath, args, {
@@ -497,6 +527,23 @@ function requestNativeV2RemoteHost(device, options = {}) {
       return;
     }
 
+    const route = routeLocalAddressForTarget(device.address, options.clientIp);
+    const requestOptions = { ...options };
+    if (route?.address) {
+      if (requestOptions.clientIp && requestOptions.clientIp !== route.address) {
+        sendToMainWindow('host-log', {
+          level: 'info',
+          message: `native-v2 route override: requested client ${requestOptions.clientIp}, using ${route.address} (${route.name || 'unknown'}, ${route.reason}) for Mac ${device.address}`,
+        });
+      } else {
+        sendToMainWindow('host-log', {
+          level: 'info',
+          message: `native-v2 route: Mac ${device.address} -> local Windows ${route.address} (${route.name || 'unknown'}, ${route.reason})`,
+        });
+      }
+      requestOptions.clientIp = route.address;
+    }
+
     const requestId = crypto.randomUUID();
     const url = `ws://${device.address}:${device.port}`;
     const socket = new WebSocket(url);
@@ -536,7 +583,7 @@ function requestNativeV2RemoteHost(device, options = {}) {
         socket.send(JSON.stringify({
           type: 'native-v2-start-host',
           requestId,
-          options,
+          options: requestOptions,
         }));
         return;
       }
@@ -828,6 +875,10 @@ ipcMain.handle('native-v2-start-host', (_event, options) => startNativeV2Host(op
 
 ipcMain.handle('native-v2-request-remote-host', (_event, payload = {}) => {
   return requestNativeV2RemoteHost(payload.device, payload.options);
+});
+
+ipcMain.handle('native-v2-route-local-address', (_event, targetIp) => {
+  return routeLocalAddressForTarget(targetIp);
 });
 
 ipcMain.handle('native-v2-stop-host', () => {

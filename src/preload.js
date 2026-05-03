@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('lanRemote', {
   stopNativeV2Client: () => ipcRenderer.invoke('native-v2-stop-client'),
   startNativeV2Host: (options) => ipcRenderer.invoke('native-v2-start-host', options),
   requestNativeV2RemoteHost: (device, options) => ipcRenderer.invoke('native-v2-request-remote-host', { device, options }),
+  getNativeV2RouteLocalAddress: (targetIp) => ipcRenderer.invoke('native-v2-route-local-address', targetIp),
   stopNativeV2Host: () => ipcRenderer.invoke('native-v2-stop-host'),
   saveDevicePreview: (id, dataUrl) => ipcRenderer.invoke('save-device-preview', id, dataUrl),
   setWindowFullscreen: (fullScreen) => ipcRenderer.invoke('set-window-fullscreen', fullScreen),

@@ -16,6 +16,18 @@ struct P2VideoHeader {
   uint16_t flags;
 };
 
+struct P2TcpVideoHeader {
+  char magic[4];
+  uint8_t version;
+  uint8_t type;
+  uint16_t headerBytes;
+  uint64_t frameId;
+  uint64_t ptsUs;
+  uint32_t frameBytes;
+  uint16_t flags;
+  uint16_t reserved;
+};
+
 struct P2InputPacket {
   char magic[4];
   uint8_t version;

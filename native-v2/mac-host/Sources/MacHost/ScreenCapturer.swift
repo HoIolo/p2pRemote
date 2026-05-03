@@ -9,6 +9,7 @@ final class ScreenCaptureOutput: NSObject, SCStreamOutput {
     private let encoder: H264LowLatencyEncoder
     private var frames = 0
     private let started = nowUs()
+    private var lastKeyframe = nowUs()
 
     init(encoder: H264LowLatencyEncoder) {
         self.encoder = encoder
@@ -18,7 +19,10 @@ final class ScreenCaptureOutput: NSObject, SCStreamOutput {
         guard type == .screen else { return }
         guard sampleBuffer.isValid, let pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer) else { return }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        encoder.encode(pixelBuffer, pts: pts)
+        let now = nowUs()
+        let forceKeyframe = frames == 0 || now - lastKeyframe >= 1_000_000
+        if forceKeyframe { lastKeyframe = now }
+        encoder.encode(pixelBuffer, pts: pts, forceKeyframe: forceKeyframe)
         frames += 1
         if frames % 300 == 0 {
             let elapsed = Double(nowUs() - started) / 1_000_000.0

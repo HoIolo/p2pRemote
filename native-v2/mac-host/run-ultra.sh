@@ -7,6 +7,7 @@ FPS="${FPS:-120}"
 BITRATE="${BITRATE:-45000000}"
 VIDEO_PORT="${VIDEO_PORT:-45000}"
 INPUT_PORT="${INPUT_PORT:-45001}"
+TRANSPORT="${TRANSPORT:-tcp}"
 cd "$(dirname "$0")"
 BIN=".build/release/p2p-native-mac-host"
 if [[ ! -x "$BIN" ]]; then
@@ -20,4 +21,5 @@ exec "$BIN" \
   --height "$HEIGHT" \
   --fps "$FPS" \
   --bitrate "$BITRATE" \
-  --keyint 1
+  --keyint 1 \
+  --transport "$TRANSPORT"
