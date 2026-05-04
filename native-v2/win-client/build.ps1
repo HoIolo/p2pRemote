@@ -1,28 +1,5 @@
-﻿$ErrorActionPreference = 'Stop'
+$ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
-
-$gstRoots = @(
-  @(
-    $env:GSTREAMER_1_0_ROOT_MSVC_X86_64,
-    $env:GSTREAMER_1_0_ROOT_MINGW_X86_64,
-    "$env:USERPROFILE\gstreamer-sdk\1.0\msvc_x86_64",
-    'C:\gstreamer\1.0\msvc_x86_64',
-    'C:\gstreamer\1.0\mingw_x86_64'
-  ) | Where-Object { $_ -and (Test-Path $_) }
-)
-
-if ($gstRoots.Count -gt 0) {
-  $gstRoot = $gstRoots[0]
-  $pkgConfig = Join-Path $gstRoot 'bin\pkg-config.exe'
-  if (Test-Path $pkgConfig) {
-    $env:PKG_CONFIG = $pkgConfig
-    $env:PKG_CONFIG_PATH = Join-Path $gstRoot 'lib\pkgconfig'
-  }
-  $env:Path = "$(Join-Path $gstRoot 'bin');$env:Path"
-  Write-Host "using GStreamer: $gstRoot"
-} else {
-  Write-Error "GStreamer SDK not found; install runtime + development SDK or set GSTREAMER_1_0_ROOT_MSVC_X86_64."
-}
 
 $cmakeArgs = @('-S', '.', '-B', 'build', '-A', 'x64', '-DCMAKE_BUILD_TYPE=Release')
 & cmake @cmakeArgs

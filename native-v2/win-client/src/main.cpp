@@ -40,8 +40,8 @@ using Microsoft::WRL::ComPtr;
 static constexpr int kMaxUdp = 1500;
 static constexpr int kVideoHeaderBytes = sizeof(P2VideoHeader);
 static constexpr int kMaxVideoFragmentPayload = 1440 - kVideoHeaderBytes;
-static constexpr size_t kMinEncodedQueueDepth = 18;
-static constexpr size_t kMaxEncodedQueueDepth = 120;
+static constexpr size_t kMinEncodedQueueDepth = 1;
+static constexpr size_t kMaxEncodedQueueDepth = 6;
 
 struct Config {
   std::wstring hostIp = L"127.0.0.1";
@@ -305,7 +305,6 @@ static void PushEncoded(EncodedFrame&& f) {
   {
     std::lock_guard lk(g_encodedMu);
     const size_t queueDepthTarget = EncodedQueueDepthTarget();
-    const size_t protectionThreshold = std::max<size_t>(queueDepthTarget * 9 / 10, queueDepthTarget > 2 ? queueDepthTarget - 2 : queueDepthTarget);
     if (g_waitingForKeyframe.load(std::memory_order_relaxed)) {
       if (!f.keyframe) {
         RecordClientFrameDrop();
@@ -319,14 +318,6 @@ static void PushEncoded(EncodedFrame&& f) {
     if (!g_decoderPrimed.load(std::memory_order_relaxed) && !f.keyframe) {
       RecordClientFrameDrop();
       return;
-    }
-
-    if (!g_encodedQueue.empty()) {
-      const EncodedFrame& pending = g_encodedQueue.back();
-      if (pending.keyframe && !f.keyframe && g_encodedQueue.size() >= protectionThreshold) {
-        RecordClientFrameDrop();
-        return;
-      }
     }
 
     while (g_encodedQueue.size() >= queueDepthTarget) {
@@ -725,12 +716,11 @@ static int AutoBitrateForPixels(int width, int height, int fallback) {
 }
 
 static size_t EncodedQueueDepthTarget() {
-  const int fps = std::max(30, g_activeVideoFps.load(std::memory_order_relaxed));
-  size_t target = static_cast<size_t>(std::clamp((fps + 3) / 4, 8, 26));
+  size_t target = 1;
   const uint64_t lastProfileApply = g_lastProfileApplyQpc.load(std::memory_order_relaxed);
   const uint64_t now = QpcNow();
   if (lastProfileApply && QpcDeltaUs(lastProfileApply, now) < 2'500'000) {
-    target += 12;
+    target += 1;
   }
   target = std::max(kMinEncodedQueueDepth, target);
   target = std::min(kMaxEncodedQueueDepth, target);
@@ -740,7 +730,7 @@ static size_t EncodedQueueDepthTarget() {
 
 static size_t DecodedQueueDepthTarget() {
   const int fps = std::max(30, g_activeVideoFps.load(std::memory_order_relaxed));
-  size_t target = static_cast<size_t>(std::clamp((fps + 14) / 15, 2, 6));
+  size_t target = 1;
   g_decodedQueueTargetNow.store(static_cast<uint32_t>(target), std::memory_order_relaxed);
   return target;
 }
@@ -978,6 +968,7 @@ static bool WriteProfileFile(const std::wstring& profileFile, const VideoProfile
   FILE* file = nullptr;
   if (_wfopen_s(&file, profileFile.c_str(), L"wb") != 0 || !file) return false;
   std::string json = "{\n"
+                     "  \"profileVersion\": 2,\n"
                      "  \"width\": " + std::to_string(profile.width) + ",\n"
                      "  \"height\": " + std::to_string(profile.height) + ",\n"
                      "  \"fps\": " + std::to_string(profile.fps) + ",\n"
@@ -1002,6 +993,27 @@ static std::wstring DisplayLabel() {
     label += L" (" + g_cfg.hostName + L")";
   }
   return label;
+}
+
+static void ClearPendingVideoQueues() {
+  {
+    std::lock_guard lk(g_encodedMu);
+    if (!g_encodedQueue.empty()) {
+      const uint64_t count = static_cast<uint64_t>(g_encodedQueue.size());
+      g_framesDropped.fetch_add(count, std::memory_order_relaxed);
+      g_clientFramesDropped.fetch_add(count, std::memory_order_relaxed);
+      g_encodedQueue.clear();
+      g_encodedQueueDepthNow.store(0, std::memory_order_relaxed);
+    }
+  }
+  {
+    std::lock_guard lk(g_decodedMu);
+    if (!g_decodedQueue.empty()) {
+      g_renderFramesDropped.fetch_add(static_cast<uint64_t>(g_decodedQueue.size()), std::memory_order_relaxed);
+      g_decodedQueue.clear();
+      g_decodedQueueDepthNow.store(0, std::memory_order_relaxed);
+    }
+  }
 }
 
 static std::wstring FormatElapsed() {
@@ -1742,13 +1754,24 @@ class VideoReceiver {
       g_bytesRx.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
       g_lastPacketQpc.store(now, std::memory_order_relaxed);
 
-      if (newestFrameId && h->frameId + 120 < newestFrameId) continue;
-      if (h->frameId > newestFrameId) newestFrameId = h->frameId;
-
-      if (partials.size() > 24) {
-        uint64_t keepFrom = newestFrameId > 24 ? newestFrameId - 24 : 0;
+      if (newestFrameId && h->frameId + 12 < newestFrameId) continue;
+      if (h->frameId > newestFrameId) {
+        newestFrameId = h->frameId;
+        const uint64_t keepFrom = newestFrameId > 3 ? newestFrameId - 3 : 0;
         for (auto it = partials.begin(); it != partials.end();) {
-          if (it->first < keepFrom || QpcDeltaUs(it->second.firstQpc, now) > 750'000) {
+          if (it->first < keepFrom) {
+            it = partials.erase(it);
+            RecordNetworkFrameDrop();
+          } else {
+            ++it;
+          }
+        }
+      }
+
+      if (partials.size() > 8) {
+        uint64_t keepFrom = newestFrameId > 8 ? newestFrameId - 8 : 0;
+        for (auto it = partials.begin(); it != partials.end();) {
+          if (it->first < keepFrom || QpcDeltaUs(it->second.firstQpc, now) > 120'000) {
             it = partials.erase(it);
             RecordNetworkFrameDrop();
           } else {
@@ -2234,6 +2257,7 @@ static void DecoderThread() {
   while (g_running.load()) {
     const uint64_t generation = g_videoProfileGeneration.load(std::memory_order_relaxed);
     if (generation != appliedProfileGeneration) {
+      ClearPendingVideoQueues();
       const VideoProfile activeProfile = ActiveVideoProfile();
       bool reconfigured = !g_renderer || g_renderer->Reconfigure(activeProfile.width, activeProfile.height);
       if (reconfigured) {
@@ -2277,10 +2301,9 @@ static void DecoderThread() {
 }
 
 static void RenderThread() {
-  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   SetThreadDescription(GetCurrentThread(), L"P2P video present");
   uint32_t gpuPresentFailStreak = 0;
-  uint64_t lastPresentQpcLocal = 0;
 
   while (g_running.load()) {
     DecodedFrame frame;
@@ -2298,16 +2321,6 @@ static void RenderThread() {
 
     bool presented = false;
     if (g_renderer) {
-      const int fps = std::max(30, g_activeVideoFps.load(std::memory_order_relaxed));
-      const uint64_t frameIntervalUs = 1'000'000ull / static_cast<uint64_t>(fps);
-      const uint64_t nowBeforePresent = QpcNow();
-      if (lastPresentQpcLocal) {
-        const uint64_t sinceLastPresentUs = QpcDeltaUs(lastPresentQpcLocal, nowBeforePresent);
-        if (sinceLastPresentUs + 2'000 < frameIntervalUs) {
-          Sleep(static_cast<DWORD>(std::max<uint64_t>(0, (frameIntervalUs - sinceLastPresentUs - 1'000) / 1000)));
-        }
-      }
-      g_renderer->WaitForPresentReady();
       if (frame.gpu) {
         presented = g_renderer->Render(frame.dxgi);
         if (!presented) {
@@ -2323,7 +2336,6 @@ static void RenderThread() {
     }
 
     if (presented) {
-      lastPresentQpcLocal = QpcNow();
       g_framesPresented.fetch_add(1, std::memory_order_relaxed);
       if (frame.gpu) g_gpuFrames.fetch_add(1, std::memory_order_relaxed);
       else g_cpuFrames.fetch_add(1, std::memory_order_relaxed);
@@ -2348,7 +2360,14 @@ static void RenderThread() {
   }
 }
 
-static uint16_t VkToMacKeyCode(WPARAM vk) {
+static uint16_t VkToMacKeyCode(WPARAM vk, LPARAM lp) {
+  if (vk == VK_SHIFT) {
+    vk = MapVirtualKeyW((lp >> 16) & 0xff, MAPVK_VSC_TO_VK_EX);
+  } else if (vk == VK_CONTROL) {
+    vk = (lp & 0x01000000) ? VK_RCONTROL : VK_LCONTROL;
+  } else if (vk == VK_MENU) {
+    vk = (lp & 0x01000000) ? VK_RMENU : VK_LMENU;
+  }
   if (vk >= 'A' && vk <= 'Z') {
     static const uint16_t map[26] = {0,11,8,2,14,3,5,4,34,38,40,37,46,45,31,35,12,15,1,17,32,9,13,7,16,6};
     return map[vk - 'A'];
@@ -2364,10 +2383,13 @@ static uint16_t VkToMacKeyCode(WPARAM vk) {
     case VK_LSHIFT: case VK_SHIFT: return 56; case VK_RSHIFT: return 60;
     case VK_LCONTROL: case VK_CONTROL: return 59; case VK_RCONTROL: return 62;
     case VK_LMENU: case VK_MENU: return 58; case VK_RMENU: return 61;
-    case VK_LWIN: return 55; case VK_RWIN: return 54;
+    case VK_LWIN: return 55; case VK_RWIN: return 54; case VK_CAPITAL: return 57;
     case VK_OEM_MINUS: return 27; case VK_OEM_PLUS: return 24; case VK_OEM_4: return 33; case VK_OEM_6: return 30;
     case VK_OEM_5: return 42; case VK_OEM_1: return 41; case VK_OEM_7: return 39; case VK_OEM_COMMA: return 43;
     case VK_OEM_PERIOD: return 47; case VK_OEM_2: return 44; case VK_OEM_3: return 50;
+    case VK_NUMPAD0: return 82; case VK_NUMPAD1: return 83; case VK_NUMPAD2: return 84; case VK_NUMPAD3: return 85; case VK_NUMPAD4: return 86;
+    case VK_NUMPAD5: return 87; case VK_NUMPAD6: return 88; case VK_NUMPAD7: return 89; case VK_NUMPAD8: return 91; case VK_NUMPAD9: return 92;
+    case VK_DECIMAL: return 65; case VK_MULTIPLY: return 67; case VK_ADD: return 69; case VK_DIVIDE: return 75; case VK_SUBTRACT: return 78;
     default:
       if (vk >= VK_F1 && vk <= VK_F12) {
         static const uint16_t f[12] = {122,120,99,118,96,97,98,100,101,109,103,111};
@@ -2375,6 +2397,50 @@ static uint16_t VkToMacKeyCode(WPARAM vk) {
       }
       return 0xffff;
   }
+}
+
+
+static bool IsModifierVirtualKey(WPARAM vk) {
+  switch (vk) {
+    case VK_SHIFT: case VK_LSHIFT: case VK_RSHIFT:
+    case VK_CONTROL: case VK_LCONTROL: case VK_RCONTROL:
+    case VK_MENU: case VK_LMENU: case VK_RMENU:
+    case VK_LWIN: case VK_RWIN:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static bool HasNonTextModifierDown() {
+  return (GetKeyState(VK_CONTROL) & 0x8000) ||
+         (GetKeyState(VK_MENU) & 0x8000) ||
+         (GetKeyState(VK_LWIN) & 0x8000) ||
+         (GetKeyState(VK_RWIN) & 0x8000);
+}
+
+static bool IsTextVirtualKey(WPARAM vk) {
+  if (vk >= 'A' && vk <= 'Z') return true;
+  if (vk >= '0' && vk <= '9') return true;
+  if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9) return true;
+  switch (vk) {
+    case VK_SPACE: case VK_OEM_MINUS: case VK_OEM_PLUS: case VK_OEM_4:
+    case VK_OEM_6: case VK_OEM_5: case VK_OEM_1: case VK_OEM_7:
+    case VK_OEM_COMMA: case VK_OEM_PERIOD: case VK_OEM_2: case VK_OEM_3:
+    case VK_DECIMAL: case VK_MULTIPLY: case VK_ADD: case VK_DIVIDE: case VK_SUBTRACT:
+      return true;
+    default:
+      return false;
+  }
+}
+
+static uint16_t MacModifierMaskForCurrentWinKeys() {
+  uint16_t mask = 0;
+  if (GetKeyState(VK_SHIFT) & 0x8000) mask |= P2_MOD_SHIFT;
+  if (GetKeyState(VK_CONTROL) & 0x8000) mask |= P2_MOD_CONTROL;
+  if (GetKeyState(VK_MENU) & 0x8000) mask |= P2_MOD_OPTION;
+  if ((GetKeyState(VK_LWIN) & 0x8000) || (GetKeyState(VK_RWIN) & 0x8000)) mask |= P2_MOD_COMMAND;
+  return mask;
 }
 
 static void SendInputPacket(uint8_t kind, float x, float y, int32_t dx, int32_t dy, uint16_t button, uint16_t keyCode) {
@@ -2637,13 +2703,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HideNativePopups();
         return 0;
       }
-      uint16_t mac = VkToMacKeyCode(wp);
+      if (!IsModifierVirtualKey(wp) && !HasNonTextModifierDown() && IsTextVirtualKey(wp)) return 0;
+      uint16_t mac = VkToMacKeyCode(wp, lp);
       if (mac != 0xffff) SendInputPacket(P2_INPUT_KEY_DOWN, 0, 0, 0, 0, 0, mac);
       return 0;
     }
     case WM_KEYUP: case WM_SYSKEYUP: {
-      uint16_t mac = VkToMacKeyCode(wp);
+      if (!IsModifierVirtualKey(wp) && !HasNonTextModifierDown() && IsTextVirtualKey(wp)) return 0;
+      uint16_t mac = VkToMacKeyCode(wp, lp);
       if (mac != 0xffff) SendInputPacket(P2_INPUT_KEY_UP, 0, 0, 0, 0, 0, mac);
+      return 0;
+    }
+    case WM_CHAR: {
+      if (wp >= 0x20 && wp != 0x7f) {
+        SendInputPacket(P2_INPUT_TEXT, 0, 0, 0, 0, MacModifierMaskForCurrentWinKeys(), static_cast<uint16_t>(wp & 0xffff));
+      }
       return 0;
     }
     case WM_PAINT: {

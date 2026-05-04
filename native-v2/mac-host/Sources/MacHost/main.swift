@@ -25,42 +25,48 @@ private func mainDisplayBounds() async throws -> CGRect {
 
 @available(macOS 13.0, *)
 final actor NativeHostRuntime {
-    let video: GStreamerVideoSender
+    let capturer: ScreenCapturer
+    let encoder: H264LowLatencyEncoder
+    let udpVideo: UdpVideoSender?
+    let tcpVideo: TcpVideoServer?
     let input: InputReceiver
     private var cfg: NativeHostConfig
 
-    init(cfg: NativeHostConfig, video: GStreamerVideoSender, input: InputReceiver) {
+    init(
+        cfg: NativeHostConfig,
+        capturer: ScreenCapturer,
+        encoder: H264LowLatencyEncoder,
+        udpVideo: UdpVideoSender?,
+        tcpVideo: TcpVideoServer?,
+        input: InputReceiver
+    ) {
         self.cfg = cfg
-        self.video = video
+        self.capturer = capturer
+        self.encoder = encoder
+        self.udpVideo = udpVideo
+        self.tcpVideo = tcpVideo
         self.input = input
     }
 
     func requestKeyframe(reason: String) {
         logLine("[control] keyframe request: \(reason)")
-        video.requestKeyframe()
+        encoder.requestKeyframe(reason: reason)
     }
 
     func updateBitrate(_ bitrate: Int, reason: String) {
-        do {
-            try video.updateBitrate(bitrate)
-            cfg.bitrate = bitrate
-            logLine("[control] bitrate updated via gst restart: \(bitrate) reason=\(reason)")
-        } catch {
-            logLine("[control] bitrate update failed: \(error)")
-        }
+        encoder.updateBitrate(bitrate, reason: reason)
+        udpVideo?.updateTargetBitrate(bitrate)
+        cfg.bitrate = bitrate
     }
 
     func reconfigureVideo(width: Int, height: Int, fps: Int, bitrateMbps: Int) async {
-        do {
-            try video.reconfigure(width: width, height: height, fps: fps, bitrateMbps: bitrateMbps)
-            cfg.width = width
-            cfg.height = height
-            cfg.fps = fps
-            if bitrateMbps > 0 { cfg.bitrate = bitrateMbps * 1_000_000 }
-            logLine("[control] video profile applied: \(width)x\(height)@\(fps) bitrateMbps=\(bitrateMbps)")
-        } catch {
-            logLine("[control] video profile apply failed: \(error)")
+        // The native VideoToolbox path applies bitrate immediately. Resolution
+        // and FPS changes are kept for the next reconnect to avoid a multi-second
+        // capture/encoder restart in the middle of a low-latency session.
+        if bitrateMbps > 0 {
+            updateBitrate(bitrateMbps * 1_000_000, reason: "manual profile")
         }
+        logLine("[control] profile request received: \(width)x\(height)@\(fps) bitrateMbps=\(bitrateMbps); bitrate applied, resolution/fps require reconnect")
     }
 }
 
@@ -93,9 +99,25 @@ struct MacHostMain {
         logLine("client=\(cfg.clientIP):\(cfg.videoPort), input=0.0.0.0:\(cfg.inputPort), video=\(cfg.width)x\(cfg.height)@\(cfg.fps), bitrate=\(cfg.bitrate), transport=\(cfg.transport)")
 
         do {
-            let displayBounds = try await mainDisplayBounds()
-            let video = GStreamerVideoSender(cfg: cfg)
-            try video.start()
+            let udpVideo = cfg.transport == "udp" ? try UdpVideoSender(clientIP: cfg.clientIP, port: cfg.videoPort, fps: cfg.fps, bitrate: cfg.bitrate) : nil
+            let tcpVideo = cfg.transport == "tcp" ? try TcpVideoServer(port: cfg.videoPort) : nil
+            tcpVideo?.start()
+            let encoder = try H264LowLatencyEncoder(
+                width: cfg.width,
+                height: cfg.height,
+                fps: cfg.fps,
+                bitrate: cfg.bitrate,
+                keyframeSeconds: cfg.keyframeSeconds
+            ) { frame, keyframe, configIncluded, ptsUs in
+                if let udpVideo {
+                    udpVideo.sendFrame(frame, keyframe: keyframe, configIncluded: configIncluded, ptsUs: ptsUs)
+                } else {
+                    tcpVideo?.sendFrame(frame, keyframe: keyframe, configIncluded: configIncluded, ptsUs: ptsUs)
+                }
+            }
+            let output = ScreenCaptureOutput(encoder: encoder)
+            let capturer = ScreenCapturer(cfg: cfg, output: output)
+            let displayBounds = try await capturer.start()
 
             let input = try InputReceiver(
                 port: cfg.inputPort,
@@ -116,9 +138,16 @@ struct MacHostMain {
                     }
                 }
             )
-            gRuntime = NativeHostRuntime(cfg: cfg, video: video, input: input)
+            gRuntime = NativeHostRuntime(
+                cfg: cfg,
+                capturer: capturer,
+                encoder: encoder,
+                udpVideo: udpVideo,
+                tcpVideo: tcpVideo,
+                input: input
+            )
             input.start()
-            logLine("[ready] gst video sender and input receiver running")
+            logLine("[ready] native VideoToolbox sender and input receiver running")
             logLine("[ready] host streaming. Press Ctrl+C to stop.")
         } catch {
             fputs("[fatal] \(error)\n", stderr)

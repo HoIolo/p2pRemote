@@ -129,7 +129,7 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
         streamCfg.width = cfg.width
         streamCfg.height = cfg.height
         streamCfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(cfg.fps))
-        streamCfg.queueDepth = 3
+        streamCfg.queueDepth = 1
         streamCfg.showsCursor = false
         streamCfg.capturesAudio = false
         streamCfg.pixelFormat = pixelFormat

@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 CLIENT_IP="${CLIENT_IP:-192.168.1.50}"
-WIDTH="${WIDTH:-1920}"
-HEIGHT="${HEIGHT:-1080}"
+WIDTH="${WIDTH:-1600}"
+HEIGHT="${HEIGHT:-900}"
 FPS="${FPS:-60}"
-BITRATE="${BITRATE:-18000000}"
+BITRATE="${BITRATE:-10000000}"
 VIDEO_PORT="${VIDEO_PORT:-45000}"
 INPUT_PORT="${INPUT_PORT:-45001}"
 TRANSPORT="${TRANSPORT:-udp}"
@@ -21,5 +21,5 @@ exec "$BIN" \
   --height "$HEIGHT" \
   --fps "$FPS" \
   --bitrate "$BITRATE" \
-  --keyint 6 \
+  --keyint 1 \
   --transport "$TRANSPORT"

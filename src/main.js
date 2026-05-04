@@ -52,6 +52,10 @@ let nativeV2ClientLastOptions = null;
 let nativeV2LastRemoteHostRequest = null;
 let appIsQuitting = false;
 let nativeV2HostAutoStopTimer = null;
+let nativeV2ClientProfileWatchPath = null;
+let nativeV2ClientProfileLastJson = '';
+let nativeV2ClientProfileChangeInFlight = false;
+let nativeV2ClientProfilePending = null;
 
 function mainWindow() {
   if (win && !win.isDestroyed()) return win;
@@ -284,35 +288,6 @@ function nativeV2MacHostCandidates() {
   ];
 }
 
-function nativeV2GStreamerRootCandidates() {
-  if (process.platform !== 'win32') return [];
-  const userProfile = process.env.USERPROFILE || os.homedir?.() || '';
-  return [
-    process.env.GSTREAMER_1_0_ROOT_MSVC_X86_64,
-    process.env.GSTREAMER_1_0_ROOT_MINGW_X86_64,
-    path.join(userProfile, 'gstreamer-sdk', '1.0', 'msvc_x86_64'),
-    'C:\\gstreamer\\1.0\\msvc_x86_64',
-    'C:\\gstreamer\\1.0\\mingw_x86_64',
-  ].filter(Boolean);
-}
-
-function nativeV2GStreamerEnv() {
-  const root = findFirstExistingPath(nativeV2GStreamerRootCandidates());
-  if (!root) return { env: process.env, root: null };
-  const bin = path.join(root, 'bin');
-  const libPkgConfig = path.join(root, 'lib', 'pkgconfig');
-  return {
-    root,
-    env: {
-      ...process.env,
-      GSTREAMER_1_0_ROOT_MSVC_X86_64: root,
-      PKG_CONFIG: path.join(bin, 'pkg-config.exe'),
-      PKG_CONFIG_PATH: libPkgConfig,
-      PATH: `${bin}${path.delimiter}${process.env.PATH || ''}`,
-    },
-  };
-}
-
 function nativeV2ClientProfilePath() {
   return path.join(app.getPath('userData'), 'native-v2-win-client-profile.json');
 }
@@ -320,12 +295,23 @@ function nativeV2ClientProfilePath() {
 function readNativeV2ClientProfile(profileFile = nativeV2ClientProfilePath()) {
   try {
     const parsed = JSON.parse(fs.readFileSync(profileFile, 'utf8'));
-    return {
+    let profile = {
       width: Number(parsed.width) || undefined,
       height: Number(parsed.height) || undefined,
       fps: Number(parsed.fps) || undefined,
       bitrate: Number(parsed.bitrate) || undefined,
+      profileVersion: Number(parsed.profileVersion) || 0,
     };
+    if (!profile.profileVersion && profile.width && profile.height && Math.max(profile.width, profile.height) > 1920) {
+      const scale = 1600 / Math.max(profile.width, profile.height);
+      profile = {
+        ...profile,
+        width: Math.max(640, Math.round(profile.width * scale / 2) * 2),
+        height: Math.max(360, Math.round(profile.height * scale / 2) * 2),
+        bitrate: Math.min(Number(profile.bitrate) || 10_000_000, 10_000_000),
+      };
+    }
+    return profile;
   } catch {
     return {};
   }
@@ -333,14 +319,97 @@ function readNativeV2ClientProfile(profileFile = nativeV2ClientProfilePath()) {
 
 function writeNativeV2ClientProfile(profileFile = nativeV2ClientProfilePath(), profile = {}) {
   const payload = {
-    width: Number(profile.width) || 1920,
-    height: Number(profile.height) || 1080,
+    profileVersion: 2,
+    width: Number(profile.width) || 1600,
+    height: Number(profile.height) || 900,
     fps: Number(profile.fps) || 60,
-    bitrate: Number(profile.bitrate) || 14_000_000,
+    bitrate: Number(profile.bitrate) || 10_000_000,
   };
   fs.mkdirSync(path.dirname(profileFile), { recursive: true });
   fs.writeFileSync(profileFile, JSON.stringify(payload, null, 2));
   return payload;
+}
+
+function nativeV2ClientProfileSignature(profile = {}) {
+  return JSON.stringify({
+    width: Number(profile.width) || 0,
+    height: Number(profile.height) || 0,
+    fps: Number(profile.fps) || 0,
+    bitrate: Number(profile.bitrate) || 0,
+  });
+}
+
+function stopNativeV2ClientProfileWatcher() {
+  if (!nativeV2ClientProfileWatchPath) return;
+  try {
+    fs.unwatchFile(nativeV2ClientProfileWatchPath);
+  } catch {
+    // ignore watcher shutdown errors
+  }
+  nativeV2ClientProfileWatchPath = null;
+  nativeV2ClientProfileLastJson = '';
+  nativeV2ClientProfilePending = null;
+  nativeV2ClientProfileChangeInFlight = false;
+}
+
+async function processNativeV2ClientProfileChange(profile) {
+  const normalized = {
+    width: normalizeNativeV2Number(profile.width, nativeV2ClientLastOptions?.width || 1600, 640, 7680),
+    height: normalizeNativeV2Number(profile.height, nativeV2ClientLastOptions?.height || 900, 360, 4320),
+    fps: normalizeNativeV2Number(profile.fps, nativeV2ClientLastOptions?.fps || 60, 30, 240),
+    bitrate: normalizeNativeV2Number(profile.bitrate, nativeV2ClientLastOptions?.bitrate || 10_000_000, 1_000_000, 200_000_000),
+    transport: 'udp',
+  };
+  if (nativeV2ClientLastOptions) {
+    nativeV2ClientLastOptions = {
+      ...nativeV2ClientLastOptions,
+      ...normalized,
+    };
+  }
+  broadcastNativeV2Status();
+  const restarted = await restartNativeV2RemoteHostForClientProfile(normalized);
+  if (!restarted) {
+    sendToMainWindow('host-log', {
+      level: 'info',
+      message: `native-v2 profile changed to ${normalized.width}x${normalized.height}@${normalized.fps} bitrate=${normalized.bitrate}; reconnect or restart the Mac host to apply capture resolution/fps`,
+    });
+  }
+}
+
+function queueNativeV2ClientProfileChange(profile) {
+  nativeV2ClientProfilePending = profile;
+  if (nativeV2ClientProfileChangeInFlight) return;
+  nativeV2ClientProfileChangeInFlight = true;
+  (async () => {
+    try {
+      while (nativeV2ClientProfilePending) {
+        const next = nativeV2ClientProfilePending;
+        nativeV2ClientProfilePending = null;
+        await processNativeV2ClientProfileChange(next);
+      }
+    } catch (err) {
+      sendToMainWindow('host-log', {
+        level: 'error',
+        message: `native-v2 profile apply failed: ${err.message || String(err)}`,
+      });
+    } finally {
+      nativeV2ClientProfileChangeInFlight = false;
+      if (nativeV2ClientProfilePending) queueNativeV2ClientProfileChange(nativeV2ClientProfilePending);
+    }
+  })();
+}
+
+function startNativeV2ClientProfileWatcher(profileFile) {
+  stopNativeV2ClientProfileWatcher();
+  nativeV2ClientProfileWatchPath = profileFile;
+  nativeV2ClientProfileLastJson = nativeV2ClientProfileSignature(readNativeV2ClientProfile(profileFile));
+  fs.watchFile(profileFile, { interval: 350 }, () => {
+    const profile = readNativeV2ClientProfile(profileFile);
+    const json = nativeV2ClientProfileSignature(profile);
+    if (!json || json === nativeV2ClientProfileLastJson) return;
+    nativeV2ClientProfileLastJson = json;
+    queueNativeV2ClientProfileChange(profile);
+  });
 }
 
 function nativeV2StatusPayload() {
@@ -352,7 +421,6 @@ function nativeV2StatusPayload() {
       path: findFirstExistingPath(nativeV2WinClientCandidates()),
       running: Boolean(nativeV2ClientProcess && !nativeV2ClientProcess.killed),
       pid: nativeV2ClientProcess?.pid || null,
-      gstreamerRoot: nativeV2GStreamerEnv().root,
     },
     macHost: {
       available: Boolean(findFirstExistingPath(nativeV2MacHostCandidates())),
@@ -363,10 +431,10 @@ function nativeV2StatusPayload() {
     defaults: {
       videoPort: 45000,
       inputPort: 45001,
-      width: Number(savedClientProfile.width) || 1920,
-      height: Number(savedClientProfile.height) || 1080,
+      width: Number(savedClientProfile.width) || 1600,
+      height: Number(savedClientProfile.height) || 900,
       fps: Number(savedClientProfile.fps) || 60,
-      bitrate: Number(savedClientProfile.bitrate) || 14_000_000,
+      bitrate: Number(savedClientProfile.bitrate) || 10_000_000,
       keyint: 1,
       transport: 'udp',
     },
@@ -425,6 +493,7 @@ function relayNativeV2ProcessOutput(kind, proc, chunk) {
 function stopNativeV2Process(kind) {
   const proc = kind === 'host' ? nativeV2HostProcess : nativeV2ClientProcess;
   if (!proc || proc.killed) return false;
+  if (kind === 'client') stopNativeV2ClientProfileWatcher();
   if (kind === 'host' && nativeV2HostAutoStopTimer) {
     clearTimeout(nativeV2HostAutoStopTimer);
     nativeV2HostAutoStopTimer = null;
@@ -461,10 +530,10 @@ function startNativeV2Client(options = {}) {
 
   const videoPort = normalizeNativeV2Number(options.videoPort, 45000, 1, 65535);
   const inputPort = normalizeNativeV2Number(options.inputPort, 45001, 1, 65535);
-  const width = normalizeNativeV2Number(options.width, 1920, 640, 7680);
-  const height = normalizeNativeV2Number(options.height, 1080, 360, 4320);
+  const width = normalizeNativeV2Number(options.width, 1600, 640, 7680);
+  const height = normalizeNativeV2Number(options.height, 900, 360, 4320);
   const fps = normalizeNativeV2Number(options.fps, 60, 30, 240);
-  const bitrate = normalizeNativeV2Number(options.bitrate, 14_000_000, 0, 200_000_000);
+  const bitrate = normalizeNativeV2Number(options.bitrate, 10_000_000, 0, 200_000_000);
   const transport = 'udp';
   const profileFile = String(options.profileFile || nativeV2ClientProfilePath());
   writeNativeV2ClientProfile(profileFile, { width, height, fps, bitrate });
@@ -497,15 +566,11 @@ function startNativeV2Client(options = {}) {
     transport,
     profileFile,
   };
-
-  const gstEnv = nativeV2GStreamerEnv();
-  if (!gstEnv.root) {
-    throw new Error('GStreamer runtime not found. Set GSTREAMER_1_0_ROOT_MSVC_X86_64 or install the bundled SDK before starting the Windows client.');
-  }
+  startNativeV2ClientProfileWatcher(profileFile);
 
   nativeV2ClientProcess = spawn(exePath, args, {
     cwd: path.dirname(exePath),
-    env: gstEnv.env,
+    env: process.env,
     windowsHide: false,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -514,7 +579,7 @@ function startNativeV2Client(options = {}) {
   const pid = nativeV2ClientProcess.pid;
   sendToMainWindow('host-log', {
     level: 'info',
-    message: `native-v2 client started pid=${pid} host=${options.hostIp}:${videoPort} transport=${transport} gstreamer=${gstEnv.root}`,
+    message: `native-v2 client started pid=${pid} host=${options.hostIp}:${videoPort} transport=${transport}`,
   });
 
   proc.stdout?.on('data', (chunk) => {
@@ -525,12 +590,18 @@ function startNativeV2Client(options = {}) {
   });
   proc.once('exit', (code, signal) => {
     sendToMainWindow('host-log', { level: 'info', message: `native-v2 client exited code=${code ?? ''} signal=${signal ?? ''}` });
-    if (nativeV2ClientProcess === proc) nativeV2ClientProcess = null;
+    if (nativeV2ClientProcess === proc) {
+      nativeV2ClientProcess = null;
+      stopNativeV2ClientProfileWatcher();
+    }
     broadcastNativeV2Status();
   });
   proc.once('error', (err) => {
     sendToMainWindow('host-log', { level: 'error', message: `native-v2 client failed: ${err.message}` });
-    if (nativeV2ClientProcess === proc) nativeV2ClientProcess = null;
+    if (nativeV2ClientProcess === proc) {
+      nativeV2ClientProcess = null;
+      stopNativeV2ClientProfileWatcher();
+    }
     broadcastNativeV2Status({ error: err.message });
   });
 
@@ -572,10 +643,10 @@ function startNativeV2Host(options = {}) {
 
   const videoPort = normalizeNativeV2Number(options.videoPort, 45000, 1, 65535);
   const inputPort = normalizeNativeV2Number(options.inputPort, 45001, 1, 65535);
-  const width = normalizeNativeV2Number(options.width, 1920, 640, 7680);
-  const height = normalizeNativeV2Number(options.height, 1080, 360, 4320);
+  const width = normalizeNativeV2Number(options.width, 1600, 640, 7680);
+  const height = normalizeNativeV2Number(options.height, 900, 360, 4320);
   const fps = normalizeNativeV2Number(options.fps, 60, 30, 240);
-  const bitrate = normalizeNativeV2Number(options.bitrate, 14_000_000, 1_000_000, 200_000_000);
+  const bitrate = normalizeNativeV2Number(options.bitrate, 10_000_000, 1_000_000, 200_000_000);
   const keyint = normalizeNativeV2Number(options.keyint, 1, 1, 300);
   const requestedTransport = options.transport === 'tcp' ? 'tcp' : 'udp';
   const transport = requestedTransport === 'udp' && allowUdpVideo ? 'udp' : 'tcp';

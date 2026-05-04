@@ -143,33 +143,19 @@ func logLine(_ message: String) {
 }
 
 final class UdpVideoSender {
-    private struct PendingPacket {
-        let frameId: UInt64
-        let bytes: Data
-        let spacingUs: UInt64
-    }
     private let fd: Int32
     private var addr = sockaddr_in()
     private var frameId: UInt64 = 1
     private let frameLock = NSLock()
     private let paceLock = NSLock()
-    private let queueLock = NSLock()
-    private let worker = DispatchQueue(label: "p2p.native.udp-video", qos: .userInteractive)
-    private var nextSendDeadlineUs: UInt64 = nowUs()
     private let fps: Int
     private var targetBitrateBps: Int
-    private var pendingFrames = [[PendingPacket]]()
-    private var pendingPacketCount = 0
-    private var pumpScheduled = false
-    private var droppedPackets: UInt64 = 0
-    private let maxQueuedPackets: Int
 
     init(clientIP: String, port: UInt16, fps: Int, bitrate: Int) throws {
         fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { throw POSIXError(.ENOTSOCK) }
         self.fps = max(30, fps)
         self.targetBitrateBps = max(2_000_000, bitrate)
-        self.maxQueuedPackets = max(64, min(1024, self.fps * 16))
 
         var one: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
@@ -199,28 +185,19 @@ final class UdpVideoSender {
         let id = frameId
         frameId &+= 1
         frameLock.unlock()
+
         let fragCount = UInt16((frame.count + maxVideoFragmentPayload - 1) / maxVideoFragmentPayload)
         let useFec = fragCount >= 3
-        let duplicateLeadingFragments = keyframe ? min(3, Int(fragCount)) : 0
-        let duplicateFecPacket = keyframe && useFec
-        var offset = 0
-        var fragIndex: UInt16 = 0
-        paceLock.lock()
-        let currentBitrate = targetBitrateBps
-        paceLock.unlock()
-        let framePeriodUs = max<UInt64>(4_000, 1_000_000 / UInt64(max(1, fps)))
-        let paceRate = max(4_000_000, min(120_000_000, Int(Double(currentBitrate) * 1.06)))
-        let estimatedSendUs = UInt64(max(2_000, Int(Double(frame.count * 8) * 1_000_000.0 / Double(max(1, paceRate)))))
-        let frameBudgetUs = max(framePeriodUs, estimatedSendUs)
-        let totalPacketCount = Int(fragCount) + (useFec ? 1 : 0) + duplicateLeadingFragments + (duplicateFecPacket ? 1 : 0)
-        let packetBudgetUs = max<UInt64>(140, frameBudgetUs / UInt64(max(1, totalPacketCount)))
+        let totalFragCount = fragCount + (useFec ? 1 : 0)
         var parity = Data(repeating: 0, count: maxVideoFragmentPayload)
         var parityLen = 0
-        let totalFragCount = fragCount + (useFec ? 1 : 0)
-        var packets = [PendingPacket]()
-        packets.reserveCapacity(totalPacketCount)
+        var sentPackets: UInt64 = 0
+        var sentBytes: UInt64 = 0
+        var sendErrors: UInt64 = 0
+        var offset = 0
+        var fragIndex: UInt16 = 0
 
-        func buildPacket(fragIndex: UInt16, totalFragCount: UInt16, payload: Data, flags: UInt16) {
+        func sendPacket(fragIndex: UInt16, totalFragCount: UInt16, payload: Data, flags: UInt16) {
             var packet = Data(capacity: p2VideoHeaderBytes + payload.count)
             packet.append(contentsOf: [0x50, 0x32, 0x56, 0x32]) // P2V2
             packet.appendU8(1)
@@ -234,7 +211,19 @@ final class UdpVideoSender {
             packet.appendU16LE(UInt16(payload.count))
             packet.appendU16LE(flags)
             packet.append(payload)
-            packets.append(PendingPacket(frameId: id, bytes: packet, spacingUs: packetBudgetUs))
+            packet.withUnsafeBytes { raw in
+                withUnsafePointer(to: &addr) { ptr in
+                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                        let rc = sendto(fd, raw.baseAddress!, raw.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
+                        if rc >= 0 {
+                            sentPackets += 1
+                            sentBytes += UInt64(rc)
+                        } else {
+                            sendErrors += 1
+                        }
+                    }
+                }
+            }
         }
 
         while offset < frame.count {
@@ -244,98 +233,26 @@ final class UdpVideoSender {
                 guard let src = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
                 parity.withUnsafeMutableBytes { parityRaw in
                     guard let dst = parityRaw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-                    for i in 0..<n {
-                        dst[i] ^= src[offset + i]
-                    }
+                    for i in 0..<n { dst[i] ^= src[offset + i] }
                 }
             }
             var flags: UInt16 = 0
             if keyframe { flags |= p2FlagKeyframe }
             if configIncluded { flags |= p2FlagConfig }
             let payload = frame.subdata(in: offset..<(offset + n))
-            buildPacket(fragIndex: fragIndex, totalFragCount: totalFragCount, payload: payload, flags: flags)
-            if Int(fragIndex) < duplicateLeadingFragments {
-                buildPacket(fragIndex: fragIndex, totalFragCount: totalFragCount, payload: payload, flags: flags)
-            }
+            sendPacket(fragIndex: fragIndex, totalFragCount: totalFragCount, payload: payload, flags: flags)
             offset += n
             fragIndex &+= 1
         }
+
         if useFec && parityLen > 0 {
             var flags: UInt16 = p2FlagFec
             if keyframe { flags |= p2FlagKeyframe }
             if configIncluded { flags |= p2FlagConfig }
-            let fecPayload = Data(parity.prefix(parityLen))
-            buildPacket(fragIndex: fragIndex, totalFragCount: totalFragCount, payload: fecPayload, flags: flags)
-            if duplicateFecPacket {
-                buildPacket(fragIndex: fragIndex, totalFragCount: totalFragCount, payload: fecPayload, flags: flags)
-            }
+            sendPacket(fragIndex: fragIndex, totalFragCount: totalFragCount, payload: Data(parity.prefix(parityLen)), flags: flags)
         }
-        queueLock.lock()
-        pendingFrames.append(packets)
-        pendingPacketCount += packets.count
-        while pendingPacketCount > maxQueuedPackets, pendingFrames.count > 1 {
-            let droppedFrame = pendingFrames.removeFirst()
-            pendingPacketCount -= droppedFrame.count
-            droppedPackets &+= UInt64(droppedFrame.count)
-        }
-        let shouldSchedule = !pumpScheduled
-        if shouldSchedule { pumpScheduled = true }
-        queueLock.unlock()
-        if shouldSchedule {
-            worker.async { [weak self] in self?.pumpPackets() }
-        }
-        NativeStats.shared.recordFrame(frameId: id, packets: 0, bytes: 0, errors: 0)
-    }
 
-    private func pumpPackets() {
-        var localSentPackets: UInt64 = 0
-        var localSentBytes: UInt64 = 0
-        var localSendErrors: UInt64 = 0
-        var localDroppedPackets: UInt64 = 0
-        var lastFrameIdSent: UInt64 = 0
-        while true {
-            queueLock.lock()
-            if pendingFrames.isEmpty {
-                pumpScheduled = false
-                localDroppedPackets = droppedPackets
-                droppedPackets = 0
-                queueLock.unlock()
-                break
-            }
-            let framePackets = pendingFrames.removeFirst()
-            pendingPacketCount -= framePackets.count
-            queueLock.unlock()
-
-            for packet in framePackets {
-                let beforeSendUs = nowUs()
-                if nextSendDeadlineUs < beforeSendUs {
-                    nextSendDeadlineUs = beforeSendUs
-                } else if nextSendDeadlineUs > beforeSendUs {
-                    usleep(useconds_t(min<UInt64>(20_000, nextSendDeadlineUs - beforeSendUs)))
-                }
-                packet.bytes.withUnsafeBytes { raw in
-                    withUnsafePointer(to: &addr) { ptr in
-                        ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                            let rc = sendto(fd, raw.baseAddress!, raw.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-                            if rc >= 0 {
-                                localSentPackets += 1
-                                localSentBytes += UInt64(rc)
-                            } else {
-                                localSendErrors += 1
-                            }
-                        }
-                    }
-                }
-                lastFrameIdSent = packet.frameId
-                nextSendDeadlineUs &+= packet.spacingUs
-            }
-        }
-        if localSentPackets > 0 || localSendErrors > 0 || localDroppedPackets > 0 {
-            NativeStats.shared.recordTransport(frameId: lastFrameIdSent,
-                                               packets: localSentPackets,
-                                               bytes: localSentBytes,
-                                               errors: localSendErrors + localDroppedPackets)
-        }
+        NativeStats.shared.recordFrame(frameId: id, packets: sentPackets, bytes: sentBytes, errors: sendErrors)
     }
 }
 

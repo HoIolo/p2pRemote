@@ -152,48 +152,47 @@ function clampEven(value, fallback = 2) {
   return number % 2 === 0 ? number : number - 1;
 }
 
-function scaleResolution(width, height, maxLongEdge = 7680) {
+function scaleResolution(width, height, maxLongEdge = 1600) {
   const longEdge = Math.max(width, height);
   if (!longEdge || longEdge <= maxLongEdge) {
-    return { width: clampEven(width, 1920), height: clampEven(height, 1080) };
+    return { width: clampEven(width, 1600), height: clampEven(height, 900) };
   }
   const scale = maxLongEdge / longEdge;
   return {
-    width: clampEven(width * scale, 1920),
-    height: clampEven(height * scale, 1080),
+    width: clampEven(width * scale, 1600),
+    height: clampEven(height * scale, 900),
   };
 }
 
 function autoBitrateForPixels(pixels, fallbackBitrate) {
   let bitrate = fallbackBitrate;
-  if (pixels <= 1280 * 720) bitrate = Math.max(bitrate, 8_000_000);
-  else if (pixels <= 1600 * 900) bitrate = Math.max(bitrate, 10_000_000);
-  else if (pixels <= 1920 * 1080) bitrate = Math.max(bitrate, 12_000_000);
-  else if (pixels <= 1920 * 1200) bitrate = Math.max(bitrate, 14_000_000);
-  else if (pixels <= 2560 * 1440) bitrate = Math.max(bitrate, 18_000_000);
-  else bitrate = Math.max(bitrate, 24_000_000);
+  if (pixels <= 1280 * 720) bitrate = Math.max(bitrate, 6_000_000);
+  else if (pixels <= 1600 * 900) bitrate = Math.max(bitrate, 8_000_000);
+  else if (pixels <= 1920 * 1080) bitrate = Math.max(bitrate, 10_000_000);
+  else if (pixels <= 1920 * 1200) bitrate = Math.max(bitrate, 12_000_000);
+  else if (pixels <= 2560 * 1440) bitrate = Math.max(bitrate, 16_000_000);
+  else bitrate = Math.max(bitrate, 20_000_000);
   return bitrate;
 }
 
 function nativeV2DisplayOptions(device) {
   const defaults = nativeV2Status?.defaults || {};
   const display = device?.display;
-  const scaleFactor = Number(device?.scaleFactor || 1);
   if (!display?.width || !display?.height) {
-    const width = clampEven(defaults.width || 1920, 1920);
-    const height = clampEven(defaults.height || 1080, 1080);
+    const width = clampEven(defaults.width || 1600, 1600);
+    const height = clampEven(defaults.height || 900, 900);
     return {
       width,
       height,
-      bitrate: autoBitrateForPixels(width * height, defaults.bitrate || 14_000_000),
+      bitrate: autoBitrateForPixels(width * height, defaults.bitrate || 8_000_000),
     };
   }
 
-  const sourceWidth = clampEven(display.width * scaleFactor, defaults.width || 1920);
-  const sourceHeight = clampEven(display.height * scaleFactor, defaults.height || 1080);
+  const sourceWidth = clampEven(display.width, defaults.width || 1600);
+  const sourceHeight = clampEven(display.height, defaults.height || 900);
   const scaled = scaleResolution(sourceWidth, sourceHeight);
   const pixels = scaled.width * scaled.height;
-  const bitrate = autoBitrateForPixels(pixels, defaults.bitrate || 14_000_000);
+  const bitrate = autoBitrateForPixels(pixels, defaults.bitrate || 8_000_000);
 
   return {
     width: scaled.width,
