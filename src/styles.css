@@ -117,17 +117,23 @@ body.light {
   color: #202124;
 }
 
+:root {
+  --light-chrome-bg: #f7f7f5;
+  --light-chrome-border: #d8d8d5;
+  --light-sidebar-bg: #ecece9;
+  --light-workspace-bg: #f7f7f5;
+}
+
 .appFrame {
   height: 100vh;
   display: grid;
   grid-template-columns: 276px minmax(0, 1fr);
-  background: #f7f7f5;
+  background: var(--light-workspace-bg);
   overflow: hidden;
 }
 
 .sidebar {
-  background: #e9e9e7;
-  border-right: 1px solid #d0d0ce;
+  background: var(--light-sidebar-bg);
   padding: 0 14px 20px;
   overflow-y: auto;
   scrollbar-width: none;
@@ -136,10 +142,12 @@ body.light {
 
 .sidebarChrome {
   -webkit-app-region: drag;
-  height: 58px;
+  height: 66px;
   display: flex;
   align-items: center;
-  margin-bottom: 16px;
+  margin: 0 -14px 16px;
+  padding: 0 14px;
+  background: var(--light-chrome-bg);
 }
 
 .sideGroup { margin-bottom: 22px; }
@@ -233,7 +241,7 @@ body.light {
 
 .workspace {
   min-width: 0;
-  background: #fbfbfa;
+  background: var(--light-workspace-bg);
   display: grid;
   grid-template-rows: 66px minmax(0, 1fr);
   height: 100vh;
@@ -241,8 +249,8 @@ body.light {
 }
 .topbar {
   -webkit-app-region: drag;
-  height: 58px;
-  border-bottom: 1px solid #dadad8;
+  height: 66px;
+  background: var(--light-chrome-bg);
   display: flex;
   align-items: center;
   justify-content: space-between;
@@ -272,6 +280,27 @@ body[data-platform="win32"] .topbar { padding-right: 154px; }
   color: #4b4f53;
   font-size: 12px;
   font-weight: 800;
+}
+.permissionCard {
+  margin-top: 10px;
+}
+.permissionActions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+.sideMiniBtn {
+  background: #ffffff;
+  color: #202124;
+  border: 1px solid rgba(0, 0, 0, .08);
+  border-radius: 8px;
+  padding: 8px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  box-shadow: none;
+}
+.sideMiniBtn:hover {
+  background: #f2f2f0;
 }
 .sideSetting select,
 .panelSelect {
@@ -319,9 +348,9 @@ body[data-platform="win32"] .topbar { padding-right: 154px; }
   line-height: 1.45;
 }
 .iconBtn {
-  width: 30px;
-  height: 30px;
-  border-radius: 8px;
+  width: 34px;
+  height: 34px;
+  border-radius: 10px;
   padding: 0;
   display: grid;
   place-items: center;
@@ -329,7 +358,7 @@ body[data-platform="win32"] .topbar { padding-right: 154px; }
   color: #606365;
   font-weight: 500;
 }
-.iconBtn:hover:not(:disabled) { background: #eeeeec; }
+.iconBtn:hover:not(:disabled) { background: rgba(32, 33, 36, .08); }
 .iconBtn:disabled { opacity: .35; }
 .icon {
   width: 18px;

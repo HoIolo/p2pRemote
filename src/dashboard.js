@@ -12,6 +12,7 @@ const refreshDevicesBtn = $('refreshDevices');
 const refreshTopBtn = $('refreshTop');
 const openScreenSettingsBtn = $('openScreenSettings');
 const resetScreenPermissionBtn = $('resetScreenPermission');
+const macPermissionCardEl = $('macPermissionCard');
 const manualAddBtn = $('manualAdd');
 const connectionModeEl = $('connectionMode');
 const nativeV2StatusTextEl = $('nativeV2StatusText');
@@ -106,6 +107,9 @@ function connectionMode() {
 
 function updateNativeV2Status(status) {
   nativeV2Status = status || nativeV2Status;
+  if (macPermissionCardEl) {
+    macPermissionCardEl.hidden = nativeV2Status?.platform !== 'darwin';
+  }
   if (nativeV2Connecting) return;
   if (!nativeV2StatusTextEl || !nativeV2Status) return;
 
