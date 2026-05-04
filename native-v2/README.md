@@ -1,10 +1,10 @@
 ﻿# P2P Remote LAN native v2
 
-这是当前唯一保留的低延迟远程桌面链路：媒体和输入都走原生实现，Electron 只负责发现设备、配对请求和启动进程。
+这是绕开 Electron/WebRTC 的第二版低延迟链路，目标是 LAN 下比 WebRTC MVP 更低、更稳定：
 
 ```text
-macOS Host:    ScreenCaptureKit -> VideoToolbox H.264 hardware realtime -> UDP video stream by default
-Windows Client: UDP/TCP receive -> Media Foundation low-latency H.264/DXVA -> NV12 GPU shader -> D3D11 flip-model present
+macOS Host:    ScreenCaptureKit -> VideoToolbox H.264 hardware realtime -> TCP video stream by default
+Windows Client: TCP receive -> Media Foundation low-latency H.264/DXVA -> NV12 GPU shader -> D3D11 flip-model present
 Input:         Windows UDP binary input packets -> macOS CGEvent injection
 ```
 
@@ -36,10 +36,9 @@ swift build -c release
   --input-port 45001 \
   --width 1920 \
   --height 1080 \
-  --fps 60 \
-  --bitrate 18000000 \
-  --keyint 1 \
-  --transport udp
+  --fps 120 \
+  --bitrate 45000000 \
+  --transport tcp
 ```
 
 macOS 权限：
@@ -65,18 +64,18 @@ cd native-v2\win-client
   --input-port 45001 `
   --width 1920 `
   --height 1080 `
-  --fps 60 `
-  --transport udp `
+  --fps 120 `
+  --transport tcp `
   --fullscreen
 ```
 
 或直接用 ultra 脚本：
 
 ```powershell
-.\run-ultra.ps1 -HostIp 192.168.1.20 -Width 1920 -Height 1080 -Fps 60
+.\run-ultra.ps1 -HostIp 192.168.1.20 -Width 1920 -Height 1080 -Fps 120
 ```
 
-默认视频走 UDP 45000，输入走 UDP 45001。Windows 防火墙需要允许 UDP 45000 入站；如果现场网络/防火墙不方便放行，可手动切 TCP。
+默认视频走 TCP 45000，输入走 UDP 45001。若手动切到 UDP 视频，Windows 防火墙需要允许 UDP 45000 入站。
 
 ## 延迟目标和调参
 
@@ -89,8 +88,8 @@ cd native-v2\win-client
 
 低延迟策略：
 
-- 默认视频走 UDP，优先低延迟和丢旧帧；如果 Windows 防火墙拦截 UDP 入站导致黑屏，再手动切 TCP。
-- receiver / decoder / renderer 队列只保留极少帧，渲染端始终取最新帧。
+- 默认视频走 TCP，先保证 Windows 端不会因为入站 UDP 被防火墙拦住而黑屏；需要极限低延迟时可手动切 UDP。
+- receiver 队列只保留最新完整帧。
 - VideoToolbox：Realtime、禁用 B 帧/重排序、1 秒关键帧。
 - Media Foundation：启用 decoder low-latency mode，并给 MFT 传和 renderer 相同的 D3D11 device manager 以争取 DXVA。
 - Windows present：优先从 decoder 的 `IMFDXGIBuffer` 直接拿 D3D11 texture 渲染；如果 decoder surface 不能直接绑定 SRV，则 GPU copy 到 NV12 shader texture；最后才退回 CPU NV12 upload。flip-discard swap chain，支持 tearing 时用 `DXGI_PRESENT_ALLOW_TEARING`，`Present(0, ...)` 不等 vsync。
@@ -99,7 +98,7 @@ cd native-v2\win-client
 
 ## 后续要继续压延迟的点
 
-1. 在真实机器上确认 H.264 decoder 是否持续提供可直接 SRV 绑定的 DXGI surface；若只能 copy，则继续做 decoder output allocator / texture pool。
+1. 在真实机器上确认 H.264 decoder 是否稳定提供可直接 SRV 绑定的 DXGI surface；若只能 copy，则继续做 decoder output allocator / texture pool。
 2. Video packet 加 pacing 和 sequence loss stats，用 ETW / signpost 记录端到端时间。
 3. macOS host 改成 `.app`，加菜单栏 UI、自动发现客户端、PIN 配对。
 4. H.265/HEVC 路径：Apple Silicon + 现代 Windows GPU 通常能进一步压码率，但兼容性要单独做。

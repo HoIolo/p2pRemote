@@ -30,7 +30,6 @@
 #include <vector>
 #include <algorithm>
 #include <cstring>
-#include <iterator>
 #include <memory>
 #include <unordered_map>
 
@@ -41,8 +40,8 @@ using Microsoft::WRL::ComPtr;
 static constexpr int kMaxUdp = 1500;
 static constexpr int kVideoHeaderBytes = sizeof(P2VideoHeader);
 static constexpr int kMaxVideoFragmentPayload = 1440 - kVideoHeaderBytes;
-static constexpr size_t kMinEncodedQueueDepth = 2;
-static constexpr size_t kMaxEncodedQueueDepth = 12;
+static constexpr size_t kMinEncodedQueueDepth = 18;
+static constexpr size_t kMaxEncodedQueueDepth = 120;
 
 struct Config {
   std::wstring hostIp = L"127.0.0.1";
@@ -108,12 +107,6 @@ struct DecodedFrame {
   Nv12Frame nv12;
 };
 
-enum class DecodeStatus {
-  Output,
-  NeedMoreInput,
-  Error,
-};
-
 static Config g_cfg;
 static HWND g_hwnd = nullptr;
 static HWND g_toolbarHwnd = nullptr;
@@ -148,7 +141,6 @@ static std::atomic<uint64_t> g_gpuRenderFails{0};
 static std::atomic<uint64_t> g_lastPacketQpc{0};
 static std::atomic<uint64_t> g_lastCompleteQpc{0};
 static std::atomic<bool> g_decoderPrimed{false};
-static std::atomic<bool> g_decoderHasSyncFrame{false};
 static std::atomic<bool> g_waitingForKeyframe{false};
 static std::atomic<uint64_t> g_lastKeyframeRequestQpc{0};
 static std::atomic<uint64_t> g_keyframeRequests{0};
@@ -210,7 +202,6 @@ static NativeUiStats g_uiStats;
 
 static size_t EncodedQueueDepthTarget();
 static void EnterVideoRecovery(const wchar_t* reason, bool reduceBitrate = true);
-static void ResetVideoPipelineForNewStream(const wchar_t* reason);
 static void SendInputPacket(uint8_t kind, float x, float y, int32_t dx, int32_t dy, uint16_t button, uint16_t keyCode);
 static void SendVideoBitrateControl(int bitrate, const wchar_t* reason);
 
@@ -314,14 +305,7 @@ static void PushEncoded(EncodedFrame&& f) {
   {
     std::lock_guard lk(g_encodedMu);
     const size_t queueDepthTarget = EncodedQueueDepthTarget();
-
-    if (f.keyframe) {
-      while (!g_encodedQueue.empty()) {
-        g_encodedQueue.pop_front();
-        RecordClientFrameDrop();
-      }
-    }
-
+    const size_t protectionThreshold = std::max<size_t>(queueDepthTarget * 9 / 10, queueDepthTarget > 2 ? queueDepthTarget - 2 : queueDepthTarget);
     if (g_waitingForKeyframe.load(std::memory_order_relaxed)) {
       if (!f.keyframe) {
         RecordClientFrameDrop();
@@ -330,31 +314,23 @@ static void PushEncoded(EncodedFrame&& f) {
       g_waitingForKeyframe.store(false, std::memory_order_relaxed);
     }
 
-    // Before the first sync frame, delta frames cannot initialize H.264 state.
-    // Once a keyframe has been accepted, keep feeding following deltas even if
-    // Media Foundation needs a few inputs before it outputs the first surface.
-    if (!g_decoderPrimed.load(std::memory_order_relaxed) &&
-        !g_decoderHasSyncFrame.load(std::memory_order_relaxed) &&
-        !f.keyframe) {
+    // Until the decoder has successfully produced a frame, keep the newest
+    // keyframe around and drop delta frames that would otherwise starve sync.
+    if (!g_decoderPrimed.load(std::memory_order_relaxed) && !f.keyframe) {
       RecordClientFrameDrop();
       return;
     }
-    if (f.keyframe) {
-      g_decoderHasSyncFrame.store(true, std::memory_order_relaxed);
+
+    if (!g_encodedQueue.empty()) {
+      const EncodedFrame& pending = g_encodedQueue.back();
+      if (pending.keyframe && !f.keyframe && g_encodedQueue.size() >= protectionThreshold) {
+        RecordClientFrameDrop();
+        return;
+      }
     }
 
     while (g_encodedQueue.size() >= queueDepthTarget) {
-      if (!g_decoderPrimed.load(std::memory_order_relaxed) &&
-          !g_encodedQueue.empty() &&
-          g_encodedQueue.front().keyframe) {
-        if (g_encodedQueue.size() == 1) {
-          RecordClientFrameDrop();
-          return;
-        }
-        g_encodedQueue.erase(std::next(g_encodedQueue.begin()));
-      } else {
-        g_encodedQueue.pop_front();
-      }
+      g_encodedQueue.pop_front();
       RecordClientFrameDrop();
     }
     g_encodedQueue.emplace_back(std::move(f));
@@ -478,7 +454,7 @@ class D3DRenderer {
 
   void WaitForPresentReady() {
     if (frameLatencyWaitable_) {
-      WaitForSingleObject(frameLatencyWaitable_, 1);
+      WaitForSingleObject(frameLatencyWaitable_, 8);
     }
   }
 
@@ -750,11 +726,11 @@ static int AutoBitrateForPixels(int width, int height, int fallback) {
 
 static size_t EncodedQueueDepthTarget() {
   const int fps = std::max(30, g_activeVideoFps.load(std::memory_order_relaxed));
-  size_t target = static_cast<size_t>(std::clamp((fps + 59) / 60 + 1, 2, 5));
+  size_t target = static_cast<size_t>(std::clamp((fps + 3) / 4, 8, 26));
   const uint64_t lastProfileApply = g_lastProfileApplyQpc.load(std::memory_order_relaxed);
   const uint64_t now = QpcNow();
-  if (lastProfileApply && QpcDeltaUs(lastProfileApply, now) < 800'000) {
-    target += 2;
+  if (lastProfileApply && QpcDeltaUs(lastProfileApply, now) < 2'500'000) {
+    target += 12;
   }
   target = std::max(kMinEncodedQueueDepth, target);
   target = std::min(kMaxEncodedQueueDepth, target);
@@ -763,7 +739,8 @@ static size_t EncodedQueueDepthTarget() {
 }
 
 static size_t DecodedQueueDepthTarget() {
-  size_t target = 1;
+  const int fps = std::max(30, g_activeVideoFps.load(std::memory_order_relaxed));
+  size_t target = static_cast<size_t>(std::clamp((fps + 14) / 15, 2, 6));
   g_decodedQueueTargetNow.store(static_cast<uint32_t>(target), std::memory_order_relaxed);
   return target;
 }
@@ -1585,7 +1562,7 @@ static bool RequestProfileApply(const VideoProfile& requestedProfile, const wcha
   g_videoProfileGeneration.fetch_add(1, std::memory_order_relaxed);
   Log(L"profile apply requested: %dx%d@%d bitrate=%d (%s)",
       profile.width, profile.height, profile.fps, profile.bitrate, reason ? reason : L"manual");
-  ResetVideoPipelineForNewStream(L"profile changed");
+  EnterVideoRecovery(L"profile changed", false);
   HideNativePopups();
   if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
   if (g_toolbarHwnd) InvalidateRect(g_toolbarHwnd, nullptr, FALSE);
@@ -1712,7 +1689,7 @@ class VideoReceiver {
 
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) return;
-    int rcvbuf = 1 * 1024 * 1024;
+    int rcvbuf = 8 * 1024 * 1024;
     setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
     DWORD timeoutMs = 100;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
@@ -1765,13 +1742,13 @@ class VideoReceiver {
       g_bytesRx.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
       g_lastPacketQpc.store(now, std::memory_order_relaxed);
 
-      if (newestFrameId && h->frameId + 8 < newestFrameId) continue;
+      if (newestFrameId && h->frameId + 120 < newestFrameId) continue;
       if (h->frameId > newestFrameId) newestFrameId = h->frameId;
 
-      if (partials.size() > 8) {
-        uint64_t keepFrom = newestFrameId > 8 ? newestFrameId - 8 : 0;
+      if (partials.size() > 24) {
+        uint64_t keepFrom = newestFrameId > 24 ? newestFrameId - 24 : 0;
         for (auto it = partials.begin(); it != partials.end();) {
-          if (it->first < keepFrom || QpcDeltaUs(it->second.firstQpc, now) > 150'000) {
+          if (it->first < keepFrom || QpcDeltaUs(it->second.firstQpc, now) > 750'000) {
             it = partials.erase(it);
             RecordNetworkFrameDrop();
           } else {
@@ -1884,7 +1861,7 @@ class TcpVideoReceiver {
 
       int one = 1;
       setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
-      int rcvbuf = 512 * 1024;
+      int rcvbuf = 8 * 1024 * 1024;
       setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
 
       sockaddr_in addr{};
@@ -1901,8 +1878,6 @@ class TcpVideoReceiver {
         Sleep(200);
         continue;
       }
-
-      ResetVideoPipelineForNewStream(L"tcp connected");
 
       while (g_running.load()) {
         P2TcpVideoHeader h{};
@@ -2013,10 +1988,10 @@ class MfDecoder {
     return SetNv12OutputType();
   }
 
-  DecodeStatus Decode(const EncodedFrame& encoded, DecodedFrame& decoded) {
+  bool Decode(const EncodedFrame& encoded, DecodedFrame& decoded) {
     ComPtr<IMFMediaBuffer> buf;
     HRESULT hr = MFCreateMemoryBuffer(static_cast<DWORD>(encoded.bytes.size()), &buf);
-    if (FAILED(hr)) return DecodeStatus::Error;
+    if (FAILED(hr)) return false;
     BYTE* dst = nullptr; DWORD maxLen = 0;
     buf->Lock(&dst, &maxLen, nullptr);
     memcpy(dst, encoded.bytes.data(), encoded.bytes.size());
@@ -2031,10 +2006,10 @@ class MfDecoder {
 
     hr = mft_->ProcessInput(0, sample.Get(), 0);
     if (hr == MF_E_NOTACCEPTING) {
-      if (DrainOne(decoded, encoded)) return DecodeStatus::Output;
+      DrainOne(decoded, encoded);
       hr = mft_->ProcessInput(0, sample.Get(), 0);
     }
-    if (FAILED(hr)) return DecodeStatus::Error;
+    if (FAILED(hr)) return false;
 
     bool gotFrame = false;
     DecodedFrame last;
@@ -2046,9 +2021,9 @@ class MfDecoder {
     }
     if (gotFrame) {
       decoded = std::move(last);
-      return DecodeStatus::Output;
+      return true;
     }
-    return DecodeStatus::NeedMoreInput;
+    return false;
   }
 
  private:
@@ -2267,7 +2242,6 @@ static void DecoderThread() {
           decoder = std::move(rebuilt);
           appliedProfileGeneration = generation;
           g_decoderPrimed.store(false, std::memory_order_relaxed);
-          g_decoderHasSyncFrame.store(false, std::memory_order_relaxed);
           Log(L"decoder/render pipeline reconfigured: %dx%d@%d bitrate=%d",
               activeProfile.width, activeProfile.height, activeProfile.fps, activeProfile.bitrate);
         } else {
@@ -2290,12 +2264,10 @@ static void DecoderThread() {
       g_encodedQueueDepthNow.store(static_cast<uint32_t>(g_encodedQueue.size()), std::memory_order_relaxed);
     }
     DecodedFrame frame;
-    const DecodeStatus status = decoder->Decode(encoded, frame);
-    if (status == DecodeStatus::Output) {
+    if (decoder->Decode(encoded, frame)) {
       g_decoderPrimed.store(true, std::memory_order_relaxed);
-      g_decoderHasSyncFrame.store(true, std::memory_order_relaxed);
       PushDecoded(std::move(frame));
-    } else if (status == DecodeStatus::Error) {
+    } else {
       g_decodeFails.fetch_add(1, std::memory_order_relaxed);
       EnterVideoRecovery(L"decode failed");
     }
@@ -2308,6 +2280,7 @@ static void RenderThread() {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
   SetThreadDescription(GetCurrentThread(), L"P2P video present");
   uint32_t gpuPresentFailStreak = 0;
+  uint64_t lastPresentQpcLocal = 0;
 
   while (g_running.load()) {
     DecodedFrame frame;
@@ -2325,6 +2298,15 @@ static void RenderThread() {
 
     bool presented = false;
     if (g_renderer) {
+      const int fps = std::max(30, g_activeVideoFps.load(std::memory_order_relaxed));
+      const uint64_t frameIntervalUs = 1'000'000ull / static_cast<uint64_t>(fps);
+      const uint64_t nowBeforePresent = QpcNow();
+      if (lastPresentQpcLocal) {
+        const uint64_t sinceLastPresentUs = QpcDeltaUs(lastPresentQpcLocal, nowBeforePresent);
+        if (sinceLastPresentUs + 2'000 < frameIntervalUs) {
+          Sleep(static_cast<DWORD>(std::max<uint64_t>(0, (frameIntervalUs - sinceLastPresentUs - 1'000) / 1000)));
+        }
+      }
       g_renderer->WaitForPresentReady();
       if (frame.gpu) {
         presented = g_renderer->Render(frame.dxgi);
@@ -2341,6 +2323,7 @@ static void RenderThread() {
     }
 
     if (presented) {
+      lastPresentQpcLocal = QpcNow();
       g_framesPresented.fetch_add(1, std::memory_order_relaxed);
       if (frame.gpu) g_gpuFrames.fetch_add(1, std::memory_order_relaxed);
       else g_cpuFrames.fetch_add(1, std::memory_order_relaxed);
@@ -2425,13 +2408,11 @@ static void SendVideoBitrateControl(int bitrate, const wchar_t* reason) {
 static void EnterVideoRecovery(const wchar_t* reason, bool reduceBitrate) {
   g_waitingForKeyframe.store(true, std::memory_order_relaxed);
   g_decoderPrimed.store(false, std::memory_order_relaxed);
-  g_decoderHasSyncFrame.store(false, std::memory_order_relaxed);
   {
     std::lock_guard lk(g_encodedMu);
     if (!g_encodedQueue.empty()) {
       RecordClientFrameDrop(static_cast<uint64_t>(g_encodedQueue.size()));
       g_encodedQueue.clear();
-      g_encodedQueueDepthNow.store(0, std::memory_order_relaxed);
     }
   }
   {
@@ -2443,6 +2424,7 @@ static void EnterVideoRecovery(const wchar_t* reason, bool reduceBitrate) {
     }
   }
 
+  if (!g_cfg.udpVideo) return;
   const uint64_t now = QpcNow();
   const uint64_t last = g_lastKeyframeRequestQpc.load(std::memory_order_relaxed);
   if (last && QpcDeltaUs(last, now) < 120'000) return;
@@ -2457,29 +2439,6 @@ static void EnterVideoRecovery(const wchar_t* reason, bool reduceBitrate) {
   }
   SendInputPacket(P2_INPUT_REQUEST_KEYFRAME, 0, 0, 0, 0, 0, 0);
   Log(L"requested keyframe recovery: %s", reason ? reason : L"unknown");
-}
-
-static void ResetVideoPipelineForNewStream(const wchar_t* reason) {
-  g_waitingForKeyframe.store(false, std::memory_order_relaxed);
-  g_decoderPrimed.store(false, std::memory_order_relaxed);
-  g_decoderHasSyncFrame.store(false, std::memory_order_relaxed);
-  {
-    std::lock_guard lk(g_encodedMu);
-    if (!g_encodedQueue.empty()) {
-      RecordClientFrameDrop(static_cast<uint64_t>(g_encodedQueue.size()));
-      g_encodedQueue.clear();
-      g_encodedQueueDepthNow.store(0, std::memory_order_relaxed);
-    }
-  }
-  {
-    std::lock_guard lk(g_decodedMu);
-    if (!g_decodedQueue.empty()) {
-      g_renderFramesDropped.fetch_add(static_cast<uint64_t>(g_decodedQueue.size()), std::memory_order_relaxed);
-      g_decodedQueue.clear();
-      g_decodedQueueDepthNow.store(0, std::memory_order_relaxed);
-    }
-  }
-  Log(L"video pipeline reset: %s", reason ? reason : L"new stream");
 }
 
 static void NormalizedPoint(HWND hwnd, LPARAM lp, float& x, float& y) {
@@ -2510,14 +2469,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       uint64_t packets = g_packetsRx.load(std::memory_order_relaxed);
       uint64_t bytes = g_bytesRx.load(std::memory_order_relaxed);
       double seconds = double(QpcDeltaUs(lastQpc, now)) / 1'000'000.0;
-      const uint64_t presentedDelta = frames >= lastFrames ? (frames - lastFrames) : frames;
-      const uint64_t completeDelta = complete >= lastComplete ? (complete - lastComplete) : complete;
-      const uint64_t packetDelta = packets >= lastPackets ? (packets - lastPackets) : packets;
-      const uint64_t byteDelta = bytes >= lastBytes ? (bytes - lastBytes) : bytes;
-      double fps = seconds > 0.001 ? double(presentedDelta) / seconds : 0.0;
-      double cfps = seconds > 0.001 ? double(completeDelta) / seconds : 0.0;
-      double pps = seconds > 0.001 ? double(packetDelta) / seconds : 0.0;
-      double mbps = seconds > 0.001 ? double(byteDelta) * 8.0 / seconds / 1'000'000.0 : 0.0;
+      double fps = seconds > 0.001 ? double(frames - lastFrames) / seconds : 0.0;
+      double cfps = seconds > 0.001 ? double(complete - lastComplete) / seconds : 0.0;
+      double pps = seconds > 0.001 ? double(packets - lastPackets) / seconds : 0.0;
+      double mbps = seconds > 0.001 ? double(bytes - lastBytes) * 8.0 / seconds / 1'000'000.0 : 0.0;
       lastFrames = frames;
       lastComplete = complete;
       lastPackets = packets;
@@ -2555,7 +2510,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       stats.renderDropped = g_renderFramesDropped.load(std::memory_order_relaxed);
       const uint64_t clientDroppedDelta = clientDropped >= lastClientDropped ? (clientDropped - lastClientDropped) : clientDropped;
       const uint64_t networkDroppedDelta = networkDropped >= lastNetworkDropped ? (networkDropped - lastNetworkDropped) : networkDropped;
-      const uint64_t clientKnownFrames = presentedDelta + clientDroppedDelta;
+      const uint64_t completeDelta = complete >= lastComplete ? (complete - lastComplete) : complete;
+      const uint64_t clientKnownFrames = completeDelta + clientDroppedDelta;
       const uint64_t networkKnownFrames = completeDelta + networkDroppedDelta;
       stats.networkDropPct = networkKnownFrames ? (double(networkDroppedDelta) * 100.0 / double(networkKnownFrames)) : 0.0;
       stats.queueDropPct = clientKnownFrames ? (double(clientDroppedDelta) * 100.0 / double(clientKnownFrames)) : 0.0;

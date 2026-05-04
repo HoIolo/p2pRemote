@@ -10,6 +10,7 @@
     "host": "electron . -- --host",
     "client": "electron . -- --client",
     "start": "electron .",
+    "build:mac-helper": "cd native/macos-input-helper && swift build -c release --arch arm64 --arch x86_64",
     "dist:win": "npm run stage:native-v2 && electron-builder --win",
     "dist:mac": "npm run stage:native-v2 && electron-builder --mac",
     "pack:win": "npm run stage:native-v2 && electron-builder --win --dir",
@@ -87,6 +88,12 @@
             "x64",
             "arm64"
           ]
+        }
+      ],
+      "extraResources": [
+        {
+          "from": "native/macos-input-helper/.build/apple/Products/Release/macos-input-helper",
+          "to": "macos-input-helper"
         }
       ],
       "extendInfo": {

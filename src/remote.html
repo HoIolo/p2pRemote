@@ -1,0 +1,37 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>P2P Remote LAN - Remote</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body class="remoteBody">
+  <main class="remoteShell">
+    <div id="topRevealZone" class="topRevealZone" aria-hidden="true"></div>
+    <header id="remoteTopbar" class="remoteTopbar">
+      <div class="remoteTitle">
+        <span id="statusDot" class="dot"></span>
+        <strong id="remoteName">&#36828;&#31243;&#35774;&#22791;</strong>
+        <span id="statusText">&#36830;&#25509;&#20013;</span>
+      </div>
+      <div class="remoteActions">
+        <button id="settings" class="secondary iconText" aria-expanded="false"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-more"></use></svg><span>&#35774;&#32622;</span></button>
+        <button id="reconnect" class="secondary iconText"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-reconnect"></use></svg><span>&#37325;&#36830;</span></button>
+        <button id="fullscreen" class="secondary iconText"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-fullscreen"></use></svg><span>&#20840;&#23631;</span></button>
+      </div>
+      <div id="settingsMenu" class="settingsMenu" hidden>
+        <button id="toggleLog" class="settingsItem" type="button"><span>&#26174;&#31034;&#36830;&#25509;&#26085;&#24535;</span><b id="logState">&#20851;&#38381;</b></button>
+      </div>
+    </header>
+
+    <section class="remoteStage">
+      <video id="remoteVideo" autoplay playsinline muted tabindex="0"></video>
+      <div id="overlay" class="remoteOverlay">&#27491;&#22312;&#36830;&#25509;&#35270;&#39057;&#27969;</div>
+    </section>
+
+    <pre id="log" class="remoteLog" hidden></pre>
+  </main>
+  <script src="remote.js"></script>
+</body>
+</html>

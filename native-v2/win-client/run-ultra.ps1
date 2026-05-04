@@ -4,11 +4,11 @@
   [ValidateSet('darwin','win32','linux','unknown')][string]$HostPlatform = 'unknown',
   [int]$Width = 1920,
   [int]$Height = 1080,
-  [int]$Fps = 60,
-  [int]$Bitrate = 18000000,
+  [int]$Fps = 120,
+  [int]$Bitrate = 20000000,
   [int]$VideoPort = 45000,
   [int]$InputPort = 45001,
-  [ValidateSet('tcp','udp')][string]$Transport = 'udp',
+  [ValidateSet('tcp','udp')][string]$Transport = 'tcp',
   [switch]$NoFullscreen
 )
 $ErrorActionPreference = 'Stop'
