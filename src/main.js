@@ -4,8 +4,6 @@ const {
   ipcMain,
   screen,
   dialog,
-  desktopCapturer,
-  session,
   systemPreferences,
   shell,
 } = require('electron');
@@ -16,16 +14,11 @@ const os = require('os');
 const path = require('path');
 const WebSocket = require('ws');
 const { execFile, spawn } = require('child_process');
-const { injectInput } = require('./injector');
 
-// Latency-oriented Chromium defaults. This is a LAN-only consent-based app;
-// exposing host candidates makes WebRTC direct LAN pairing more reliable.
+// Native v2 owns the media/input hot path. Keep Chromium timers responsive for the dashboard.
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
 app.commandLine.appendSwitch('disable-background-timer-throttling');
 app.commandLine.appendSwitch('disable-renderer-backgrounding');
-app.commandLine.appendSwitch('disable-features', 'WebRtcHideLocalIpsWithMdns');
-app.commandLine.appendSwitch('force-webrtc-ip-handling-policy', 'default_public_and_private_interfaces');
-app.commandLine.appendSwitch('enable-features', 'WebRtcAllowInputVolumeAdjustment');
 
 function resolveRole() {
   if (process.argv.includes('--host')) return 'host';
@@ -52,10 +45,7 @@ let pruneTimer = null;
 let deviceId = null;
 const clients = new Map();
 const devices = new Map();
-const remoteConfigs = new Map();
 const devicePreviews = new Map();
-let signalRendererReady = false;
-const pendingSignalMessages = [];
 let nativeV2ClientProcess = null;
 let nativeV2HostProcess = null;
 let nativeV2ClientLastOptions = null;
@@ -86,24 +76,6 @@ function sendToMainWindow(channel, payload) {
   return sendToWindow(mainWindow(), channel, payload);
 }
 
-function sendSignalToRenderer(payload) {
-  if (!signalRendererReady) {
-    pendingSignalMessages.push(payload);
-    sendToMainWindow('host-log', {
-      level: 'debug',
-      message: `queued signal ${payload.message?.type || 'unknown'} from ${payload.clientId?.slice?.(0, 8) || 'unknown'} until renderer is ready`,
-    });
-    return false;
-  }
-  return sendToMainWindow('signal-message', payload);
-}
-
-function markSignalRendererReady() {
-  signalRendererReady = true;
-  while (pendingSignalMessages.length) {
-    sendToMainWindow('signal-message', pendingSignalMessages.shift());
-  }
-}
 
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 if (!gotSingleInstanceLock) app.quit();
@@ -283,20 +255,6 @@ function createWindow(file, options = {}) {
   return browserWindow;
 }
 
-function createRemoteWindow(device) {
-  const remoteWindow = createWindow('remote.html', {
-    width: 1280,
-    height: 820,
-    title: `${device.name || device.address} - P2P Remote LAN`,
-    titleBarHeight: 54,
-  });
-  const webContentsId = remoteWindow.webContents.id;
-  remoteConfigs.set(webContentsId, serializeDevice(device));
-  remoteWindow.once('closed', () => {
-    remoteConfigs.delete(webContentsId);
-  });
-  return remoteWindow;
-}
 
 function findFirstExistingPath(candidates) {
   return candidates.find((candidate) => {
@@ -324,6 +282,35 @@ function nativeV2MacHostCandidates() {
     path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'arm64-apple-macosx', 'release', 'p2p-native-mac-host'),
     path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'x86_64-apple-macosx', 'release', 'p2p-native-mac-host'),
   ];
+}
+
+function nativeV2GStreamerRootCandidates() {
+  if (process.platform !== 'win32') return [];
+  const userProfile = process.env.USERPROFILE || os.homedir?.() || '';
+  return [
+    process.env.GSTREAMER_1_0_ROOT_MSVC_X86_64,
+    process.env.GSTREAMER_1_0_ROOT_MINGW_X86_64,
+    path.join(userProfile, 'gstreamer-sdk', '1.0', 'msvc_x86_64'),
+    'C:\\gstreamer\\1.0\\msvc_x86_64',
+    'C:\\gstreamer\\1.0\\mingw_x86_64',
+  ].filter(Boolean);
+}
+
+function nativeV2GStreamerEnv() {
+  const root = findFirstExistingPath(nativeV2GStreamerRootCandidates());
+  if (!root) return { env: process.env, root: null };
+  const bin = path.join(root, 'bin');
+  const libPkgConfig = path.join(root, 'lib', 'pkgconfig');
+  return {
+    root,
+    env: {
+      ...process.env,
+      GSTREAMER_1_0_ROOT_MSVC_X86_64: root,
+      PKG_CONFIG: path.join(bin, 'pkg-config.exe'),
+      PKG_CONFIG_PATH: libPkgConfig,
+      PATH: `${bin}${path.delimiter}${process.env.PATH || ''}`,
+    },
+  };
 }
 
 function nativeV2ClientProfilePath() {
@@ -365,6 +352,7 @@ function nativeV2StatusPayload() {
       path: findFirstExistingPath(nativeV2WinClientCandidates()),
       running: Boolean(nativeV2ClientProcess && !nativeV2ClientProcess.killed),
       pid: nativeV2ClientProcess?.pid || null,
+      gstreamerRoot: nativeV2GStreamerEnv().root,
     },
     macHost: {
       available: Boolean(findFirstExistingPath(nativeV2MacHostCandidates())),
@@ -379,7 +367,7 @@ function nativeV2StatusPayload() {
       height: Number(savedClientProfile.height) || 1080,
       fps: Number(savedClientProfile.fps) || 60,
       bitrate: Number(savedClientProfile.bitrate) || 14_000_000,
-      keyint: 6,
+      keyint: 1,
       transport: 'udp',
     },
   };
@@ -477,7 +465,7 @@ function startNativeV2Client(options = {}) {
   const height = normalizeNativeV2Number(options.height, 1080, 360, 4320);
   const fps = normalizeNativeV2Number(options.fps, 60, 30, 240);
   const bitrate = normalizeNativeV2Number(options.bitrate, 14_000_000, 0, 200_000_000);
-  const transport = options.transport === 'tcp' ? 'tcp' : 'udp';
+  const transport = 'udp';
   const profileFile = String(options.profileFile || nativeV2ClientProfilePath());
   writeNativeV2ClientProfile(profileFile, { width, height, fps, bitrate });
   const args = [
@@ -510,8 +498,14 @@ function startNativeV2Client(options = {}) {
     profileFile,
   };
 
+  const gstEnv = nativeV2GStreamerEnv();
+  if (!gstEnv.root) {
+    throw new Error('GStreamer runtime not found. Set GSTREAMER_1_0_ROOT_MSVC_X86_64 or install the bundled SDK before starting the Windows client.');
+  }
+
   nativeV2ClientProcess = spawn(exePath, args, {
     cwd: path.dirname(exePath),
+    env: gstEnv.env,
     windowsHide: false,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -520,7 +514,7 @@ function startNativeV2Client(options = {}) {
   const pid = nativeV2ClientProcess.pid;
   sendToMainWindow('host-log', {
     level: 'info',
-    message: `native-v2 client started pid=${pid} host=${options.hostIp}:${videoPort} transport=${transport}`,
+    message: `native-v2 client started pid=${pid} host=${options.hostIp}:${videoPort} transport=${transport} gstreamer=${gstEnv.root}`,
   });
 
   proc.stdout?.on('data', (chunk) => {
@@ -761,57 +755,6 @@ function getScreenCaptureStatus() {
   }
 }
 
-function registerDisplayMediaHandler() {
-  const preferSystemPicker = process.platform === 'darwin' && process.env.P2P_REMOTE_FORCE_CUSTOM_PICKER !== '1';
-  session.defaultSession.setDisplayMediaRequestHandler(async (request, callback) => {
-    try {
-      if (!request.videoRequested) {
-        callback({});
-        return;
-      }
-
-      const sources = await desktopCapturer.getSources({
-        types: ['screen'],
-        thumbnailSize: { width: 1, height: 1 },
-      });
-      const primaryDisplayId = String(screen.getPrimaryDisplay().id);
-      const primarySource = sources.find((source) => source.display_id === primaryDisplayId);
-      const source = primarySource || sources[0];
-
-      if (!source) {
-        sendToMainWindow('host-log', {
-          level: 'error',
-          message: `no screen capture source found; macOS screen permission=${getScreenCaptureStatus()}`,
-        });
-        callback({});
-        return;
-      }
-
-      sendToMainWindow('host-log', {
-        level: 'info',
-        message: `screen source selected: ${source.name || source.id}`,
-      });
-      callback({ video: source, audio: false });
-    } catch (err) {
-      sendToMainWindow('host-log', {
-        level: 'error',
-        message: `screen source selection failed: ${err && err.message ? err.message : String(err)}; macOS screen permission=${getScreenCaptureStatus()}`,
-      });
-      callback({});
-    }
-  }, {
-    // On current macOS builds, the system picker is markedly more reliable than
-    // injecting a DesktopCapturer source directly. Keep our handler as a
-    // fallback for platforms/versions where the picker is unavailable, and
-    // allow forcing the old behavior via env for debugging.
-    useSystemPicker: preferSystemPicker,
-  });
-
-  sendToMainWindow('host-log', {
-    level: 'info',
-    message: `display media mode=${preferSystemPicker ? 'system-picker' : 'custom-source-handler'} platform=${process.platform}`,
-  });
-}
 
 function startSignalServer() {
   if (wss) return;
@@ -851,7 +794,6 @@ function startSignalServer() {
         clearTimeout(helloTimer);
         clients.set(clientId, socket);
         socket.send(JSON.stringify({ type: 'hello-ok', clientId }));
-        sendToMainWindow('client-connected', { clientId, remoteAddress });
         sendToMainWindow('host-log', { level: 'info', message: `paired client ${clientId.slice(0, 8)} from ${remoteAddress}` });
         return;
       }
@@ -873,15 +815,15 @@ function startSignalServer() {
         return;
       }
 
-      // Relay WebRTC offer/ICE from paired client to the macOS host renderer.
-      sendToMainWindow('host-log', { level: 'debug', message: `signal ${msg.type || 'unknown'} from ${clientId.slice(0, 8)}` });
-      sendSignalToRenderer({ clientId, message: msg });
+      sendToMainWindow('host-log', { level: 'debug', message: `ignored unsupported message ${msg.type || 'unknown'} from ${clientId.slice(0, 8)}` });
+      if (socket.readyState === WebSocket.OPEN) {
+        socket.send(JSON.stringify({ type: 'error', error: `unsupported message type: ${msg.type || 'unknown'}` }));
+      }
     });
 
     socket.on('close', (code, reason) => {
       clearTimeout(helloTimer);
       clients.delete(clientId);
-      sendToMainWindow('client-disconnected', { clientId, remoteAddress });
       sendToMainWindow('host-log', { level: 'info', message: `client ${clientId.slice(0, 8)} disconnected code=${code} reason=${reason || ''}` });
     });
   });
@@ -934,33 +876,17 @@ function startDiscovery() {
 }
 
 async function startHost() {
-  signalRendererReady = false;
-  pendingSignalMessages.length = 0;
-  win = createWindow('host.html', { title: 'P2P Remote LAN - macOS Host', frame: true });
+  win = createWindow('dashboard.html', { title: 'P2P Remote LAN - macOS Host' });
   startSignalServer();
   startDiscovery();
 }
 
 async function startDashboard() {
-  signalRendererReady = false;
-  pendingSignalMessages.length = 0;
   win = createWindow('dashboard.html', { title: 'P2P Remote LAN' });
   startSignalServer();
   startDiscovery();
 }
 
-ipcMain.handle('host-info', () => {
-  const primary = screen.getPrimaryDisplay();
-  return {
-    role: ROLE,
-    port: SIGNAL_PORT,
-    pin: PIN,
-    addresses: lanAddresses(),
-    display: primary.bounds,
-    scaleFactor: primary.scaleFactor,
-    platform: process.platform,
-  };
-});
 
 ipcMain.handle('app-info', () => {
   const primary = screen.getPrimaryDisplay();
@@ -989,17 +915,6 @@ ipcMain.handle('refresh-devices', () => {
   return true;
 });
 
-ipcMain.handle('open-remote-window', (_event, device) => {
-  if (!device || !device.address || !device.port || !device.pin) {
-    throw new Error('Device is missing connection details');
-  }
-  createRemoteWindow(device);
-  return true;
-});
-
-ipcMain.handle('remote-config', (event) => {
-  return remoteConfigs.get(event.sender.id) || null;
-});
 
 ipcMain.handle('native-v2-status', () => nativeV2StatusPayload());
 
@@ -1073,35 +988,8 @@ ipcMain.handle('reset-screen-capture-permission', async () => {
   return true;
 });
 
-ipcMain.on('signal-send', (_event, payload) => {
-  if (!payload || !payload.clientId || !payload.message) return;
-  const client = clients.get(payload.clientId);
-  if (client && client.readyState === WebSocket.OPEN) {
-    client.send(JSON.stringify(payload.message));
-  }
-});
-
-ipcMain.on('input-event', async (_event, event) => {
-  try {
-    const bounds = screen.getPrimaryDisplay().bounds;
-    await injectInput(event, bounds);
-  } catch (err) {
-    sendToMainWindow('host-log', {
-      level: 'error',
-      message: `input injection failed: ${err && err.message ? err.message : String(err)}`,
-    });
-  }
-});
-
-
-ipcMain.on('host-renderer-ready', () => {
-  markSignalRendererReady();
-  sendToMainWindow('host-log', { level: 'debug', message: 'host renderer ready' });
-});
 
 app.whenReady().then(async () => {
-  registerDisplayMediaHandler();
-
   if (ROLE === 'host') await startHost();
   else await startDashboard();
 
