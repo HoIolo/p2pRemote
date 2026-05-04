@@ -9,9 +9,14 @@ let maxVideoFragmentPayload = maxUdpPayloadBytes - p2VideoHeaderBytes
 let p2InputRequestKeyframe: UInt8 = 7
 let p2InputSetVideoProfile: UInt8 = 8
 let p2InputSetVideoBitrate: UInt8 = 9
+let p2InputText: UInt8 = 10
 let p2FlagKeyframe: UInt16 = 1 << 0
 let p2FlagConfig: UInt16 = 1 << 1
 let p2FlagFec: UInt16 = 1 << 2
+let p2ModShift: UInt16 = 1 << 0
+let p2ModControl: UInt16 = 1 << 1
+let p2ModOption: UInt16 = 1 << 2
+let p2ModCommand: UInt16 = 1 << 3
 
 final class NativeStats {
     static let shared = NativeStats()
@@ -70,7 +75,7 @@ struct NativeHostConfig {
     var height: Int = 1080
     var fps: Int = 60
     var bitrate: Int = 14_000_000
-    var keyframeSeconds: Int = 6
+    var keyframeSeconds: Int = 1
     var transport: String = "udp"
 
     static func parse() -> NativeHostConfig {

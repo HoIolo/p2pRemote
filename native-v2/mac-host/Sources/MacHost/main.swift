@@ -36,15 +36,31 @@ final actor NativeHostRuntime {
     }
 
     func requestKeyframe(reason: String) {
-        logLine("[control] keyframe request ignored by gst backend: \(reason)")
+        logLine("[control] keyframe request: \(reason)")
+        video.requestKeyframe()
     }
 
     func updateBitrate(_ bitrate: Int, reason: String) {
-        logLine("[control] bitrate update requested (restart required for gst backend): \(bitrate) reason=\(reason)")
+        do {
+            try video.updateBitrate(bitrate)
+            cfg.bitrate = bitrate
+            logLine("[control] bitrate updated via gst restart: \(bitrate) reason=\(reason)")
+        } catch {
+            logLine("[control] bitrate update failed: \(error)")
+        }
     }
 
     func reconfigureVideo(width: Int, height: Int, fps: Int, bitrateMbps: Int) async {
-        logLine("[control] video profile request ignored by gst backend: \(width)x\(height)@\(fps) bitrateMbps=\(bitrateMbps)")
+        do {
+            try video.reconfigure(width: width, height: height, fps: fps, bitrateMbps: bitrateMbps)
+            cfg.width = width
+            cfg.height = height
+            cfg.fps = fps
+            if bitrateMbps > 0 { cfg.bitrate = bitrateMbps * 1_000_000 }
+            logLine("[control] video profile applied: \(width)x\(height)@\(fps) bitrateMbps=\(bitrateMbps)")
+        } catch {
+            logLine("[control] video profile apply failed: \(error)")
+        }
     }
 }
 

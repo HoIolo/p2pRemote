@@ -106,6 +106,8 @@ final class InputReceiver {
             postKey(code: keyCode, down: true)
         case 6:
             postKey(code: keyCode, down: false)
+        case p2InputText:
+            postText(codeUnit: UInt16(keyCode), modifiers: UInt16(button))
         case p2InputRequestKeyframe:
             onKeyframeRequest()
         case p2InputSetVideoProfile:
@@ -175,5 +177,30 @@ final class InputReceiver {
     private func postKey(code: CGKeyCode, down: Bool) {
         guard let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down) else { return }
         event.post(tap: .cghidEventTap)
+    }
+
+    private func flags(from modifiers: UInt16) -> CGEventFlags {
+        var flags = CGEventFlags()
+        if (modifiers & p2ModShift) != 0 { flags.insert(.maskShift) }
+        if (modifiers & p2ModControl) != 0 { flags.insert(.maskControl) }
+        if (modifiers & p2ModOption) != 0 { flags.insert(.maskAlternate) }
+        if (modifiers & p2ModCommand) != 0 { flags.insert(.maskCommand) }
+        return flags
+    }
+
+    private func postText(codeUnit: UInt16, modifiers: UInt16) {
+        guard codeUnit >= 0x20, codeUnit != 0x7f else { return }
+        var chars = [UniChar(codeUnit)]
+        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
+              let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else { return }
+        let eventFlags = flags(from: modifiers)
+        down.flags = eventFlags
+        up.flags = eventFlags
+        chars.withUnsafeBufferPointer { buffer in
+            down.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: buffer.baseAddress)
+            up.keyboardSetUnicodeString(stringLength: chars.count, unicodeString: buffer.baseAddress)
+        }
+        down.post(tap: .cghidEventTap)
+        up.post(tap: .cghidEventTap)
     }
 }

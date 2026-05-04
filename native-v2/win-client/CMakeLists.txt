@@ -1,4 +1,4 @@
-﻿cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.20)
 project(P2PNativeWinClient LANGUAGES CXX)
 
 option(P2P_ALLOW_LEGACY_VIDEO_FALLBACK "Allow building the old non-GStreamer video client when GStreamer is missing" OFF)
@@ -49,6 +49,7 @@ if (P2P_WIN_CLIENT_GST)
     user32
     gdi32
     winmm
+
   )
 else()
   target_link_libraries(p2p-native-win-client PRIVATE

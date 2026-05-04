@@ -48,6 +48,10 @@ static constexpr uint8_t P2_VIDEO_H264_ANNEXB = 1;
 static constexpr uint16_t P2_FLAG_KEYFRAME = 1u << 0;
 static constexpr uint16_t P2_FLAG_CONFIG = 1u << 1;
 static constexpr uint16_t P2_FLAG_FEC = 1u << 2;
+static constexpr uint16_t P2_MOD_SHIFT = 1u << 0;
+static constexpr uint16_t P2_MOD_CONTROL = 1u << 1;
+static constexpr uint16_t P2_MOD_OPTION = 1u << 2;
+static constexpr uint16_t P2_MOD_COMMAND = 1u << 3;
 
 enum P2InputKind : uint8_t {
   P2_INPUT_MOVE = 1,
@@ -59,4 +63,5 @@ enum P2InputKind : uint8_t {
   P2_INPUT_REQUEST_KEYFRAME = 7,
   P2_INPUT_SET_VIDEO_PROFILE = 8,
   P2_INPUT_SET_VIDEO_BITRATE = 9,
+  P2_INPUT_TEXT = 10,
 };
