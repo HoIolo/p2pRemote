@@ -70,7 +70,7 @@ struct NativeHostConfig {
     var height: Int = 1080
     var fps: Int = 60
     var bitrate: Int = 14_000_000
-    var keyframeSeconds: Int = 6
+    var keyframeSeconds: Int = 1
     var transport: String = "udp"
 
     static func parse() -> NativeHostConfig {
@@ -90,7 +90,7 @@ struct NativeHostConfig {
         if let v = popValue("--height"), let n = Int(v) { cfg.height = n }
         if let v = popValue("--fps"), let n = Int(v) { cfg.fps = n }
         if let v = popValue("--bitrate"), let n = Int(v) { cfg.bitrate = n }
-        if let v = popValue("--keyint"), let n = Int(v) { cfg.keyframeSeconds = n }
+        if let v = popValue("--keyint"), let n = Int(v) { cfg.keyframeSeconds = max(1, n) }
         if let v = popValue("--transport") { cfg.transport = v.lowercased() == "udp" ? "udp" : "tcp" }
         return cfg
     }
@@ -392,8 +392,10 @@ final class TcpVideoServer {
             var one: Int32 = 1
             setsockopt(client, IPPROTO_TCP, TCP_NODELAY, &one, socklen_t(MemoryLayout<Int32>.size))
             setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-            var sndbuf: Int32 = 4 * 1024 * 1024
+            var sndbuf: Int32 = 512 * 1024
             setsockopt(client, SOL_SOCKET, SO_SNDBUF, &sndbuf, socklen_t(MemoryLayout<Int32>.size))
+            var sendTimeout = timeval(tv_sec: 0, tv_usec: 5_000)
+            setsockopt(client, SOL_SOCKET, SO_SNDTIMEO, &sendTimeout, socklen_t(MemoryLayout<timeval>.size))
             lock.lock()
             clients.append(client)
             lock.unlock()
@@ -439,17 +441,19 @@ final class TcpVideoServer {
         lock.lock()
         var next = [Int32]()
         var sentClients: UInt64 = 0
+        var droppedClients: UInt64 = 0
         for c in clients {
             if writeAll(c, packet) {
                 next.append(c)
                 sentClients += 1
             } else {
                 close(c)
+                droppedClients += 1
                 logLine("[tcp] Windows video client disconnected")
             }
         }
         clients = next
         lock.unlock()
-        NativeStats.shared.recordFrame(frameId: id, packets: sentClients, bytes: UInt64(packet.count) * sentClients, errors: 0)
+        NativeStats.shared.recordFrame(frameId: id, packets: sentClients, bytes: UInt64(packet.count) * sentClients, errors: droppedClients)
     }
 }

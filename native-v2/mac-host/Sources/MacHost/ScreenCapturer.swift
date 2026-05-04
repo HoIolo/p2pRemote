@@ -8,6 +8,7 @@ import AppKit
 @available(macOS 13.0, *)
 final class ScreenCaptureOutput: NSObject, SCStreamOutput {
     private let encoder: H264LowLatencyEncoder
+    private let keyframeIntervalUs: UInt64
     private var frames = 0
     private let started = nowUs()
     private var lastKeyframe = nowUs()
@@ -15,8 +16,9 @@ final class ScreenCaptureOutput: NSObject, SCStreamOutput {
     private var reportedFirstFrame = false
     private var reportedMissingImageBuffer = false
 
-    init(encoder: H264LowLatencyEncoder, firstFrameCallback: @escaping () -> Void = {}) {
+    init(encoder: H264LowLatencyEncoder, keyframeSeconds: Int, firstFrameCallback: @escaping () -> Void = {}) {
         self.encoder = encoder
+        self.keyframeIntervalUs = UInt64(max(1, keyframeSeconds)) * 1_000_000
         self.firstFrameCallback = firstFrameCallback
     }
 
@@ -39,7 +41,7 @@ final class ScreenCaptureOutput: NSObject, SCStreamOutput {
         }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let now = nowUs()
-        let forceKeyframe = frames == 0 || now - lastKeyframe >= 6_000_000
+        let forceKeyframe = frames == 0 || now - lastKeyframe >= keyframeIntervalUs
         if forceKeyframe { lastKeyframe = now }
         encoder.encode(pixelBuffer, pts: pts, forceKeyframe: forceKeyframe)
         frames += 1
@@ -129,7 +131,7 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
         streamCfg.width = cfg.width
         streamCfg.height = cfg.height
         streamCfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(cfg.fps))
-        streamCfg.queueDepth = 3
+        streamCfg.queueDepth = 1
         streamCfg.showsCursor = false
         streamCfg.capturesAudio = false
         streamCfg.pixelFormat = pixelFormat

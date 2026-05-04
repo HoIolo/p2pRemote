@@ -142,7 +142,7 @@ final actor NativeHostRuntime {
 
     private func makePipeline(cfg: NativeHostConfig, encoder: H264LowLatencyEncoder) async throws -> CapturePipeline {
         let capturerRef = RefBox<ScreenCapturer?>(nil)
-        let output = ScreenCaptureOutput(encoder: encoder) {
+        let output = ScreenCaptureOutput(encoder: encoder, keyframeSeconds: cfg.keyframeSeconds) {
             capturerRef.value?.markFirstFrame()
         }
         let capturer = ScreenCapturer(cfg: cfg, output: output)
@@ -199,7 +199,7 @@ struct MacHostMain {
                 }
             }
             let capturerRef = RefBox<ScreenCapturer?>(nil)
-            let output = ScreenCaptureOutput(encoder: encoder) {
+            let output = ScreenCaptureOutput(encoder: encoder, keyframeSeconds: cfg.keyframeSeconds) {
                 capturerRef.value?.markFirstFrame()
             }
             let capturer = ScreenCapturer(cfg: cfg, output: output)

@@ -3,11 +3,11 @@ set -euo pipefail
 CLIENT_IP="${CLIENT_IP:-192.168.1.50}"
 WIDTH="${WIDTH:-1920}"
 HEIGHT="${HEIGHT:-1080}"
-FPS="${FPS:-120}"
-BITRATE="${BITRATE:-45000000}"
+FPS="${FPS:-60}"
+BITRATE="${BITRATE:-18000000}"
 VIDEO_PORT="${VIDEO_PORT:-45000}"
 INPUT_PORT="${INPUT_PORT:-45001}"
-TRANSPORT="${TRANSPORT:-tcp}"
+TRANSPORT="${TRANSPORT:-udp}"
 cd "$(dirname "$0")"
 BIN=".build/release/p2p-native-mac-host"
 if [[ ! -x "$BIN" ]]; then
@@ -21,5 +21,5 @@ exec "$BIN" \
   --height "$HEIGHT" \
   --fps "$FPS" \
   --bitrate "$BITRATE" \
-  --keyint 6 \
+  --keyint "${KEYINT:-1}" \
   --transport "$TRANSPORT"
