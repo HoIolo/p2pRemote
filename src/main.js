@@ -379,7 +379,7 @@ function nativeV2StatusPayload() {
       height: Number(savedClientProfile.height) || 1080,
       fps: Number(savedClientProfile.fps) || 60,
       bitrate: Number(savedClientProfile.bitrate) || 14_000_000,
-      keyint: 1,
+      keyint: 6,
       transport: 'udp',
     },
   };
@@ -532,41 +532,6 @@ function startNativeV2Client(options = {}) {
   proc.once('exit', (code, signal) => {
     sendToMainWindow('host-log', { level: 'info', message: `native-v2 client exited code=${code ?? ''} signal=${signal ?? ''}` });
     if (nativeV2ClientProcess === proc) nativeV2ClientProcess = null;
-    if (code === 23 && !appIsQuitting && nativeV2ClientLastOptions?.hostIp) {
-      const savedProfile = readNativeV2ClientProfile(nativeV2ClientLastOptions.profileFile);
-      const nextOptions = {
-        ...nativeV2ClientLastOptions,
-        ...savedProfile,
-      };
-      sendToMainWindow('host-log', {
-        level: 'info',
-        message: `native-v2 client requested relaunch with updated profile ${nextOptions.width}x${nextOptions.height}@${nextOptions.fps} bitrate=${nextOptions.bitrate}`,
-      });
-      setTimeout(() => {
-        if (!appIsQuitting) {
-          try {
-            startNativeV2Client(nextOptions);
-            if (nativeV2LastRemoteHostRequest?.device?.pin && nativeV2LastRemoteHostRequest?.device?.port) {
-              setTimeout(() => {
-                restartNativeV2RemoteHostForClientProfile(nextOptions).catch((err) => {
-                  sendToMainWindow('host-log', {
-                    level: 'error',
-                    message: `native-v2 remote host profile restart failed: ${err.message || String(err)}`,
-                  });
-                });
-              }, 220);
-            }
-          } catch (err) {
-            sendToMainWindow('host-log', {
-              level: 'error',
-              message: `native-v2 client relaunch failed: ${err.message || String(err)}`,
-            });
-            broadcastNativeV2Status({ error: err.message || String(err) });
-          }
-        }
-      }, 160);
-      return;
-    }
     broadcastNativeV2Status();
   });
   proc.once('error', (err) => {

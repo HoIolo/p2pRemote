@@ -4,11 +4,14 @@ import Darwin
 let p2VideoHeaderBytes = 36
 let p2TcpVideoHeaderBytes = 32
 let p2InputPacketBytes = 32
-let maxUdpPayloadBytes = 1200
+let maxUdpPayloadBytes = 1440
 let maxVideoFragmentPayload = maxUdpPayloadBytes - p2VideoHeaderBytes
 let p2InputRequestKeyframe: UInt8 = 7
 let p2InputSetVideoProfile: UInt8 = 8
 let p2InputSetVideoBitrate: UInt8 = 9
+let p2FlagKeyframe: UInt16 = 1 << 0
+let p2FlagConfig: UInt16 = 1 << 1
+let p2FlagFec: UInt16 = 1 << 2
 
 final class NativeStats {
     static let shared = NativeStats()
@@ -49,7 +52,7 @@ struct NativeHostConfig {
     var height: Int = 1080
     var fps: Int = 60
     var bitrate: Int = 14_000_000
-    var keyframeSeconds: Int = 1
+    var keyframeSeconds: Int = 6
     var transport: String = "udp"
 
     static func parse() -> NativeHostConfig {
@@ -161,6 +164,9 @@ final class UdpVideoSender {
         let id = frameId
         frameId &+= 1
         let fragCount = UInt16((frame.count + maxVideoFragmentPayload - 1) / maxVideoFragmentPayload)
+        let useFec = fragCount >= 3
+        let duplicateLeadingFragments = keyframe ? min(3, Int(fragCount)) : 0
+        let duplicateFecPacket = keyframe && useFec
         var offset = 0
         var fragIndex: UInt16 = 0
         var sentPackets: UInt64 = 0
@@ -170,20 +176,25 @@ final class UdpVideoSender {
         let currentBitrate = targetBitrateBps
         paceLock.unlock()
         let framePeriodUs = max<UInt64>(4_000, 1_000_000 / UInt64(max(1, fps)))
-        let paceRate = max(20_000_000, currentBitrate * 2)
-        let frameBudgetUs = UInt64(max(1_000, min(Int(framePeriodUs), Int(Double(frame.count * 8) * 1_000_000.0 / Double(max(1, paceRate))))))
-        let packetBudgetUs = max<UInt64>(40, frameBudgetUs / UInt64(max(1, Int(fragCount))))
+        let paceRate = max(4_000_000, min(120_000_000, Int(Double(currentBitrate) * 1.06)))
+        let estimatedSendUs = UInt64(max(2_000, Int(Double(frame.count * 8) * 1_000_000.0 / Double(max(1, paceRate)))))
+        let frameBudgetUs = max(framePeriodUs, estimatedSendUs)
+        let totalPacketCount = Int(fragCount) + (useFec ? 1 : 0) + duplicateLeadingFragments + (duplicateFecPacket ? 1 : 0)
+        let packetBudgetUs = max<UInt64>(140, frameBudgetUs / UInt64(max(1, totalPacketCount)))
         let startUs = nowUs()
         if nextSendDeadlineUs < startUs {
             nextSendDeadlineUs = startUs
         }
-        while offset < frame.count {
+        var parity = Data(repeating: 0, count: maxVideoFragmentPayload)
+        var parityLen = 0
+        let totalFragCount = fragCount + (useFec ? 1 : 0)
+
+        func emitPacket(fragIndex: UInt16, totalFragCount: UInt16, payload: Data, flags: UInt16) {
             let beforeSendUs = nowUs()
             if nextSendDeadlineUs > beforeSendUs {
                 usleep(useconds_t(min<UInt64>(20_000, nextSendDeadlineUs - beforeSendUs)))
             }
-            let n = min(maxVideoFragmentPayload, frame.count - offset)
-            var packet = Data(capacity: p2VideoHeaderBytes + n)
+            var packet = Data(capacity: p2VideoHeaderBytes + payload.count)
             packet.append(contentsOf: [0x50, 0x32, 0x56, 0x32]) // P2V2
             packet.appendU8(1)
             packet.appendU8(1)
@@ -192,14 +203,10 @@ final class UdpVideoSender {
             packet.appendU64LE(ptsUs)
             packet.appendU32LE(UInt32(frame.count))
             packet.appendU16LE(fragIndex)
-            packet.appendU16LE(fragCount)
-            packet.appendU16LE(UInt16(n))
-            var flags: UInt16 = 0
-            if keyframe { flags |= 1 }
-            if configIncluded { flags |= 2 }
+            packet.appendU16LE(totalFragCount)
+            packet.appendU16LE(UInt16(payload.count))
             packet.appendU16LE(flags)
-            packet.append(frame.subdata(in: offset..<(offset + n)))
-
+            packet.append(payload)
             packet.withUnsafeBytes { raw in
                 withUnsafePointer(to: &addr) { ptr in
                     ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
@@ -213,9 +220,41 @@ final class UdpVideoSender {
                     }
                 }
             }
+            nextSendDeadlineUs &+= packetBudgetUs
+        }
+
+        while offset < frame.count {
+            let n = min(maxVideoFragmentPayload, frame.count - offset)
+            parityLen = max(parityLen, n)
+            frame.withUnsafeBytes { raw in
+                guard let src = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                parity.withUnsafeMutableBytes { parityRaw in
+                    guard let dst = parityRaw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                    for i in 0..<n {
+                        dst[i] ^= src[offset + i]
+                    }
+                }
+            }
+            var flags: UInt16 = 0
+            if keyframe { flags |= p2FlagKeyframe }
+            if configIncluded { flags |= p2FlagConfig }
+            let payload = frame.subdata(in: offset..<(offset + n))
+            emitPacket(fragIndex: fragIndex, totalFragCount: totalFragCount, payload: payload, flags: flags)
+            if Int(fragIndex) < duplicateLeadingFragments {
+                emitPacket(fragIndex: fragIndex, totalFragCount: totalFragCount, payload: payload, flags: flags)
+            }
             offset += n
             fragIndex &+= 1
-            nextSendDeadlineUs &+= packetBudgetUs
+        }
+        if useFec && parityLen > 0 {
+            var flags: UInt16 = p2FlagFec
+            if keyframe { flags |= p2FlagKeyframe }
+            if configIncluded { flags |= p2FlagConfig }
+            let fecPayload = Data(parity.prefix(parityLen))
+            emitPacket(fragIndex: fragIndex, totalFragCount: totalFragCount, payload: fecPayload, flags: flags)
+            if duplicateFecPacket {
+                emitPacket(fragIndex: fragIndex, totalFragCount: totalFragCount, payload: fecPayload, flags: flags)
+            }
         }
         let endUs = nowUs()
         if endUs > nextSendDeadlineUs + 20_000 {

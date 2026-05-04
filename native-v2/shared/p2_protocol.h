@@ -47,6 +47,7 @@ static constexpr uint8_t P2_VERSION = 1;
 static constexpr uint8_t P2_VIDEO_H264_ANNEXB = 1;
 static constexpr uint16_t P2_FLAG_KEYFRAME = 1u << 0;
 static constexpr uint16_t P2_FLAG_CONFIG = 1u << 1;
+static constexpr uint16_t P2_FLAG_FEC = 1u << 2;
 
 enum P2InputKind : uint8_t {
   P2_INPUT_MOVE = 1,

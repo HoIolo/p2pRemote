@@ -109,7 +109,6 @@ final class H264LowLatencyEncoder {
         controlLock.unlock()
         set(kVTCompressionPropertyKey_AverageBitRate, clamped as CFTypeRef)
         setDataRateLimits(bitrate: clamped)
-        requestKeyframe(reason: "\(reason) bitrate=\(clamped)")
         logLine("[encoder] bitrate updated: \(clamped)")
     }
 

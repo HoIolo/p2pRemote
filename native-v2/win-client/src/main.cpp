@@ -4,6 +4,7 @@
 #include <windowsx.h>
 #include <shellapi.h>
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <dxgi1_5.h>
 #include <d3dcompiler.h>
 #include <mfapi.h>
@@ -38,8 +39,9 @@ using Microsoft::WRL::ComPtr;
 
 static constexpr int kMaxUdp = 1500;
 static constexpr int kVideoHeaderBytes = sizeof(P2VideoHeader);
-static constexpr int kMaxVideoFragmentPayload = 1200 - kVideoHeaderBytes;
-static constexpr size_t kMaxEncodedQueueDepth = 2;
+static constexpr int kMaxVideoFragmentPayload = 1440 - kVideoHeaderBytes;
+static constexpr size_t kMinEncodedQueueDepth = 18;
+static constexpr size_t kMaxEncodedQueueDepth = 120;
 
 struct Config {
   std::wstring hostIp = L"127.0.0.1";
@@ -114,6 +116,9 @@ static std::atomic<bool> g_running{true};
 static std::mutex g_encodedMu;
 static std::condition_variable g_encodedCv;
 static std::deque<EncodedFrame> g_encodedQueue;
+static std::mutex g_decodedMu;
+static std::condition_variable g_decodedCv;
+static std::deque<DecodedFrame> g_decodedQueue;
 static std::mutex g_frameMu;
 static BgraFrame g_latestFrame;
 static SOCKET g_inputSock = INVALID_SOCKET;
@@ -146,6 +151,17 @@ static std::atomic<uint64_t> g_lastBitrateControlQpc{0};
 static std::atomic<uint64_t> g_lastBitrateIncreaseQpc{0};
 static std::atomic<double> g_recentDropScore{0.0};
 static std::atomic<uint64_t> g_lastAutoProfileChangeQpc{0};
+static std::atomic<int> g_activeVideoWidth{1920};
+static std::atomic<int> g_activeVideoHeight{1080};
+static std::atomic<int> g_activeVideoFps{60};
+static std::atomic<int> g_activeVideoBitrate{14'000'000};
+static std::atomic<uint64_t> g_videoProfileGeneration{0};
+static std::atomic<uint32_t> g_encodedQueueDepthNow{0};
+static std::atomic<uint32_t> g_encodedQueueTargetNow{0};
+static std::atomic<uint32_t> g_decodedQueueDepthNow{0};
+static std::atomic<uint32_t> g_decodedQueueTargetNow{4};
+static std::atomic<uint64_t> g_renderFramesDropped{0};
+static std::atomic<uint64_t> g_lastProfileApplyQpc{0};
 static uint64_t g_startedQpc = 0;
 static std::wstring g_localIp = L"-";
 static VideoProfile g_pendingProfile;
@@ -154,7 +170,6 @@ static int g_resolutionIndex = 0;
 static int g_fpsIndex = 0;
 static int g_bitrateIndex = 0;
 static int g_exitCode = 0;
-static constexpr int kProfileApplyExitCode = 23;
 static constexpr std::array<int, 5> kFpsPresets = {30, 45, 60, 90, 120};
 static constexpr std::array<int, 5> kBitratePresetsMbps = {8, 12, 16, 24, 32};
 
@@ -175,12 +190,18 @@ struct NativeUiStats {
   uint64_t gpuRenderFails = 0;
   uint64_t gpuFrames = 0;
   uint64_t cpuFrames = 0;
+  uint32_t queueDepth = 0;
+  uint32_t queueTarget = 0;
+  uint32_t decodedQueueDepth = 0;
+  uint32_t decodedQueueTarget = 0;
+  uint64_t renderDropped = 0;
 };
 
 static std::mutex g_uiStatsMu;
 static NativeUiStats g_uiStats;
 
-static void EnterVideoRecovery(const wchar_t* reason);
+static size_t EncodedQueueDepthTarget();
+static void EnterVideoRecovery(const wchar_t* reason, bool reduceBitrate = true);
 static void SendInputPacket(uint8_t kind, float x, float y, int32_t dx, int32_t dy, uint16_t button, uint16_t keyCode);
 static void SendVideoBitrateControl(int bitrate, const wchar_t* reason);
 
@@ -283,6 +304,8 @@ static void PushEncoded(EncodedFrame&& f) {
   bool queued = false;
   {
     std::lock_guard lk(g_encodedMu);
+    const size_t queueDepthTarget = EncodedQueueDepthTarget();
+    const size_t protectionThreshold = std::max<size_t>(queueDepthTarget * 9 / 10, queueDepthTarget > 2 ? queueDepthTarget - 2 : queueDepthTarget);
     if (g_waitingForKeyframe.load(std::memory_order_relaxed)) {
       if (!f.keyframe) {
         RecordClientFrameDrop();
@@ -300,17 +323,18 @@ static void PushEncoded(EncodedFrame&& f) {
 
     if (!g_encodedQueue.empty()) {
       const EncodedFrame& pending = g_encodedQueue.back();
-      if (pending.keyframe && !f.keyframe) {
+      if (pending.keyframe && !f.keyframe && g_encodedQueue.size() >= protectionThreshold) {
         RecordClientFrameDrop();
         return;
       }
     }
 
-    while (g_encodedQueue.size() >= kMaxEncodedQueueDepth) {
+    while (g_encodedQueue.size() >= queueDepthTarget) {
       g_encodedQueue.pop_front();
       RecordClientFrameDrop();
     }
     g_encodedQueue.emplace_back(std::move(f));
+    g_encodedQueueDepthNow.store(static_cast<uint32_t>(g_encodedQueue.size()), std::memory_order_relaxed);
     queued = true;
   }
   if (queued) g_encodedCv.notify_one();
@@ -337,6 +361,11 @@ class D3DRenderer {
                                    &device_, &actual, &ctx_);
     if (FAILED(hr)) return false;
 
+    ComPtr<ID3D11Multithread> multithread;
+    if (SUCCEEDED(ctx_.As(&multithread))) {
+      multithread->SetMultithreadProtected(TRUE);
+    }
+
     ComPtr<IDXGIDevice> dxgiDevice;
     ComPtr<IDXGIAdapter> adapter;
     ComPtr<IDXGIFactory2> factory;
@@ -356,11 +385,18 @@ class D3DRenderer {
     desc.Scaling = DXGI_SCALING_STRETCH;
     desc.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
     desc.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
-    desc.Flags = allowTearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
+    desc.Flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
+    if (allowTearing_) desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
 
     hr = factory->CreateSwapChainForHwnd(device_.Get(), hwnd_, &desc, nullptr, nullptr, &swap_);
     if (FAILED(hr)) return false;
     factory->MakeWindowAssociation(hwnd_, DXGI_MWA_NO_ALT_ENTER);
+
+    ComPtr<IDXGISwapChain2> swap2;
+    if (SUCCEEDED(swap_.As(&swap2))) {
+      swap2->SetMaximumFrameLatency(1);
+      frameLatencyWaitable_ = swap2->GetFrameLatencyWaitableObject();
+    }
 
     return CreatePipeline() && CreateNv12Textures();
   }
@@ -388,6 +424,39 @@ class D3DRenderer {
   }
 
   ID3D11Device* Device() const { return device_.Get(); }
+
+  bool Reconfigure(int width, int height) {
+    width = std::max(2, width);
+    height = std::max(2, height);
+    if (width == width_ && height == height_) return true;
+    width_ = width;
+    height_ = height;
+    yTex_.Reset();
+    uvTex_.Reset();
+    ySrv_.Reset();
+    uvSrv_.Reset();
+    copyNv12Tex_.Reset();
+    copyYSrv_.Reset();
+    copyUvSrv_.Reset();
+    if (!swap_) return CreateNv12Textures();
+    HRESULT hr = swap_->ResizeBuffers(0, static_cast<UINT>(width_), static_cast<UINT>(height_),
+                                      DXGI_FORMAT_UNKNOWN,
+                                      DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
+                                      (allowTearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0));
+    if (FAILED(hr)) return false;
+    ComPtr<IDXGISwapChain2> swap2;
+    if (SUCCEEDED(swap_.As(&swap2))) {
+      swap2->SetMaximumFrameLatency(1);
+      frameLatencyWaitable_ = swap2->GetFrameLatencyWaitableObject();
+    }
+    return CreateNv12Textures();
+  }
+
+  void WaitForPresentReady() {
+    if (frameLatencyWaitable_) {
+      WaitForSingleObject(frameLatencyWaitable_, 8);
+    }
+  }
 
  private:
   bool CheckTearingSupport() {
@@ -605,6 +674,7 @@ float4 main(VSOut i) : SV_Target {
   ComPtr<ID3D11Texture2D> copyNv12Tex_;
   ComPtr<ID3D11ShaderResourceView> copyYSrv_;
   ComPtr<ID3D11ShaderResourceView> copyUvSrv_;
+  HANDLE frameLatencyWaitable_ = nullptr;
 };
 
 static std::unique_ptr<D3DRenderer> g_renderer;
@@ -614,7 +684,7 @@ static constexpr int kToolbarHeight = 60;
 static constexpr int kMenuWidth = 440;
 static constexpr int kMenuHeight = 486;
 static constexpr int kStatsWidth = 580;
-static constexpr int kStatsHeight = 760;
+static constexpr int kStatsHeight = 862;
 static constexpr wchar_t kNativeClientVersion[] = L"native v2 0.1.0";
 
 static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -654,13 +724,71 @@ static int AutoBitrateForPixels(int width, int height, int fallback) {
   return bitrate;
 }
 
-static VideoProfile CurrentVideoProfile() {
+static size_t EncodedQueueDepthTarget() {
+  const int fps = std::max(30, g_activeVideoFps.load(std::memory_order_relaxed));
+  size_t target = static_cast<size_t>(std::clamp((fps + 3) / 4, 8, 26));
+  const uint64_t lastProfileApply = g_lastProfileApplyQpc.load(std::memory_order_relaxed);
+  const uint64_t now = QpcNow();
+  if (lastProfileApply && QpcDeltaUs(lastProfileApply, now) < 2'500'000) {
+    target += 12;
+  }
+  target = std::max(kMinEncodedQueueDepth, target);
+  target = std::min(kMaxEncodedQueueDepth, target);
+  g_encodedQueueTargetNow.store(static_cast<uint32_t>(target), std::memory_order_relaxed);
+  return target;
+}
+
+static size_t DecodedQueueDepthTarget() {
+  const int fps = std::max(30, g_activeVideoFps.load(std::memory_order_relaxed));
+  size_t target = static_cast<size_t>(std::clamp((fps + 14) / 15, 2, 6));
+  g_decodedQueueTargetNow.store(static_cast<uint32_t>(target), std::memory_order_relaxed);
+  return target;
+}
+
+static void PushDecoded(DecodedFrame&& frame) {
+  bool queued = false;
+  {
+    std::lock_guard lk(g_decodedMu);
+    const size_t queueTarget = DecodedQueueDepthTarget();
+    while (g_decodedQueue.size() >= queueTarget) {
+      g_decodedQueue.pop_front();
+      g_renderFramesDropped.fetch_add(1, std::memory_order_relaxed);
+    }
+    g_decodedQueue.emplace_back(std::move(frame));
+    g_decodedQueueDepthNow.store(static_cast<uint32_t>(g_decodedQueue.size()), std::memory_order_relaxed);
+    queued = true;
+  }
+  if (queued) g_decodedCv.notify_one();
+}
+
+static VideoProfile ActiveVideoProfile() {
   VideoProfile profile;
-  profile.width = g_cfg.width;
-  profile.height = g_cfg.height;
-  profile.fps = g_cfg.fps;
-  profile.bitrate = g_cfg.bitrate > 0 ? g_cfg.bitrate : AutoBitrateForPixels(g_cfg.width, g_cfg.height, 14'000'000);
+  profile.width = std::max(640, g_activeVideoWidth.load(std::memory_order_relaxed));
+  profile.height = std::max(360, g_activeVideoHeight.load(std::memory_order_relaxed));
+  profile.fps = std::max(30, g_activeVideoFps.load(std::memory_order_relaxed));
+  const int bitrate = g_activeVideoBitrate.load(std::memory_order_relaxed);
+  profile.bitrate = bitrate > 0 ? bitrate : AutoBitrateForPixels(profile.width, profile.height, 14'000'000);
   return profile;
+}
+
+static void CommitActiveVideoProfile(const VideoProfile& profile) {
+  const int width = std::max(640, ClampEven(profile.width, g_cfg.width));
+  const int height = std::max(360, ClampEven(profile.height, g_cfg.height));
+  const int fps = std::clamp(profile.fps, 30, 240);
+  const int fallbackBitrate = AutoBitrateForPixels(width, height, 14'000'000);
+  const int bitrate = std::clamp(profile.bitrate > 0 ? profile.bitrate : fallbackBitrate, 2'000'000, 80'000'000);
+  g_activeVideoWidth.store(width, std::memory_order_relaxed);
+  g_activeVideoHeight.store(height, std::memory_order_relaxed);
+  g_activeVideoFps.store(fps, std::memory_order_relaxed);
+  g_activeVideoBitrate.store(bitrate, std::memory_order_relaxed);
+  g_currentBitrate.store(bitrate, std::memory_order_relaxed);
+  const int adaptiveCeiling = std::max({bitrate, AutoBitrateForPixels(width, height, bitrate), 20'000'000});
+  g_maxAdaptiveBitrate.store(std::min(80'000'000, adaptiveCeiling), std::memory_order_relaxed);
+  g_minAdaptiveBitrate.store(std::max(2'000'000, bitrate / 3), std::memory_order_relaxed);
+}
+
+static VideoProfile CurrentVideoProfile() {
+  return ActiveVideoProfile();
 }
 
 static bool SameVideoProfile(const VideoProfile& lhs, const VideoProfile& rhs) {
@@ -1167,8 +1295,9 @@ static void DrawToolbar(HDC hdc, RECT rc) {
   HFONT controlSubFont = CreateUiFont(12, FW_NORMAL);
   RECT controlRc{114, 11, 262, 30};
   RECT controlSubRc{114, 28, 262, 46};
-  std::wstring controlSummary = FormatResolution(g_cfg.width, g_cfg.height)
-                              + L" / " + std::to_wstring(g_cfg.fps) + L" fps / "
+  const VideoProfile activeProfile = ActiveVideoProfile();
+  std::wstring controlSummary = FormatResolution(activeProfile.width, activeProfile.height)
+                              + L" / " + std::to_wstring(activeProfile.fps) + L" fps / "
                               + FormatBitrate(g_currentBitrate.load(std::memory_order_relaxed));
   DrawTextRect(hdc, L"显示控制", controlRc, RGB(18, 24, 34), controlFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
   DrawTextRect(hdc, controlSummary, controlSubRc, RGB(104, 114, 126), controlSubFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -1302,7 +1431,7 @@ static void DrawMenu(HDC hdc, RECT rc) {
   DrawMenuSelectorRow(hdc, 148, 1, L"帧率", std::to_wstring(g_pendingProfile.fps) + L" fps");
   DrawMenuSelectorRow(hdc, 202, 4, L"码率", FormatProfileBitrate(g_pendingProfile.bitrate));
   DrawSeparator(hdc, 258);
-  DrawMenuRow(hdc, 276, 6, L"应用并重连", pendingChanges ? FormatCompactProfile(g_pendingProfile) : L"当前已生效", false);
+  DrawMenuRow(hdc, 276, 6, L"立即应用", pendingChanges ? FormatCompactProfile(g_pendingProfile) : L"当前已生效", false);
   wchar_t statsValue[64];
   if (stats.presentFps > 0.1 || stats.rxToPresentMs > 0.0) {
     swprintf_s(statsValue, L"%.0f fps / %.0f ms", stats.presentFps, stats.rxToPresentMs);
@@ -1352,30 +1481,34 @@ static void DrawStats(HDC hdc, RECT rc) {
   DeleteObject(line);
 
   DrawStatsRow(hdc, 126, L"收帧后延时:", stats.rxToPresentMs > 0.0 ? FormatDouble(stats.rxToPresentMs, L" ms", 0) : L"-- ms");
-  DrawStatsRow(hdc, 166, L"显示帧率:", stats.presentFps > 0.1 ? FormatDouble(stats.presentFps, L"", 0) : FormatDouble(g_cfg.fps, L"", 0));
+  const VideoProfile activeProfile = ActiveVideoProfile();
+  DrawStatsRow(hdc, 166, L"显示帧率:", stats.presentFps > 0.1 ? FormatDouble(stats.presentFps, L"", 0) : FormatDouble(activeProfile.fps, L"", 0));
   DrawStatsRow(hdc, 206, L"接收完整帧率:", stats.completeFps > 0.1 ? FormatDouble(stats.completeFps, L"", 0) : L"--");
   DrawStatsRow(hdc, 246, L"带宽占用:", FormatDouble(stats.mbps, L" Mbps", 1));
-  DrawStatsRow(hdc, 286, L"客户端丢旧帧:", FormatDouble(stats.queueDropPct, L"%", 1));
+  DrawStatsRow(hdc, 286, L"客户端丢旧帧(当前):", FormatDouble(stats.queueDropPct, L"%", 1));
 
   DrawStatsSeparator(hdc, 332);
   DrawStatsRow(hdc, 356, L"传输通道:", g_cfg.udpVideo ? L"UDP 局域网直连" : L"TCP 局域网直连");
   DrawStatsRow(hdc, 396, L"被控端 IP:", g_cfg.hostIp);
   DrawStatsRow(hdc, 436, L"控制端 IP:", g_localIp);
-  DrawStatsRow(hdc, 476, L"网络拼帧废弃:", FormatDouble(stats.networkDropPct, L"%", 1));
+  DrawStatsRow(hdc, 476, L"网络拼帧废弃(当前):", FormatDouble(stats.networkDropPct, L"%", 1));
   DrawStatsRow(hdc, 516, L"被控端系统:", PlatformLabel(g_cfg.hostPlatform));
 
   DrawStatsSeparator(hdc, 562);
   DrawStatsRow(hdc, 586, L"当前发送码率:", FormatBitrate(g_currentBitrate.load(std::memory_order_relaxed)));
-  DrawStatsRow(hdc, 620, L"编解码器:", L"H.264 / Media Foundation");
-  DrawStatsRow(hdc, 654, L"编码模式:", stats.gpuFrames > 0 ? L"硬编 / 硬解" : L"硬编 / 硬解优先");
-  DrawStatsRow(hdc, 688, L"采集方式:", g_cfg.hostPlatform == L"win32" ? L"DXGI" : L"ScreenCaptureKit");
+  DrawStatsRow(hdc, 620, L"编码队列:", std::to_wstring(stats.queueDepth) + L" / " + std::to_wstring(stats.queueTarget) + L" 帧");
+  DrawStatsRow(hdc, 654, L"显示队列:", std::to_wstring(stats.decodedQueueDepth) + L" / " + std::to_wstring(stats.decodedQueueTarget) + L" 帧");
+  DrawStatsRow(hdc, 688, L"显示丢旧帧:", std::to_wstring(stats.renderDropped));
+  DrawStatsRow(hdc, 722, L"编解码器:", L"H.264 / Media Foundation");
+  DrawStatsRow(hdc, 756, L"编码模式:", stats.gpuFrames > 0 ? L"硬编 / 硬解" : L"硬编 / 硬解优先");
+  DrawStatsRow(hdc, 790, L"采集方式:", g_cfg.hostPlatform == L"win32" ? L"DXGI" : L"ScreenCaptureKit");
   wchar_t target[128];
   swprintf_s(target, L"%dx%d @ %d fps / %d Mbps",
-             g_cfg.width,
-             g_cfg.height,
-             g_cfg.fps,
-             std::max(1, (g_cfg.bitrate + 500'000) / 1'000'000));
-  DrawStatsRow(hdc, 722, L"目标档位:", target);
+             activeProfile.width,
+             activeProfile.height,
+             activeProfile.fps,
+             std::max(1, (activeProfile.bitrate + 500'000) / 1'000'000));
+  DrawStatsRow(hdc, 824, L"目标档位:", target);
 }
 
 static void HandleToolbarClick(int x, int y) {
@@ -1410,7 +1543,7 @@ static bool RequestProfileApply(const VideoProfile& requestedProfile, const wcha
   }
 
   SyncPendingProfileToIndices(profile);
-  if (!WriteProfileFile(g_cfg.profileFile, profile)) {
+  if (!autoTriggered && !WriteProfileFile(g_cfg.profileFile, profile)) {
     if (autoTriggered) {
       Log(L"auto profile apply save failed: %dx%d@%d bitrate=%d (%s)",
           profile.width, profile.height, profile.fps, profile.bitrate, reason ? reason : L"auto");
@@ -1423,12 +1556,18 @@ static bool RequestProfileApply(const VideoProfile& requestedProfile, const wcha
   if (autoTriggered) {
     g_lastAutoProfileChangeQpc.store(QpcNow(), std::memory_order_relaxed);
   }
+  g_lastProfileApplyQpc.store(QpcNow(), std::memory_order_relaxed);
   SendVideoProfileCommand(profile);
+  CommitActiveVideoProfile(profile);
+  g_videoProfileGeneration.fetch_add(1, std::memory_order_relaxed);
   Log(L"profile apply requested: %dx%d@%d bitrate=%d (%s)",
       profile.width, profile.height, profile.fps, profile.bitrate, reason ? reason : L"manual");
-  g_exitCode = kProfileApplyExitCode;
+  EnterVideoRecovery(L"profile changed", false);
   HideNativePopups();
-  PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+  if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
+  if (g_toolbarHwnd) InvalidateRect(g_toolbarHwnd, nullptr, FALSE);
+  if (g_menuHwnd) InvalidateRect(g_menuHwnd, nullptr, FALSE);
+  if (g_statsHwnd) InvalidateRect(g_statsHwnd, nullptr, FALSE);
   return true;
 }
 
@@ -1441,15 +1580,6 @@ static bool BuildLowerAutoProfile(const VideoProfile& activeProfile, VideoProfil
   const int fpsIndex = FindClosestFpsIndex(activeProfile.fps);
   if (fpsIndex > 0) {
     nextProfile.fps = kFpsPresets[fpsIndex - 1];
-    return true;
-  }
-
-  const int resolutionIndex = FindResolutionPresetIndex(activeProfile.width, activeProfile.height);
-  if (resolutionIndex > 0) {
-    nextProfile.width = g_resolutionPresets[resolutionIndex - 1].width;
-    nextProfile.height = g_resolutionPresets[resolutionIndex - 1].height;
-    nextProfile.bitrate = std::max(g_minAdaptiveBitrate.load(std::memory_order_relaxed),
-                                   std::min(liveBitrate, AutoBitrateForPixels(nextProfile.width, nextProfile.height, liveBitrate)));
     return true;
   }
   return false;
@@ -1581,8 +1711,13 @@ class VideoReceiver {
       uint16_t flags = 0;
       uint64_t firstQpc = 0;
       uint16_t received = 0;
+      bool hasFec = false;
+      uint16_t dataFragCount = 0;
+      uint16_t fecIndex = 0;
+      uint16_t fecPayloadBytes = 0;
       std::vector<uint8_t> bytes;
       std::vector<uint8_t> got;
+      std::vector<uint8_t> fec;
     };
 
     std::vector<uint8_t> packet(kMaxUdp);
@@ -1632,6 +1767,9 @@ class VideoReceiver {
         partial.firstQpc = now;
         partial.bytes.assign(h->frameBytes, 0);
         partial.got.assign(h->fragCount, 0);
+        partial.hasFec = (h->flags & P2_FLAG_FEC) != 0;
+        partial.dataFragCount = partial.hasFec && h->fragCount > 1 ? uint16_t(h->fragCount - 1) : h->fragCount;
+        partial.fecIndex = partial.dataFragCount;
       } else if (partial.fragCount != h->fragCount || partial.frameBytes != h->frameBytes) {
         partials.erase(it);
         RecordNetworkFrameDrop();
@@ -1639,12 +1777,57 @@ class VideoReceiver {
       }
 
       if (partial.got[h->fragIndex]) continue;
-      size_t off = static_cast<size_t>(h->fragIndex) * kMaxVideoFragmentPayload;
-      if (off + h->payloadBytes > partial.bytes.size()) continue;
-      memcpy(partial.bytes.data() + off, packet.data() + h->headerBytes, h->payloadBytes);
-      partial.got[h->fragIndex] = 1;
-      ++partial.received;
-      if (partial.received == partial.fragCount) {
+      if ((h->flags & P2_FLAG_FEC) != 0) {
+        partial.hasFec = true;
+        partial.dataFragCount = partial.fragCount > 1 ? uint16_t(partial.fragCount - 1) : partial.fragCount;
+        partial.fecIndex = h->fragIndex;
+        partial.fecPayloadBytes = h->payloadBytes;
+        partial.fec.assign(packet.data() + h->headerBytes, packet.data() + h->headerBytes + h->payloadBytes);
+        partial.got[h->fragIndex] = 1;
+        ++partial.received;
+      } else {
+        size_t off = static_cast<size_t>(h->fragIndex) * kMaxVideoFragmentPayload;
+        if (off + h->payloadBytes > partial.bytes.size()) continue;
+        memcpy(partial.bytes.data() + off, packet.data() + h->headerBytes, h->payloadBytes);
+        partial.got[h->fragIndex] = 1;
+        ++partial.received;
+      }
+
+      bool frameReady = false;
+      if (partial.hasFec) {
+        uint16_t missingIndex = 0xffff;
+        uint16_t missingCount = 0;
+        for (uint16_t idx = 0; idx < partial.dataFragCount; ++idx) {
+          if (!partial.got[idx]) {
+            missingIndex = idx;
+            ++missingCount;
+            if (missingCount > 1) break;
+          }
+        }
+        if (missingCount == 0) {
+          frameReady = true;
+        } else if (missingCount == 1 && !partial.fec.empty() && partial.got[partial.fecIndex]) {
+          const size_t off = static_cast<size_t>(missingIndex) * kMaxVideoFragmentPayload;
+          const size_t expectedLen = std::min<size_t>(kMaxVideoFragmentPayload, partial.bytes.size() - off);
+          std::vector<uint8_t> recovered(partial.fec.begin(), partial.fec.end());
+          recovered.resize(expectedLen, 0);
+          for (uint16_t idx = 0; idx < partial.dataFragCount; ++idx) {
+            if (idx == missingIndex || !partial.got[idx]) continue;
+            const size_t srcOff = static_cast<size_t>(idx) * kMaxVideoFragmentPayload;
+            const size_t srcLen = std::min<size_t>(kMaxVideoFragmentPayload, partial.bytes.size() - srcOff);
+            for (size_t j = 0; j < srcLen && j < recovered.size(); ++j) {
+              recovered[j] ^= partial.bytes[srcOff + j];
+            }
+          }
+          memcpy(partial.bytes.data() + off, recovered.data(), recovered.size());
+          partial.got[missingIndex] = 1;
+          frameReady = true;
+        }
+      } else if (partial.received == partial.fragCount) {
+        frameReady = true;
+      }
+
+      if (frameReady) {
         EncodedFrame out;
         out.bytes = std::move(partial.bytes);
         out.frameId = h->frameId;
@@ -2024,15 +2207,18 @@ class MfDecoder {
 
 static void DecoderThread() {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
-  SetThreadDescription(GetCurrentThread(), L"P2P H264 decode + present");
+  SetThreadDescription(GetCurrentThread(), L"P2P H264 decode");
   CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   MFStartup(MF_VERSION, MFSTARTUP_LITE);
-  const bool sharedDeviceAvailable = g_renderer && g_renderer->Device();
-  bool useSharedDevice = sharedDeviceAvailable;
+  auto sharedDeviceAvailableNow = [&]() -> bool {
+    return g_renderer && g_renderer->Device();
+  };
+  bool useSharedDevice = sharedDeviceAvailableNow();
   auto createDecoder = [&](bool preferSharedDevice) -> std::unique_ptr<MfDecoder> {
     auto decoder = std::make_unique<MfDecoder>();
     ID3D11Device* renderDevice = (preferSharedDevice && g_renderer) ? g_renderer->Device() : nullptr;
-    if (!decoder->Init(g_cfg.width, g_cfg.height, g_cfg.fps, renderDevice)) return nullptr;
+    const VideoProfile activeProfile = ActiveVideoProfile();
+    if (!decoder->Init(activeProfile.width, activeProfile.height, activeProfile.fps, renderDevice)) return nullptr;
     return decoder;
   };
 
@@ -2043,9 +2229,31 @@ static void DecoderThread() {
     CoUninitialize();
     return;
   }
-  uint32_t gpuPresentFailStreak = 0;
+  uint64_t appliedProfileGeneration = g_videoProfileGeneration.load(std::memory_order_relaxed);
 
   while (g_running.load()) {
+    const uint64_t generation = g_videoProfileGeneration.load(std::memory_order_relaxed);
+    if (generation != appliedProfileGeneration) {
+      const VideoProfile activeProfile = ActiveVideoProfile();
+      bool reconfigured = !g_renderer || g_renderer->Reconfigure(activeProfile.width, activeProfile.height);
+      if (reconfigured) {
+        useSharedDevice = sharedDeviceAvailableNow();
+        if (auto rebuilt = createDecoder(useSharedDevice)) {
+          decoder = std::move(rebuilt);
+          appliedProfileGeneration = generation;
+          g_decoderPrimed.store(false, std::memory_order_relaxed);
+          Log(L"decoder/render pipeline reconfigured: %dx%d@%d bitrate=%d",
+              activeProfile.width, activeProfile.height, activeProfile.fps, activeProfile.bitrate);
+        } else {
+          Log(L"decoder rebuild failed after profile change: %dx%d@%d",
+              activeProfile.width, activeProfile.height, activeProfile.fps);
+        }
+      } else {
+        Log(L"renderer reconfigure failed after profile change: %dx%d",
+            activeProfile.width, activeProfile.height);
+      }
+    }
+
     EncodedFrame encoded;
     {
       std::unique_lock lk(g_encodedMu);
@@ -2053,54 +2261,12 @@ static void DecoderThread() {
       if (!g_running.load()) break;
       encoded = std::move(g_encodedQueue.front());
       g_encodedQueue.pop_front();
+      g_encodedQueueDepthNow.store(static_cast<uint32_t>(g_encodedQueue.size()), std::memory_order_relaxed);
     }
     DecodedFrame frame;
     if (decoder->Decode(encoded, frame)) {
       g_decoderPrimed.store(true, std::memory_order_relaxed);
-      bool presented = false;
-      if (g_renderer) {
-        if (frame.gpu) {
-          presented = g_renderer->Render(frame.dxgi);
-          if (!presented) {
-            g_gpuRenderFails.fetch_add(1, std::memory_order_relaxed);
-            ++gpuPresentFailStreak;
-            if (useSharedDevice && sharedDeviceAvailable && gpuPresentFailStreak >= 4) {
-              Log(L"GPU present failed %u times, falling back to CPU-copy decode", gpuPresentFailStreak);
-              if (auto fallback = createDecoder(false)) {
-                decoder = std::move(fallback);
-                useSharedDevice = false;
-                gpuPresentFailStreak = 0;
-                g_decoderPrimed.store(false, std::memory_order_relaxed);
-              }
-            }
-          } else {
-            gpuPresentFailStreak = 0;
-          }
-        } else {
-          presented = g_renderer->Render(frame.nv12);
-          if (presented) gpuPresentFailStreak = 0;
-        }
-        if (presented) {
-          g_framesPresented.fetch_add(1, std::memory_order_relaxed);
-          if (frame.gpu) g_gpuFrames.fetch_add(1, std::memory_order_relaxed);
-          else g_cpuFrames.fetch_add(1, std::memory_order_relaxed);
-          uint64_t presentQpc = QpcNow();
-          uint64_t recvQpc = frame.gpu ? frame.dxgi.recvQpc : frame.nv12.recvQpc;
-          g_lastPresentQpc.store(presentQpc, std::memory_order_relaxed);
-          g_lastRxToPresentUs.store(QpcDeltaUs(recvQpc, presentQpc), std::memory_order_relaxed);
-        }
-      }
-      if (!presented && !frame.gpu) {
-        BgraFrame bgra;
-        NV12ToBGRA(frame.nv12.bytes.data(), static_cast<DWORD>(frame.nv12.bytes.size()), frame.nv12.width, frame.nv12.height, bgra.bytes);
-        bgra.width = frame.nv12.width;
-        bgra.height = frame.nv12.height;
-        {
-          std::lock_guard lk(g_frameMu);
-          g_latestFrame = std::move(bgra);
-        }
-        InvalidateRect(g_hwnd, nullptr, FALSE);
-      }
+      PushDecoded(std::move(frame));
     } else {
       g_decodeFails.fetch_add(1, std::memory_order_relaxed);
       EnterVideoRecovery(L"decode failed");
@@ -2108,6 +2274,78 @@ static void DecoderThread() {
   }
   MFShutdown();
   CoUninitialize();
+}
+
+static void RenderThread() {
+  SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+  SetThreadDescription(GetCurrentThread(), L"P2P video present");
+  uint32_t gpuPresentFailStreak = 0;
+  uint64_t lastPresentQpcLocal = 0;
+
+  while (g_running.load()) {
+    DecodedFrame frame;
+    {
+      std::unique_lock lk(g_decodedMu);
+      g_decodedCv.wait(lk, [] { return !g_running.load() || !g_decodedQueue.empty(); });
+      if (!g_running.load()) break;
+      frame = std::move(g_decodedQueue.back());
+      if (g_decodedQueue.size() > 1) {
+        g_renderFramesDropped.fetch_add(static_cast<uint64_t>(g_decodedQueue.size() - 1), std::memory_order_relaxed);
+      }
+      g_decodedQueue.clear();
+      g_decodedQueueDepthNow.store(0, std::memory_order_relaxed);
+    }
+
+    bool presented = false;
+    if (g_renderer) {
+      const int fps = std::max(30, g_activeVideoFps.load(std::memory_order_relaxed));
+      const uint64_t frameIntervalUs = 1'000'000ull / static_cast<uint64_t>(fps);
+      const uint64_t nowBeforePresent = QpcNow();
+      if (lastPresentQpcLocal) {
+        const uint64_t sinceLastPresentUs = QpcDeltaUs(lastPresentQpcLocal, nowBeforePresent);
+        if (sinceLastPresentUs + 2'000 < frameIntervalUs) {
+          Sleep(static_cast<DWORD>(std::max<uint64_t>(0, (frameIntervalUs - sinceLastPresentUs - 1'000) / 1000)));
+        }
+      }
+      g_renderer->WaitForPresentReady();
+      if (frame.gpu) {
+        presented = g_renderer->Render(frame.dxgi);
+        if (!presented) {
+          g_gpuRenderFails.fetch_add(1, std::memory_order_relaxed);
+          ++gpuPresentFailStreak;
+        } else {
+          gpuPresentFailStreak = 0;
+        }
+      } else {
+        presented = g_renderer->Render(frame.nv12);
+        if (presented) gpuPresentFailStreak = 0;
+      }
+    }
+
+    if (presented) {
+      lastPresentQpcLocal = QpcNow();
+      g_framesPresented.fetch_add(1, std::memory_order_relaxed);
+      if (frame.gpu) g_gpuFrames.fetch_add(1, std::memory_order_relaxed);
+      else g_cpuFrames.fetch_add(1, std::memory_order_relaxed);
+      uint64_t presentQpc = QpcNow();
+      uint64_t recvQpc = frame.gpu ? frame.dxgi.recvQpc : frame.nv12.recvQpc;
+      g_lastPresentQpc.store(presentQpc, std::memory_order_relaxed);
+      g_lastRxToPresentUs.store(QpcDeltaUs(recvQpc, presentQpc), std::memory_order_relaxed);
+      continue;
+    }
+
+    if (!frame.gpu) {
+      BgraFrame bgra;
+      NV12ToBGRA(frame.nv12.bytes.data(), static_cast<DWORD>(frame.nv12.bytes.size()), frame.nv12.width, frame.nv12.height, bgra.bytes);
+      bgra.width = frame.nv12.width;
+      bgra.height = frame.nv12.height;
+      {
+        std::lock_guard lk(g_frameMu);
+        g_latestFrame = std::move(bgra);
+      }
+      InvalidateRect(g_hwnd, nullptr, FALSE);
+    }
+  }
 }
 
 static uint16_t VkToMacKeyCode(WPARAM vk) {
@@ -2167,7 +2405,7 @@ static void SendVideoBitrateControl(int bitrate, const wchar_t* reason) {
   Log(L"adaptive bitrate request=%d (%s)", clamped, reason ? reason : L"adaptive");
 }
 
-static void EnterVideoRecovery(const wchar_t* reason) {
+static void EnterVideoRecovery(const wchar_t* reason, bool reduceBitrate) {
   g_waitingForKeyframe.store(true, std::memory_order_relaxed);
   g_decoderPrimed.store(false, std::memory_order_relaxed);
   {
@@ -2177,6 +2415,14 @@ static void EnterVideoRecovery(const wchar_t* reason) {
       g_encodedQueue.clear();
     }
   }
+  {
+    std::lock_guard lk(g_decodedMu);
+    if (!g_decodedQueue.empty()) {
+      g_renderFramesDropped.fetch_add(static_cast<uint64_t>(g_decodedQueue.size()), std::memory_order_relaxed);
+      g_decodedQueue.clear();
+      g_decodedQueueDepthNow.store(0, std::memory_order_relaxed);
+    }
+  }
 
   if (!g_cfg.udpVideo) return;
   const uint64_t now = QpcNow();
@@ -2184,10 +2430,12 @@ static void EnterVideoRecovery(const wchar_t* reason) {
   if (last && QpcDeltaUs(last, now) < 120'000) return;
   g_lastKeyframeRequestQpc.store(now, std::memory_order_relaxed);
   g_keyframeRequests.fetch_add(1, std::memory_order_relaxed);
-  const int current = g_currentBitrate.load(std::memory_order_relaxed);
-  const int reduced = std::max(g_minAdaptiveBitrate.load(std::memory_order_relaxed), current * 85 / 100);
-  if (reduced < current) {
-    SendVideoBitrateControl(reduced, L"recovery");
+  if (reduceBitrate) {
+    const int current = g_currentBitrate.load(std::memory_order_relaxed);
+    const int reduced = std::max(g_minAdaptiveBitrate.load(std::memory_order_relaxed), current * 85 / 100);
+    if (reduced < current) {
+      SendVideoBitrateControl(reduced, L"recovery");
+    }
   }
   SendInputPacket(P2_INPUT_REQUEST_KEYFRAME, 0, 0, 0, 0, 0, 0);
   Log(L"requested keyframe recovery: %s", reason ? reason : L"unknown");
@@ -2212,6 +2460,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       static uint64_t lastComplete = 0;
       static uint64_t lastPackets = 0;
       static uint64_t lastBytes = 0;
+      static uint64_t lastClientDropped = 0;
+      static uint64_t lastNetworkDropped = 0;
       static uint64_t lastQpc = QpcNow();
       uint64_t now = QpcNow();
       uint64_t frames = g_framesPresented.load(std::memory_order_relaxed);
@@ -2253,13 +2503,24 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       stats.gpuRenderFails = gpuRenderFails;
       stats.gpuFrames = gpu;
       stats.cpuFrames = cpu;
-      const uint64_t clientKnownFrames = complete + clientDropped;
-      const uint64_t networkKnownFrames = complete + networkDropped;
-      stats.queueDropPct = clientKnownFrames ? (double(clientDropped) * 100.0 / double(clientKnownFrames)) : 0.0;
-      stats.networkDropPct = networkKnownFrames ? (double(networkDropped) * 100.0 / double(networkKnownFrames)) : 0.0;
+      stats.queueDepth = g_encodedQueueDepthNow.load(std::memory_order_relaxed);
+      stats.queueTarget = g_encodedQueueTargetNow.load(std::memory_order_relaxed);
+      stats.decodedQueueDepth = g_decodedQueueDepthNow.load(std::memory_order_relaxed);
+      stats.decodedQueueTarget = g_decodedQueueTargetNow.load(std::memory_order_relaxed);
+      stats.renderDropped = g_renderFramesDropped.load(std::memory_order_relaxed);
+      const uint64_t clientDroppedDelta = clientDropped >= lastClientDropped ? (clientDropped - lastClientDropped) : clientDropped;
+      const uint64_t networkDroppedDelta = networkDropped >= lastNetworkDropped ? (networkDropped - lastNetworkDropped) : networkDropped;
+      const uint64_t completeDelta = complete >= lastComplete ? (complete - lastComplete) : complete;
+      const uint64_t clientKnownFrames = completeDelta + clientDroppedDelta;
+      const uint64_t networkKnownFrames = completeDelta + networkDroppedDelta;
+      stats.networkDropPct = networkKnownFrames ? (double(networkDroppedDelta) * 100.0 / double(networkKnownFrames)) : 0.0;
+      stats.queueDropPct = clientKnownFrames ? (double(clientDroppedDelta) * 100.0 / double(clientKnownFrames)) : 0.0;
+      lastClientDropped = clientDropped;
+      lastNetworkDropped = networkDropped;
       StoreUiStats(stats);
 
       if (g_cfg.udpVideo) {
+        const VideoProfile activeProfile = ActiveVideoProfile();
         double prevScore = g_recentDropScore.load(std::memory_order_relaxed);
         double dropScore = prevScore * 0.72 + stats.queueDropPct * 0.28;
         g_recentDropScore.store(dropScore, std::memory_order_relaxed);
@@ -2269,28 +2530,29 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         const uint64_t sinceCtl = lastCtlQpc ? QpcDeltaUs(lastCtlQpc, now) : UINT64_MAX;
         const uint64_t sinceUp = lastUpQpc ? QpcDeltaUs(lastUpQpc, now) : UINT64_MAX;
         const uint64_t sinceProfile = lastProfileQpc ? QpcDeltaUs(lastProfileQpc, now) : UINT64_MAX;
-        const bool canAdjust = sinceCtl >= 1'200'000;
+        const bool canAdjust = sinceCtl >= 700'000;
         const int current = g_currentBitrate.load(std::memory_order_relaxed);
         const int bitrateFloor = g_minAdaptiveBitrate.load(std::memory_order_relaxed);
-        const bool overloaded = dropScore >= 8.0 || stats.frameAgeMs > 55.0 || stats.packetAgeMs > 40.0 || (stats.presentFps > 0.1 && stats.presentFps + 8.0 < double(g_cfg.fps));
-        const bool severeOverload = dropScore >= 16.0 || stats.frameAgeMs > 95.0 || stats.packetAgeMs > 75.0 || (stats.presentFps > 0.1 && stats.presentFps + 14.0 < double(g_cfg.fps));
-        const bool stable = dropScore <= 2.0 && stats.frameAgeMs < 20.0 && stats.packetAgeMs < 16.0 && stats.presentFps >= double(g_cfg.fps) - 2.0;
+        const double queueFill = stats.queueTarget > 0 ? (double(stats.queueDepth) / double(stats.queueTarget)) : 0.0;
+        const bool overloaded = dropScore >= 2.0 || queueFill >= 0.72 || stats.frameAgeMs > 32.0 || stats.packetAgeMs > 24.0 || (stats.presentFps > 0.1 && stats.presentFps + 4.0 < double(activeProfile.fps));
+        const bool severeOverload = dropScore >= 6.0 || queueFill >= 0.9 || stats.frameAgeMs > 60.0 || stats.packetAgeMs > 45.0 || (stats.presentFps > 0.1 && stats.presentFps + 8.0 < double(activeProfile.fps));
+        const bool stable = dropScore <= 1.0 && stats.frameAgeMs < 16.0 && stats.packetAgeMs < 12.0 && stats.presentFps >= double(activeProfile.fps) - 1.0;
         if (canAdjust) {
           if (overloaded) {
-            const int reduced = std::max(bitrateFloor, current * 84 / 100);
+            const int reduced = std::max(bitrateFloor, current * (queueFill >= 0.9 ? 68 : 74) / 100);
             if (reduced < current) {
               SendVideoBitrateControl(reduced, L"overload");
             }
-          } else if (stable && sinceUp >= 3'000'000) {
-            const int increased = std::min(g_maxAdaptiveBitrate.load(std::memory_order_relaxed), current + std::max(300'000, current / 14));
+          } else if (stable && sinceUp >= 4'000'000) {
+            const int increased = std::min(g_maxAdaptiveBitrate.load(std::memory_order_relaxed), current + std::max(200'000, current / 18));
             if (increased > current) {
               SendVideoBitrateControl(increased, L"stable");
             }
           }
         }
-        if (severeOverload && sinceProfile >= 12'000'000 && (current <= bitrateFloor + 600'000 || stats.presentFps + 18.0 < double(g_cfg.fps))) {
+        if (severeOverload && sinceProfile >= 15'000'000 && (current <= bitrateFloor + 500'000 || stats.presentFps + 20.0 < double(activeProfile.fps))) {
           VideoProfile downgraded{};
-          if (BuildLowerAutoProfile(CurrentVideoProfile(), downgraded)) {
+          if (BuildLowerAutoProfile(activeProfile, downgraded)) {
             if (RequestProfileApply(downgraded, L"auto-overload", true)) {
               return 0;
             }
@@ -2417,13 +2679,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_DESTROY:
       KillTimer(hwnd, 1);
-      g_running.store(false);
-      g_encodedCv.notify_all();
-      if (g_toolbarHwnd) { DestroyWindow(g_toolbarHwnd); g_toolbarHwnd = nullptr; }
-      if (g_menuHwnd) { DestroyWindow(g_menuHwnd); g_menuHwnd = nullptr; }
-      if (g_statsHwnd) { DestroyWindow(g_statsHwnd); g_statsHwnd = nullptr; }
-      PostQuitMessage(g_exitCode);
-      return 0;
+  g_running.store(false);
+  g_encodedCv.notify_all();
+  g_decodedCv.notify_all();
+  if (g_toolbarHwnd) { DestroyWindow(g_toolbarHwnd); g_toolbarHwnd = nullptr; }
+  if (g_menuHwnd) { DestroyWindow(g_menuHwnd); g_menuHwnd = nullptr; }
+  if (g_statsHwnd) { DestroyWindow(g_statsHwnd); g_statsHwnd = nullptr; }
+  PostQuitMessage(g_exitCode);
+  return 0;
   }
   return DefWindowProc(hwnd, msg, wp, lp);
 }
@@ -2455,10 +2718,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     return 1;
   }
   const int initialBitrate = std::max(2'000'000, g_cfg.bitrate > 0 ? g_cfg.bitrate : 14'000'000);
-  g_currentBitrate.store(initialBitrate, std::memory_order_relaxed);
-  const int adaptiveCeiling = std::max({initialBitrate, AutoBitrateForPixels(g_cfg.width, g_cfg.height, initialBitrate), 20'000'000});
-  g_maxAdaptiveBitrate.store(std::min(80'000'000, adaptiveCeiling), std::memory_order_relaxed);
-  g_minAdaptiveBitrate.store(std::max(2'000'000, initialBitrate / 3), std::memory_order_relaxed);
+  CommitActiveVideoProfile(VideoProfile{g_cfg.width, g_cfg.height, g_cfg.fps, initialBitrate});
   g_recentDropScore.store(0.0, std::memory_order_relaxed);
   g_lastBitrateControlQpc.store(0, std::memory_order_relaxed);
   g_lastBitrateIncreaseQpc.store(0, std::memory_order_relaxed);
@@ -2483,7 +2743,8 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
                            x, y, w, h, nullptr, nullptr, hInst, nullptr);
   CreateOverlayWindows(hInst);
   g_renderer = std::make_unique<D3DRenderer>();
-  if (!g_renderer->Init(g_hwnd, g_cfg.width, g_cfg.height)) {
+  const VideoProfile initialProfile = ActiveVideoProfile();
+  if (!g_renderer->Init(g_hwnd, initialProfile.width, initialProfile.height)) {
     g_renderer.reset();
     MessageBoxW(g_hwnd, L"D3D11 flip-model renderer failed; falling back to GDI.", L"P2P Native", MB_ICONWARNING);
   }
@@ -2492,6 +2753,7 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
     ? std::thread(VideoReceiver(g_cfg.videoPort))
     : std::thread(TcpVideoReceiver(g_cfg.hostIp, g_cfg.videoPort));
   std::thread dec(DecoderThread);
+  std::thread ren(RenderThread);
 
   MSG msg{};
   while (GetMessageW(&msg, nullptr, 0, 0) > 0) {
@@ -2501,8 +2763,10 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
 
   g_running.store(false);
   g_encodedCv.notify_all();
+  g_decodedCv.notify_all();
   if (rx.joinable()) rx.detach(); // recvfrom may block; process is exiting
   if (dec.joinable()) dec.join();
+  if (ren.joinable()) ren.join();
   g_renderer.reset();
   if (g_inputSock != INVALID_SOCKET) closesocket(g_inputSock);
   WSACleanup();

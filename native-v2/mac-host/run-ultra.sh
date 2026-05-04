@@ -21,5 +21,5 @@ exec "$BIN" \
   --height "$HEIGHT" \
   --fps "$FPS" \
   --bitrate "$BITRATE" \
-  --keyint 1 \
+  --keyint 6 \
   --transport "$TRANSPORT"

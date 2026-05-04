@@ -153,7 +153,7 @@ function clampEven(value, fallback = 2) {
   return number % 2 === 0 ? number : number - 1;
 }
 
-function scaleResolution(width, height, maxLongEdge = 1600) {
+function scaleResolution(width, height, maxLongEdge = 7680) {
   const longEdge = Math.max(width, height);
   if (!longEdge || longEdge <= maxLongEdge) {
     return { width: clampEven(width, 1920), height: clampEven(height, 1080) };
@@ -235,7 +235,7 @@ function nativeV2HostOptions(device) {
     height: display.height,
     fps: defaults.fps || 60,
     bitrate: display.bitrate,
-    keyint: defaults.keyint || 1,
+    keyint: defaults.keyint || 6,
     transport,
   };
 }
