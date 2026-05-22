@@ -142,6 +142,8 @@ static std::atomic<uint64_t> g_lastPacketQpc{0};
 static std::atomic<uint64_t> g_lastCompleteQpc{0};
 static std::atomic<bool> g_decoderPrimed{false};
 static std::atomic<bool> g_waitingForKeyframe{false};
+static std::atomic<bool> g_loggedFirstDecodedFrame{false};
+static std::atomic<bool> g_loggedFirstPresentedFrame{false};
 static std::atomic<uint64_t> g_lastKeyframeRequestQpc{0};
 static std::atomic<uint64_t> g_keyframeRequests{0};
 static std::atomic<int> g_currentBitrate{12'000'000};
@@ -235,6 +237,19 @@ static void Log(const wchar_t* fmt, ...) {
   va_end(args);
   OutputDebugStringW(buf);
   OutputDebugStringW(L"\n");
+  HANDLE out = GetStdHandle(STD_OUTPUT_HANDLE);
+  if (out && out != INVALID_HANDLE_VALUE) {
+    int needed = WideCharToMultiByte(CP_UTF8, 0, buf, -1, nullptr, 0, nullptr, nullptr);
+    if (needed > 1) {
+      std::vector<char> utf8(static_cast<size_t>(needed));
+      int writtenChars = WideCharToMultiByte(CP_UTF8, 0, buf, -1, utf8.data(), needed, nullptr, nullptr);
+      if (writtenChars > 1) {
+        DWORD written = 0;
+        WriteFile(out, utf8.data(), static_cast<DWORD>(writtenChars - 1), &written, nullptr);
+        WriteFile(out, "\n", 1, &written, nullptr);
+      }
+    }
+  }
 }
 
 static bool StartsWith(const wchar_t* s, const wchar_t* p) {
@@ -1792,6 +1807,7 @@ class VideoReceiver {
       uint16_t flags = 0;
       uint64_t firstQpc = 0;
       uint16_t received = 0;
+      uint16_t dataReceived = 0;
       bool hasFec = false;
       uint16_t dataFragCount = 0;
       uint16_t fecIndex = 0;
@@ -1805,6 +1821,8 @@ class VideoReceiver {
     std::unordered_map<uint64_t, PartialFrame> partials;
     partials.reserve(16);
     uint64_t newestFrameId = 0;
+    bool reportedFirstPacket = false;
+    bool reportedFirstCompleteFrame = false;
 
     while (g_running.load()) {
       int n = recv(s, reinterpret_cast<char*>(packet.data()), static_cast<int>(packet.size()), 0);
@@ -1817,11 +1835,27 @@ class VideoReceiver {
       if (memcmp(h->magic, "P2V2", 4) != 0 || h->version != P2_VERSION) continue;
       if (h->headerBytes != sizeof(P2VideoHeader) || h->payloadBytes + h->headerBytes > n) continue;
       if (h->fragCount == 0 || h->fragIndex >= h->fragCount || h->frameBytes > 8 * 1024 * 1024) continue;
+      const uint16_t dataFragCountFromBytes = static_cast<uint16_t>(
+          (h->frameBytes + kMaxVideoFragmentPayload - 1) / kMaxVideoFragmentPayload);
+      if (dataFragCountFromBytes == 0 || dataFragCountFromBytes > h->fragCount ||
+          h->fragCount > dataFragCountFromBytes + 1) {
+        continue;
+      }
 
       const uint64_t now = QpcNow();
       g_packetsRx.fetch_add(1, std::memory_order_relaxed);
       g_bytesRx.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
       g_lastPacketQpc.store(now, std::memory_order_relaxed);
+      if (!reportedFirstPacket) {
+        reportedFirstPacket = true;
+        Log(L"UDP first video packet frame=%llu frag=%u/%u payload=%u frameBytes=%u flags=0x%x",
+            static_cast<unsigned long long>(h->frameId),
+            static_cast<unsigned>(h->fragIndex + 1),
+            static_cast<unsigned>(h->fragCount),
+            static_cast<unsigned>(h->payloadBytes),
+            static_cast<unsigned>(h->frameBytes),
+            static_cast<unsigned>(h->flags));
+      }
 
       if (newestFrameId && h->frameId + 12 < newestFrameId) continue;
       if (h->frameId > newestFrameId) {
@@ -1859,8 +1893,8 @@ class VideoReceiver {
         partial.firstQpc = now;
         partial.bytes.assign(h->frameBytes, 0);
         partial.got.assign(h->fragCount, 0);
-        partial.hasFec = (h->flags & P2_FLAG_FEC) != 0;
-        partial.dataFragCount = partial.hasFec && h->fragCount > 1 ? uint16_t(h->fragCount - 1) : h->fragCount;
+        partial.dataFragCount = dataFragCountFromBytes;
+        partial.hasFec = h->fragCount > dataFragCountFromBytes;
         partial.fecIndex = partial.dataFragCount;
       } else if (partial.fragCount != h->fragCount || partial.frameBytes != h->frameBytes) {
         partials.erase(it);
@@ -1870,23 +1904,27 @@ class VideoReceiver {
 
       if (partial.got[h->fragIndex]) continue;
       if ((h->flags & P2_FLAG_FEC) != 0) {
+        if (h->fragIndex < partial.dataFragCount) continue;
         partial.hasFec = true;
-        partial.dataFragCount = partial.fragCount > 1 ? uint16_t(partial.fragCount - 1) : partial.fragCount;
         partial.fecIndex = h->fragIndex;
         partial.fecPayloadBytes = h->payloadBytes;
         partial.fec.assign(packet.data() + h->headerBytes, packet.data() + h->headerBytes + h->payloadBytes);
         partial.got[h->fragIndex] = 1;
         ++partial.received;
       } else {
+        if (h->fragIndex >= partial.dataFragCount) continue;
         size_t off = static_cast<size_t>(h->fragIndex) * kMaxVideoFragmentPayload;
         if (off + h->payloadBytes > partial.bytes.size()) continue;
         memcpy(partial.bytes.data() + off, packet.data() + h->headerBytes, h->payloadBytes);
         partial.got[h->fragIndex] = 1;
         ++partial.received;
+        ++partial.dataReceived;
       }
 
       bool frameReady = false;
-      if (partial.hasFec) {
+      if (partial.dataReceived == partial.dataFragCount) {
+        frameReady = true;
+      } else if (partial.hasFec) {
         uint16_t missingIndex = 0xffff;
         uint16_t missingCount = 0;
         for (uint16_t idx = 0; idx < partial.dataFragCount; ++idx) {
@@ -1913,10 +1951,9 @@ class VideoReceiver {
           }
           memcpy(partial.bytes.data() + off, recovered.data(), recovered.size());
           partial.got[missingIndex] = 1;
+          ++partial.dataReceived;
           frameReady = true;
         }
-      } else if (partial.received == partial.fragCount) {
-        frameReady = true;
       }
 
       if (frameReady) {
@@ -1929,6 +1966,15 @@ class VideoReceiver {
         PushEncoded(std::move(out));
         g_framesComplete.fetch_add(1, std::memory_order_relaxed);
         g_lastCompleteQpc.store(QpcNow(), std::memory_order_relaxed);
+        if (!reportedFirstCompleteFrame) {
+          reportedFirstCompleteFrame = true;
+          Log(L"UDP first complete frame id=%llu bytes=%u frags=%u dataFrags=%u keyframe=%d",
+              static_cast<unsigned long long>(h->frameId),
+              static_cast<unsigned>(partial.frameBytes),
+              static_cast<unsigned>(partial.fragCount),
+              static_cast<unsigned>(partial.dataFragCount),
+              (partial.flags & P2_FLAG_KEYFRAME) != 0 ? 1 : 0);
+        }
         partials.erase(h->frameId);
       }
     }
@@ -2359,9 +2405,18 @@ static void DecoderThread() {
     DecodedFrame frame;
     if (decoder->Decode(encoded, frame)) {
       g_decoderPrimed.store(true, std::memory_order_relaxed);
+      if (!g_loggedFirstDecodedFrame.exchange(true, std::memory_order_relaxed)) {
+        Log(L"decoder first frame id=%llu mode=%s",
+            static_cast<unsigned long long>(encoded.frameId),
+            frame.gpu ? L"gpu" : L"cpu");
+      }
       PushDecoded(std::move(frame));
     } else {
       g_decodeFails.fetch_add(1, std::memory_order_relaxed);
+      Log(L"decode failed frame=%llu bytes=%zu keyframe=%d",
+          static_cast<unsigned long long>(encoded.frameId),
+          encoded.bytes.size(),
+          encoded.keyframe ? 1 : 0);
       EnterVideoRecovery(L"decode failed");
     }
   }
@@ -2412,6 +2467,9 @@ static void RenderThread() {
       uint64_t recvQpc = frame.gpu ? frame.dxgi.recvQpc : frame.nv12.recvQpc;
       g_lastPresentQpc.store(presentQpc, std::memory_order_relaxed);
       g_lastRxToPresentUs.store(QpcDeltaUs(recvQpc, presentQpc), std::memory_order_relaxed);
+      if (!g_loggedFirstPresentedFrame.exchange(true, std::memory_order_relaxed)) {
+        Log(L"present first frame mode=%s", frame.gpu ? L"gpu" : L"cpu");
+      }
       continue;
     }
 
