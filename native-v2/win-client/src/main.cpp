@@ -147,12 +147,6 @@ static std::atomic<bool> g_loggedFirstPresentedFrame{false};
 static std::atomic<uint64_t> g_lastKeyframeRequestQpc{0};
 static std::atomic<uint64_t> g_keyframeRequests{0};
 static std::atomic<int> g_currentBitrate{12'000'000};
-static std::atomic<int> g_minAdaptiveBitrate{4'000'000};
-static std::atomic<int> g_maxAdaptiveBitrate{20'000'000};
-static std::atomic<uint64_t> g_lastBitrateControlQpc{0};
-static std::atomic<uint64_t> g_lastBitrateIncreaseQpc{0};
-static std::atomic<double> g_recentDropScore{0.0};
-static std::atomic<uint64_t> g_lastAutoProfileChangeQpc{0};
 static std::atomic<int> g_activeVideoWidth{1920};
 static std::atomic<int> g_activeVideoHeight{1080};
 static std::atomic<int> g_activeVideoFps{60};
@@ -204,9 +198,8 @@ static std::mutex g_uiStatsMu;
 static NativeUiStats g_uiStats;
 
 static size_t EncodedQueueDepthTarget();
-static void EnterVideoRecovery(const wchar_t* reason, bool reduceBitrate = true);
+static void EnterVideoRecovery(const wchar_t* reason);
 static void SendInputPacket(uint8_t kind, float x, float y, int32_t dx, int32_t dy, uint16_t button, uint16_t keyCode);
-static void SendVideoBitrateControl(int bitrate, const wchar_t* reason);
 
 static uint64_t QpcNow() {
   LARGE_INTEGER q{};
@@ -720,7 +713,7 @@ static int ClampEven(int value, int fallback = 2) {
   return (number % 2) == 0 ? number : number - 1;
 }
 
-static int AutoBitrateForPixels(int width, int height, int fallback) {
+static int DefaultBitrateForPixels(int width, int height, int fallback) {
   const int64_t pixels = static_cast<int64_t>(width) * height;
   int bitrate = std::max(8'000'000, fallback);
   if (pixels <= 1280ll * 720ll) bitrate = std::max(bitrate, 8'000'000);
@@ -774,7 +767,7 @@ static VideoProfile ActiveVideoProfile() {
   profile.height = std::max(360, g_activeVideoHeight.load(std::memory_order_relaxed));
   profile.fps = std::max(30, g_activeVideoFps.load(std::memory_order_relaxed));
   const int bitrate = g_activeVideoBitrate.load(std::memory_order_relaxed);
-  profile.bitrate = bitrate > 0 ? bitrate : AutoBitrateForPixels(profile.width, profile.height, 14'000'000);
+  profile.bitrate = bitrate > 0 ? bitrate : DefaultBitrateForPixels(profile.width, profile.height, 14'000'000);
   return profile;
 }
 
@@ -782,16 +775,13 @@ static void CommitActiveVideoProfile(const VideoProfile& profile) {
   const int width = std::max(640, ClampEven(profile.width, g_cfg.width));
   const int height = std::max(360, ClampEven(profile.height, g_cfg.height));
   const int fps = std::clamp(profile.fps, 30, 240);
-  const int fallbackBitrate = AutoBitrateForPixels(width, height, 14'000'000);
+  const int fallbackBitrate = DefaultBitrateForPixels(width, height, 14'000'000);
   const int bitrate = std::clamp(profile.bitrate > 0 ? profile.bitrate : fallbackBitrate, 2'000'000, 80'000'000);
   g_activeVideoWidth.store(width, std::memory_order_relaxed);
   g_activeVideoHeight.store(height, std::memory_order_relaxed);
   g_activeVideoFps.store(fps, std::memory_order_relaxed);
   g_activeVideoBitrate.store(bitrate, std::memory_order_relaxed);
   g_currentBitrate.store(bitrate, std::memory_order_relaxed);
-  const int adaptiveCeiling = std::max({bitrate, AutoBitrateForPixels(width, height, bitrate), 20'000'000});
-  g_maxAdaptiveBitrate.store(std::min(80'000'000, adaptiveCeiling), std::memory_order_relaxed);
-  g_minAdaptiveBitrate.store(std::max(2'000'000, bitrate / 3), std::memory_order_relaxed);
 }
 
 static VideoProfile CurrentVideoProfile() {
@@ -1625,7 +1615,7 @@ static void SendVideoProfileCommand(const VideoProfile& profile) {
   }
 }
 
-static bool RequestProfileApply(const VideoProfile& requestedProfile, const wchar_t* reason, bool autoTriggered = false) {
+static bool RequestProfileApply(const VideoProfile& requestedProfile, const wchar_t* reason) {
   VideoProfile profile = requestedProfile;
   profile.width = ClampEven(profile.width, g_cfg.width);
   profile.height = ClampEven(profile.height, g_cfg.height);
@@ -1633,51 +1623,29 @@ static bool RequestProfileApply(const VideoProfile& requestedProfile, const wcha
   profile.bitrate = std::clamp(profile.bitrate, 2'000'000, 80'000'000);
   const VideoProfile activeProfile = CurrentVideoProfile();
   if (SameVideoProfile(activeProfile, profile)) {
-    if (!autoTriggered) HideNativePopups();
+    HideNativePopups();
     return false;
   }
 
   SyncPendingProfileToIndices(profile);
-  if (!autoTriggered && !WriteProfileFile(g_cfg.profileFile, profile)) {
-    if (autoTriggered) {
-      Log(L"auto profile apply save failed: %dx%d@%d bitrate=%d (%s)",
-          profile.width, profile.height, profile.fps, profile.bitrate, reason ? reason : L"auto");
-    } else {
-      MessageBoxW(g_hwnd, L"Failed to save the updated native-v2 profile.", L"P2P Native", MB_ICONERROR);
-    }
+  if (!WriteProfileFile(g_cfg.profileFile, profile)) {
+    MessageBoxW(g_hwnd, L"Failed to save the updated native-v2 profile.", L"P2P Native", MB_ICONERROR);
     return false;
   }
 
-  if (autoTriggered) {
-    g_lastAutoProfileChangeQpc.store(QpcNow(), std::memory_order_relaxed);
-  }
   g_lastProfileApplyQpc.store(QpcNow(), std::memory_order_relaxed);
   SendVideoProfileCommand(profile);
   CommitActiveVideoProfile(profile);
   g_videoProfileGeneration.fetch_add(1, std::memory_order_relaxed);
   Log(L"profile apply requested: %dx%d@%d bitrate=%d (%s)",
       profile.width, profile.height, profile.fps, profile.bitrate, reason ? reason : L"manual");
-  EnterVideoRecovery(L"profile changed", false);
+  EnterVideoRecovery(L"profile changed");
   HideNativePopups();
   if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
   if (g_toolbarHwnd) InvalidateRect(g_toolbarHwnd, nullptr, FALSE);
   if (g_menuHwnd) InvalidateRect(g_menuHwnd, nullptr, FALSE);
   if (g_statsHwnd) InvalidateRect(g_statsHwnd, nullptr, FALSE);
   return true;
-}
-
-static bool BuildLowerAutoProfile(const VideoProfile& activeProfile, VideoProfile& nextProfile) {
-  nextProfile = activeProfile;
-  const int liveBitrate = std::max(g_minAdaptiveBitrate.load(std::memory_order_relaxed),
-                                   g_currentBitrate.load(std::memory_order_relaxed));
-  nextProfile.bitrate = liveBitrate;
-
-  const int fpsIndex = FindClosestFpsIndex(activeProfile.fps);
-  if (fpsIndex > 0) {
-    nextProfile.fps = kFpsPresets[fpsIndex - 1];
-    return true;
-  }
-  return false;
 }
 
 static void ApplyPendingVideoProfile() {
@@ -2582,23 +2550,7 @@ static void SendInputPacket(uint8_t kind, float x, float y, int32_t dx, int32_t 
   sendto(g_inputSock, reinterpret_cast<const char*>(&p), sizeof(p), 0, reinterpret_cast<sockaddr*>(&g_inputAddr), sizeof(g_inputAddr));
 }
 
-static void SendVideoBitrateControl(int bitrate, const wchar_t* reason) {
-  if (g_inputSock == INVALID_SOCKET) return;
-  const int clamped = std::max(g_minAdaptiveBitrate.load(std::memory_order_relaxed),
-                               std::min(g_maxAdaptiveBitrate.load(std::memory_order_relaxed), bitrate));
-  const int current = g_currentBitrate.load(std::memory_order_relaxed);
-  if (clamped == current) return;
-  g_currentBitrate.store(clamped, std::memory_order_relaxed);
-  const uint64_t now = QpcNow();
-  g_lastBitrateControlQpc.store(now, std::memory_order_relaxed);
-  if (clamped > current) {
-    g_lastBitrateIncreaseQpc.store(now, std::memory_order_relaxed);
-  }
-  SendInputPacket(P2_INPUT_SET_VIDEO_BITRATE, 0, 0, static_cast<int32_t>(clamped), 0, 0, 0);
-  Log(L"adaptive bitrate request=%d (%s)", clamped, reason ? reason : L"adaptive");
-}
-
-static void EnterVideoRecovery(const wchar_t* reason, bool reduceBitrate) {
+static void EnterVideoRecovery(const wchar_t* reason) {
   g_waitingForKeyframe.store(true, std::memory_order_relaxed);
   g_decoderPrimed.store(false, std::memory_order_relaxed);
   {
@@ -2623,13 +2575,6 @@ static void EnterVideoRecovery(const wchar_t* reason, bool reduceBitrate) {
   if (last && QpcDeltaUs(last, now) < 120'000) return;
   g_lastKeyframeRequestQpc.store(now, std::memory_order_relaxed);
   g_keyframeRequests.fetch_add(1, std::memory_order_relaxed);
-  if (reduceBitrate) {
-    const int current = g_currentBitrate.load(std::memory_order_relaxed);
-    const int reduced = std::max(g_minAdaptiveBitrate.load(std::memory_order_relaxed), current * 85 / 100);
-    if (reduced < current) {
-      SendVideoBitrateControl(reduced, L"recovery");
-    }
-  }
   SendInputPacket(P2_INPUT_REQUEST_KEYFRAME, 0, 0, 0, 0, 0, 0);
   Log(L"requested keyframe recovery: %s", reason ? reason : L"unknown");
 }
@@ -2711,47 +2656,6 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       lastClientDropped = clientDropped;
       lastNetworkDropped = networkDropped;
       StoreUiStats(stats);
-
-      if (g_cfg.udpVideo) {
-        const VideoProfile activeProfile = ActiveVideoProfile();
-        double prevScore = g_recentDropScore.load(std::memory_order_relaxed);
-        double dropScore = prevScore * 0.72 + stats.queueDropPct * 0.28;
-        g_recentDropScore.store(dropScore, std::memory_order_relaxed);
-        const uint64_t lastCtlQpc = g_lastBitrateControlQpc.load(std::memory_order_relaxed);
-        const uint64_t lastUpQpc = g_lastBitrateIncreaseQpc.load(std::memory_order_relaxed);
-        const uint64_t lastProfileQpc = g_lastAutoProfileChangeQpc.load(std::memory_order_relaxed);
-        const uint64_t sinceCtl = lastCtlQpc ? QpcDeltaUs(lastCtlQpc, now) : UINT64_MAX;
-        const uint64_t sinceUp = lastUpQpc ? QpcDeltaUs(lastUpQpc, now) : UINT64_MAX;
-        const uint64_t sinceProfile = lastProfileQpc ? QpcDeltaUs(lastProfileQpc, now) : UINT64_MAX;
-        const bool canAdjust = sinceCtl >= 700'000;
-        const int current = g_currentBitrate.load(std::memory_order_relaxed);
-        const int bitrateFloor = g_minAdaptiveBitrate.load(std::memory_order_relaxed);
-        const double queueFill = stats.queueTarget > 0 ? (double(stats.queueDepth) / double(stats.queueTarget)) : 0.0;
-        const bool overloaded = dropScore >= 2.0 || queueFill >= 0.72 || stats.frameAgeMs > 32.0 || stats.packetAgeMs > 24.0 || (stats.presentFps > 0.1 && stats.presentFps + 4.0 < double(activeProfile.fps));
-        const bool severeOverload = dropScore >= 6.0 || queueFill >= 0.9 || stats.frameAgeMs > 60.0 || stats.packetAgeMs > 45.0 || (stats.presentFps > 0.1 && stats.presentFps + 8.0 < double(activeProfile.fps));
-        const bool stable = dropScore <= 1.0 && stats.frameAgeMs < 16.0 && stats.packetAgeMs < 12.0 && stats.presentFps >= double(activeProfile.fps) - 1.0;
-        if (canAdjust) {
-          if (overloaded) {
-            const int reduced = std::max(bitrateFloor, current * (queueFill >= 0.9 ? 68 : 74) / 100);
-            if (reduced < current) {
-              SendVideoBitrateControl(reduced, L"overload");
-            }
-          } else if (stable && sinceUp >= 4'000'000) {
-            const int increased = std::min(g_maxAdaptiveBitrate.load(std::memory_order_relaxed), current + std::max(200'000, current / 18));
-            if (increased > current) {
-              SendVideoBitrateControl(increased, L"stable");
-            }
-          }
-        }
-        if (severeOverload && sinceProfile >= 15'000'000 && (current <= bitrateFloor + 500'000 || stats.presentFps + 20.0 < double(activeProfile.fps))) {
-          VideoProfile downgraded{};
-          if (BuildLowerAutoProfile(activeProfile, downgraded)) {
-            if (RequestProfileApply(downgraded, L"auto-overload", true)) {
-              return 0;
-            }
-          }
-        }
-      }
 
       wchar_t title[512];
       swprintf_s(title, L"P2P Native v2 %s -> %s | present %.0f fps complete %.0f fps | %.1f Mbps %.0f pkt/s | last pkt %.0f ms frame %.0f ms | rx-present %.2f ms | drop local %llu net %llu | GPU %llu CPU %llu | bitrate %d Mbps",
@@ -2921,9 +2825,6 @@ int WINAPI wWinMain(HINSTANCE hInst, HINSTANCE, PWSTR, int nCmdShow) {
   }
   const int initialBitrate = std::max(2'000'000, g_cfg.bitrate > 0 ? g_cfg.bitrate : 14'000'000);
   CommitActiveVideoProfile(VideoProfile{g_cfg.width, g_cfg.height, g_cfg.fps, initialBitrate});
-  g_recentDropScore.store(0.0, std::memory_order_relaxed);
-  g_lastBitrateControlQpc.store(0, std::memory_order_relaxed);
-  g_lastBitrateIncreaseQpc.store(0, std::memory_order_relaxed);
 
   WNDCLASSW wc{};
   wc.lpfnWndProc = WndProc;
