@@ -1783,6 +1783,7 @@ class VideoReceiver {
       MessageBoxW(nullptr, L"Failed to bind video UDP port", L"P2P Native", MB_ICONERROR);
       return;
     }
+    Log(L"UDP video receiver bound on 0.0.0.0:%u fragmentPayload=%d", port_, kMaxVideoFragmentPayload);
 
     struct PartialFrame {
       uint32_t frameBytes = 0;
