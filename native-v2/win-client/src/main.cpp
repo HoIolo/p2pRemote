@@ -170,6 +170,7 @@ static int g_resolutionIndex = 0;
 static int g_fpsIndex = 0;
 static int g_bitrateIndex = 0;
 static int g_exitCode = 0;
+static bool g_toolbarExpanded = false;
 static constexpr std::array<int, 5> kFpsPresets = {30, 45, 60, 90, 120};
 static constexpr std::array<int, 5> kBitratePresetsMbps = {8, 12, 16, 24, 32};
 
@@ -670,12 +671,13 @@ float4 main(VSOut i) : SV_Target {
 
 static std::unique_ptr<D3DRenderer> g_renderer;
 
-static constexpr int kToolbarWidth = 560;
-static constexpr int kToolbarHeight = 60;
-static constexpr int kMenuWidth = 440;
-static constexpr int kMenuHeight = 486;
-static constexpr int kStatsWidth = 580;
-static constexpr int kStatsHeight = 862;
+static constexpr int kToolbarIconSize = 42;
+static constexpr int kToolbarWidth = 430;
+static constexpr int kToolbarHeight = 48;
+static constexpr int kMenuWidth = 360;
+static constexpr int kMenuHeight = 390;
+static constexpr int kStatsWidth = 430;
+static constexpr int kStatsHeight = 640;
 static constexpr wchar_t kNativeClientVersion[] = L"native v2 0.1.0";
 
 static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -1053,11 +1055,11 @@ static void DrawSignalBars(HDC hdc, int x, int y, COLORREF color) {
   HBRUSH oldBrush = reinterpret_cast<HBRUSH>(SelectObject(hdc, brush));
   HPEN pen = CreatePen(PS_SOLID, 1, color);
   HPEN oldPen = reinterpret_cast<HPEN>(SelectObject(hdc, pen));
-  const int widths[] = {5, 5, 5};
-  const int heights[] = {14, 23, 32};
+  const int widths[] = {4, 4, 4};
+  const int heights[] = {11, 18, 25};
   for (int i = 0; i < 3; ++i) {
-    int left = x + i * 12;
-    RoundRect(hdc, left, y + 34 - heights[i], left + widths[i], y + 34, 5, 5);
+    int left = x + i * 9;
+    RoundRect(hdc, left, y + 28 - heights[i], left + widths[i], y + 28, 4, 4);
   }
   SelectObject(hdc, oldPen);
   SelectObject(hdc, oldBrush);
@@ -1065,65 +1067,84 @@ static void DrawSignalBars(HDC hdc, int x, int y, COLORREF color) {
   DeleteObject(brush);
 }
 
-static void DrawMenuIcon(HDC hdc, int kind, int x, int y, COLORREF color) {
+static void DrawMenuIcon(HDC hdc, int kind, int x, int y, COLORREF color, int size = 22) {
+  const int oldMode = SetMapMode(hdc, MM_ANISOTROPIC);
+  SIZE oldWindowExt{}, oldViewportExt{};
+  POINT oldViewportOrg{}, oldWindowOrg{};
+  GetWindowExtEx(hdc, &oldWindowExt);
+  GetViewportExtEx(hdc, &oldViewportExt);
+  GetViewportOrgEx(hdc, &oldViewportOrg);
+  GetWindowOrgEx(hdc, &oldWindowOrg);
+  SetWindowExtEx(hdc, 28, 28, nullptr);
+  SetViewportExtEx(hdc, size, size, nullptr);
+  SetViewportOrgEx(hdc, x, y, nullptr);
+  SetWindowOrgEx(hdc, 0, 0, nullptr);
+
   HPEN pen = CreatePen(PS_SOLID, 2, color);
   HPEN oldPen = reinterpret_cast<HPEN>(SelectObject(hdc, pen));
   HBRUSH oldBrush = reinterpret_cast<HBRUSH>(SelectObject(hdc, GetStockObject(NULL_BRUSH)));
 
   switch (kind) {
     case 0:
-      RoundRect(hdc, x + 2, y + 3, x + 24, y + 20, 4, 4);
-      MoveToEx(hdc, x + 13, y + 20, nullptr); LineTo(hdc, x + 13, y + 25);
-      MoveToEx(hdc, x + 8, y + 25, nullptr); LineTo(hdc, x + 18, y + 25);
+      RoundRect(hdc, 2, 3, 24, 20, 4, 4);
+      MoveToEx(hdc, 13, 20, nullptr); LineTo(hdc, 13, 25);
+      MoveToEx(hdc, 8, 25, nullptr); LineTo(hdc, 18, 25);
       break;
     case 1:
-      Rectangle(hdc, x + 3, y + 4, x + 24, y + 23);
-      MoveToEx(hdc, x + 6, y + 17, nullptr); LineTo(hdc, x + 12, y + 11); LineTo(hdc, x + 16, y + 15); LineTo(hdc, x + 22, y + 8);
-      Ellipse(hdc, x + 7, y + 6, x + 12, y + 11);
+      Rectangle(hdc, 3, 4, 24, 23);
+      MoveToEx(hdc, 6, 17, nullptr); LineTo(hdc, 12, 11); LineTo(hdc, 16, 15); LineTo(hdc, 22, 8);
+      Ellipse(hdc, 7, 6, 12, 11);
       break;
     case 2:
-      RoundRect(hdc, x + 3, y + 3, x + 24, y + 24, 4, 4);
-      MoveToEx(hdc, x + 9, y + 3, nullptr); LineTo(hdc, x + 9, y + 10); LineTo(hdc, x + 3, y + 10);
-      MoveToEx(hdc, x + 18, y + 24, nullptr); LineTo(hdc, x + 18, y + 17); LineTo(hdc, x + 24, y + 17);
+      RoundRect(hdc, 3, 3, 24, 24, 4, 4);
+      MoveToEx(hdc, 9, 3, nullptr); LineTo(hdc, 9, 10); LineTo(hdc, 3, 10);
+      MoveToEx(hdc, 18, 24, nullptr); LineTo(hdc, 18, 17); LineTo(hdc, 24, 17);
       break;
     case 3:
-      MoveToEx(hdc, x + 4, y + 14, nullptr); LineTo(hdc, x + 10, y + 14); LineTo(hdc, x + 17, y + 7); LineTo(hdc, x + 17, y + 21); LineTo(hdc, x + 10, y + 14);
-      Arc(hdc, x + 12, y + 7, x + 28, y + 21, x + 22, y + 8, x + 22, y + 20);
+      MoveToEx(hdc, 4, 14, nullptr); LineTo(hdc, 10, 14); LineTo(hdc, 17, 7); LineTo(hdc, 17, 21); LineTo(hdc, 10, 14);
+      Arc(hdc, 12, 7, 28, 21, 22, 8, 22, 20);
       break;
     case 4: {
-      POINT pts[] = {{x + 14, y + 2}, {x + 24, y + 6}, {x + 21, y + 20}, {x + 14, y + 26}, {x + 7, y + 20}, {x + 4, y + 6}};
+      POINT pts[] = {{14, 2}, {24, 6}, {21, 20}, {14, 26}, {7, 20}, {4, 6}};
       Polygon(hdc, pts, ARRAYSIZE(pts));
-      MoveToEx(hdc, x + 10, y + 14, nullptr); LineTo(hdc, x + 13, y + 17); LineTo(hdc, x + 19, y + 10);
+      MoveToEx(hdc, 10, 14, nullptr); LineTo(hdc, 13, 17); LineTo(hdc, 19, 10);
       break;
     }
     case 5:
-      MoveToEx(hdc, x + 14, y + 3, nullptr); LineTo(hdc, x + 14, y + 23);
-      MoveToEx(hdc, x + 8, y + 10, nullptr); LineTo(hdc, x + 14, y + 16); LineTo(hdc, x + 21, y + 9);
-      Ellipse(hdc, x + 11, y + 21, x + 17, y + 27);
-      Rectangle(hdc, x + 18, y + 6, x + 24, y + 12);
+      MoveToEx(hdc, 14, 3, nullptr); LineTo(hdc, 14, 23);
+      MoveToEx(hdc, 8, 10, nullptr); LineTo(hdc, 14, 16); LineTo(hdc, 21, 9);
+      Ellipse(hdc, 11, 21, 17, 27);
+      Rectangle(hdc, 18, 6, 24, 12);
       break;
     case 6:
       for (int yy = 0; yy < 2; ++yy) for (int xx = 0; xx < 2; ++xx) {
-        RoundRect(hdc, x + 3 + xx * 12, y + 4 + yy * 12, x + 11 + xx * 12, y + 12 + yy * 12, 3, 3);
+        RoundRect(hdc, 3 + xx * 12, 4 + yy * 12, 11 + xx * 12, 12 + yy * 12, 3, 3);
       }
       break;
     case 7:
-      MoveToEx(hdc, x + 4, y + 11, nullptr); LineTo(hdc, x + 4, y + 4); LineTo(hdc, x + 11, y + 4);
-      MoveToEx(hdc, x + 17, y + 4, nullptr); LineTo(hdc, x + 24, y + 4); LineTo(hdc, x + 24, y + 11);
-      MoveToEx(hdc, x + 24, y + 17, nullptr); LineTo(hdc, x + 24, y + 24); LineTo(hdc, x + 17, y + 24);
-      MoveToEx(hdc, x + 11, y + 24, nullptr); LineTo(hdc, x + 4, y + 24); LineTo(hdc, x + 4, y + 17);
+      MoveToEx(hdc, 4, 11, nullptr); LineTo(hdc, 4, 4); LineTo(hdc, 11, 4);
+      MoveToEx(hdc, 17, 4, nullptr); LineTo(hdc, 24, 4); LineTo(hdc, 24, 11);
+      MoveToEx(hdc, 24, 17, nullptr); LineTo(hdc, 24, 24); LineTo(hdc, 17, 24);
+      MoveToEx(hdc, 11, 24, nullptr); LineTo(hdc, 4, 24); LineTo(hdc, 4, 17);
       break;
     case 8:
-      MoveToEx(hdc, x + 3, y + 5, nullptr); LineTo(hdc, x + 15, y + 5); MoveToEx(hdc, x + 3, y + 23, nullptr); LineTo(hdc, x + 15, y + 23);
-      MoveToEx(hdc, x + 3, y + 5, nullptr); LineTo(hdc, x + 3, y + 23);
-      MoveToEx(hdc, x + 11, y + 14, nullptr); LineTo(hdc, x + 25, y + 14);
-      MoveToEx(hdc, x + 20, y + 9, nullptr); LineTo(hdc, x + 25, y + 14); LineTo(hdc, x + 20, y + 19);
+      MoveToEx(hdc, 3, 5, nullptr); LineTo(hdc, 15, 5); MoveToEx(hdc, 3, 23, nullptr); LineTo(hdc, 15, 23);
+      MoveToEx(hdc, 3, 5, nullptr); LineTo(hdc, 3, 23);
+      MoveToEx(hdc, 11, 14, nullptr); LineTo(hdc, 25, 14);
+      MoveToEx(hdc, 20, 9, nullptr); LineTo(hdc, 25, 14); LineTo(hdc, 20, 19);
       break;
   }
 
   SelectObject(hdc, oldBrush);
   SelectObject(hdc, oldPen);
   DeleteObject(pen);
+  SetMapMode(hdc, oldMode);
+  SetWindowOrgEx(hdc, oldWindowOrg.x, oldWindowOrg.y, nullptr);
+  SetViewportOrgEx(hdc, oldViewportOrg.x, oldViewportOrg.y, nullptr);
+  if (oldMode == MM_ANISOTROPIC || oldMode == MM_ISOTROPIC) {
+    SetWindowExtEx(hdc, oldWindowExt.cx, oldWindowExt.cy, nullptr);
+    SetViewportExtEx(hdc, oldViewportExt.cx, oldViewportExt.cy, nullptr);
+  }
 }
 
 static void ApplyRoundedRegion(HWND hwnd, int radius) {
@@ -1150,39 +1171,58 @@ static void UpdateOverlayLayout() {
   if (!g_hwnd || !g_toolbarHwnd) return;
   RECT owner{};
   GetWindowRect(g_hwnd, &owner);
-  int ownerW = owner.right - owner.left;
-  int toolbarX = owner.left + std::max(0, (ownerW - kToolbarWidth) / 2);
-  int toolbarY = owner.top + 10;
-  ClampToMonitor(toolbarX, toolbarY, kToolbarWidth, kToolbarHeight);
+  RECT client{};
+  GetClientRect(g_hwnd, &client);
+  POINT clientOrigin{0, 0};
+  ClientToScreen(g_hwnd, &clientOrigin);
+  const int clientLeft = clientOrigin.x;
+  const int clientTop = clientOrigin.y;
+  const int clientRight = clientLeft + (client.right - client.left);
+  const int toolbarWidth = g_toolbarExpanded ? kToolbarWidth : kToolbarIconSize;
+  const int toolbarHeight = g_toolbarExpanded ? kToolbarHeight : kToolbarIconSize;
+  int toolbarX = std::max(clientLeft + 12, clientRight - toolbarWidth - 12);
+  int toolbarY = clientTop + 12;
+  ClampToMonitor(toolbarX, toolbarY, toolbarWidth, toolbarHeight);
 
-  SetWindowPos(g_toolbarHwnd, HWND_TOPMOST, toolbarX, toolbarY, kToolbarWidth, kToolbarHeight,
+  SetWindowPos(g_toolbarHwnd, HWND_TOPMOST, toolbarX, toolbarY, toolbarWidth, toolbarHeight,
                SWP_NOACTIVATE | SWP_SHOWWINDOW);
-  ApplyRoundedRegion(g_toolbarHwnd, 28);
+  ApplyRoundedRegion(g_toolbarHwnd, g_toolbarExpanded ? 22 : kToolbarIconSize);
 
   if (g_menuHwnd && IsWindowVisible(g_menuHwnd)) {
-    int x = toolbarX + 28;
-    int y = toolbarY + kToolbarHeight + 8;
+    int x = toolbarX + toolbarWidth - kMenuWidth;
+    int y = toolbarY + toolbarHeight + 8;
     ClampToMonitor(x, y, kMenuWidth, kMenuHeight);
     SetWindowPos(g_menuHwnd, HWND_TOPMOST, x, y, kMenuWidth, kMenuHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    ApplyRoundedRegion(g_menuHwnd, 18);
+    ApplyRoundedRegion(g_menuHwnd, 16);
   }
 
   if (g_statsHwnd && IsWindowVisible(g_statsHwnd)) {
-    int x = toolbarX + std::max(0, kToolbarWidth - kStatsWidth);
-    int y = toolbarY + kToolbarHeight + 8;
+    int x = toolbarX + toolbarWidth - kStatsWidth;
+    int y = toolbarY + toolbarHeight + 8;
     ClampToMonitor(x, y, kStatsWidth, kStatsHeight);
     SetWindowPos(g_statsHwnd, HWND_TOPMOST, x, y, kStatsWidth, kStatsHeight, SWP_NOACTIVATE | SWP_SHOWWINDOW);
-    ApplyRoundedRegion(g_statsHwnd, 18);
+    ApplyRoundedRegion(g_statsHwnd, 16);
   }
 }
 
 static void HideNativePopups() {
   if (g_menuHwnd) ShowWindow(g_menuHwnd, SW_HIDE);
   if (g_statsHwnd) ShowWindow(g_statsHwnd, SW_HIDE);
+  if (g_toolbarExpanded) {
+    g_toolbarExpanded = false;
+    UpdateOverlayLayout();
+  }
   if (g_toolbarHwnd) InvalidateRect(g_toolbarHwnd, nullptr, FALSE);
 }
 
+static bool NativeOverlayIsOpen() {
+  return g_toolbarExpanded
+    || (g_menuHwnd && IsWindowVisible(g_menuHwnd))
+    || (g_statsHwnd && IsWindowVisible(g_statsHwnd));
+}
+
 static void ShowOnlyPopup(HWND hwnd) {
+  g_toolbarExpanded = true;
   if (g_menuHwnd && hwnd != g_menuHwnd) ShowWindow(g_menuHwnd, SW_HIDE);
   if (g_statsHwnd && hwnd != g_statsHwnd) ShowWindow(g_statsHwnd, SW_HIDE);
   if (hwnd) {
@@ -1197,9 +1237,16 @@ static void TogglePopup(HWND hwnd) {
   if (!hwnd) return;
   if (IsWindowVisible(hwnd)) {
     ShowWindow(hwnd, SW_HIDE);
+    if ((!g_menuHwnd || !IsWindowVisible(g_menuHwnd)) && (!g_statsHwnd || !IsWindowVisible(g_statsHwnd))) {
+      g_toolbarExpanded = false;
+      UpdateOverlayLayout();
+    } else {
+      UpdateOverlayLayout();
+    }
   } else {
     ShowOnlyPopup(hwnd);
   }
+  if (g_toolbarHwnd) InvalidateRect(g_toolbarHwnd, nullptr, FALSE);
   if (g_hwnd) SetFocus(g_hwnd);
 }
 
@@ -1261,17 +1308,28 @@ static void DrawToolbar(HDC hdc, RECT rc) {
   HPEN border = CreatePen(PS_SOLID, 1, RGB(219, 225, 232));
   HBRUSH oldBrush = reinterpret_cast<HBRUSH>(SelectObject(hdc, bg));
   HPEN oldPen = reinterpret_cast<HPEN>(SelectObject(hdc, border));
-  RoundRect(hdc, 0, 0, rc.right, rc.bottom, 24, 24);
+  RoundRect(hdc, 0, 0, rc.right, rc.bottom, g_toolbarExpanded ? 22 : rc.right, g_toolbarExpanded ? 22 : rc.bottom);
   SelectObject(hdc, oldPen);
   SelectObject(hdc, oldBrush);
   DeleteObject(border);
   DeleteObject(bg);
 
+  if (!g_toolbarExpanded) {
+    HPEN dotPen = CreatePen(PS_SOLID, 3, RGB(22, 30, 40));
+    HPEN oldDotPen = reinterpret_cast<HPEN>(SelectObject(hdc, dotPen));
+    MoveToEx(hdc, 14, 18, nullptr); LineTo(hdc, 14, 24);
+    MoveToEx(hdc, 21, 18, nullptr); LineTo(hdc, 21, 24);
+    MoveToEx(hdc, 28, 18, nullptr); LineTo(hdc, 28, 24);
+    SelectObject(hdc, oldDotPen);
+    DeleteObject(dotPen);
+    return;
+  }
+
   HBRUSH closeFill = CreateSolidBrush(RGB(242, 245, 248));
   HPEN closeBorder = CreatePen(PS_SOLID, 1, RGB(224, 229, 235));
   HBRUSH oldCloseFill = reinterpret_cast<HBRUSH>(SelectObject(hdc, closeFill));
   HPEN oldCloseBorder = reinterpret_cast<HPEN>(SelectObject(hdc, closeBorder));
-  Ellipse(hdc, 14, 12, 48, 46);
+  Ellipse(hdc, 11, 10, 38, 37);
   SelectObject(hdc, oldCloseBorder);
   SelectObject(hdc, oldCloseFill);
   DeleteObject(closeBorder);
@@ -1279,8 +1337,8 @@ static void DrawToolbar(HDC hdc, RECT rc) {
 
   HPEN ink = CreatePen(PS_SOLID, 2, RGB(22, 30, 40));
   HPEN oldInk = reinterpret_cast<HPEN>(SelectObject(hdc, ink));
-  MoveToEx(hdc, 25, 22, nullptr); LineTo(hdc, 37, 34);
-  MoveToEx(hdc, 37, 22, nullptr); LineTo(hdc, 25, 34);
+  MoveToEx(hdc, 20, 19, nullptr); LineTo(hdc, 29, 28);
+  MoveToEx(hdc, 29, 19, nullptr); LineTo(hdc, 20, 28);
   SelectObject(hdc, oldInk);
   DeleteObject(ink);
 
@@ -1288,7 +1346,7 @@ static void DrawToolbar(HDC hdc, RECT rc) {
   HBRUSH oldControlPill = reinterpret_cast<HBRUSH>(SelectObject(hdc, controlPill));
   HPEN controlPen = CreatePen(PS_SOLID, 1, RGB(218, 225, 233));
   HPEN oldControlPen = reinterpret_cast<HPEN>(SelectObject(hdc, controlPen));
-  RoundRect(hdc, 64, 8, 274, 52, 18, 18);
+  RoundRect(hdc, 48, 7, 206, 41, 16, 16);
   SelectObject(hdc, oldControlPen);
   SelectObject(hdc, oldControlPill);
   DeleteObject(controlPen);
@@ -1296,20 +1354,20 @@ static void DrawToolbar(HDC hdc, RECT rc) {
 
   HPEN controlInk = CreatePen(PS_SOLID, 2, RGB(24, 33, 44));
   HPEN oldControlInk = reinterpret_cast<HPEN>(SelectObject(hdc, controlInk));
-  RoundRect(hdc, 82, 16, 104, 24, 4, 4);
-  RoundRect(hdc, 82, 31, 104, 39, 4, 4);
-  MoveToEx(hdc, 87, 20, nullptr); LineTo(hdc, 99, 20);
-  MoveToEx(hdc, 87, 35, nullptr); LineTo(hdc, 99, 35);
+  RoundRect(hdc, 61, 15, 79, 21, 4, 4);
+  RoundRect(hdc, 61, 27, 79, 33, 4, 4);
+  MoveToEx(hdc, 65, 18, nullptr); LineTo(hdc, 75, 18);
+  MoveToEx(hdc, 65, 30, nullptr); LineTo(hdc, 75, 30);
   SelectObject(hdc, oldControlInk);
   DeleteObject(controlInk);
 
-  HFONT controlFont = CreateUiFont(16, FW_SEMIBOLD);
-  HFONT controlSubFont = CreateUiFont(12, FW_NORMAL);
-  RECT controlRc{114, 11, 262, 30};
-  RECT controlSubRc{114, 28, 262, 46};
+  HFONT controlFont = CreateUiFont(13, FW_SEMIBOLD);
+  HFONT controlSubFont = CreateUiFont(10, FW_NORMAL);
+  RECT controlRc{88, 9, 198, 25};
+  RECT controlSubRc{88, 23, 198, 39};
   const VideoProfile activeProfile = ActiveVideoProfile();
   std::wstring controlSummary = FormatResolution(activeProfile.width, activeProfile.height)
-                              + L" / " + std::to_wstring(activeProfile.fps) + L" fps / "
+                               + L" / " + std::to_wstring(activeProfile.fps) + L" fps / "
                               + FormatBitrate(g_currentBitrate.load(std::memory_order_relaxed));
   DrawTextRect(hdc, L"显示控制", controlRc, RGB(18, 24, 34), controlFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
   DrawTextRect(hdc, controlSummary, controlSubRc, RGB(104, 114, 126), controlSubFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
@@ -1320,13 +1378,13 @@ static void DrawToolbar(HDC hdc, RECT rc) {
   HBRUSH oldPill = reinterpret_cast<HBRUSH>(SelectObject(hdc, pill));
   HPEN noPen = CreatePen(PS_SOLID, 1, RGB(210, 228, 217));
   HPEN oldNoPen = reinterpret_cast<HPEN>(SelectObject(hdc, noPen));
-  RoundRect(hdc, 286, 8, 430, 52, 18, 18);
+  RoundRect(hdc, 216, 7, 330, 41, 16, 16);
   SelectObject(hdc, oldNoPen);
   SelectObject(hdc, oldPill);
   DeleteObject(noPen);
   DeleteObject(pill);
 
-  DrawSignalBars(hdc, 304, 14, RGB(17, 190, 122));
+  DrawSignalBars(hdc, 228, 7, RGB(17, 190, 122));
 
   wchar_t statsText[96];
   if (stats.rxToPresentMs > 0.0 || stats.mbps > 0.0) {
@@ -1334,10 +1392,10 @@ static void DrawToolbar(HDC hdc, RECT rc) {
   } else {
     swprintf_s(statsText, L"%s 直连", g_cfg.udpVideo ? L"UDP" : L"TCP");
   }
-  HFONT statsFont = CreateUiFont(14, FW_SEMIBOLD);
-  HFONT statsSubFont = CreateUiFont(11, FW_NORMAL);
-  RECT statsRc{346, 11, 418, 28};
-  RECT statsSubRc{346, 28, 418, 45};
+  HFONT statsFont = CreateUiFont(12, FW_SEMIBOLD);
+  HFONT statsSubFont = CreateUiFont(9, FW_NORMAL);
+  RECT statsRc{270, 9, 322, 24};
+  RECT statsSubRc{270, 23, 322, 38};
   DrawTextRect(hdc, L"链路概览", statsRc, RGB(24, 92, 52), statsFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
   DrawTextRect(hdc, statsText, statsSubRc, RGB(72, 118, 90), statsSubFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
   DeleteObject(statsFont);
@@ -1347,16 +1405,16 @@ static void DrawToolbar(HDC hdc, RECT rc) {
   HPEN timerBorder = CreatePen(PS_SOLID, 1, RGB(222, 228, 235));
   HBRUSH oldTimerFill = reinterpret_cast<HBRUSH>(SelectObject(hdc, timerFill));
   HPEN oldTimerBorder = reinterpret_cast<HPEN>(SelectObject(hdc, timerBorder));
-  RoundRect(hdc, 442, 8, 546, 52, 18, 18);
+  RoundRect(hdc, 340, 7, 420, 41, 16, 16);
   SelectObject(hdc, oldTimerBorder);
   SelectObject(hdc, oldTimerFill);
   DeleteObject(timerBorder);
   DeleteObject(timerFill);
 
-  HFONT timeFont = CreateUiFont(18, FW_SEMIBOLD);
-  HFONT timeSubFont = CreateUiFont(11, FW_NORMAL);
-  RECT timeRc{454, 14, 534, 34};
-  RECT timeSubRc{454, 30, 534, 46};
+  HFONT timeFont = CreateUiFont(14, FW_SEMIBOLD);
+  HFONT timeSubFont = CreateUiFont(9, FW_NORMAL);
+  RECT timeRc{348, 10, 412, 27};
+  RECT timeSubRc{348, 24, 412, 39};
   DrawTextRect(hdc, FormatElapsed(), timeRc, RGB(48, 58, 72), timeFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
   DrawTextRect(hdc, L"本次会话", timeSubRc, RGB(123, 133, 144), timeSubFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
   DeleteObject(timeFont);
@@ -1366,19 +1424,19 @@ static void DrawToolbar(HDC hdc, RECT rc) {
 static void DrawMenuRow(HDC hdc, int y, int icon, const std::wstring& label, const std::wstring& value, bool chevron, bool danger = false) {
   COLORREF ink = danger ? RGB(232, 62, 52) : RGB(28, 37, 48);
   COLORREF subtle = danger ? RGB(232, 62, 52) : RGB(120, 130, 142);
-  DrawMenuIcon(hdc, icon, 24, y + 9, ink);
-  HFONT labelFont = CreateUiFont(17, FW_SEMIBOLD);
-  HFONT valueFont = CreateUiFont(13, FW_NORMAL);
-  RECT labelRc{62, y + 6, 250, y + 34};
+  DrawMenuIcon(hdc, icon, 18, y + 6, ink, 19);
+  HFONT labelFont = CreateUiFont(14, FW_SEMIBOLD);
+  HFONT valueFont = CreateUiFont(11, FW_NORMAL);
+  RECT labelRc{52, y + 4, 202, y + 29};
   DrawTextRect(hdc, label, labelRc, ink, labelFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
   if (!value.empty()) {
-    RECT valueRc{214, y + 9, chevron ? 390 : 412, y + 34};
+    RECT valueRc{174, y + 6, chevron ? 318 : 338, y + 29};
     DrawTextRect(hdc, value, valueRc, subtle, valueFont, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
   }
   if (chevron) {
-    HPEN pen = CreatePen(PS_SOLID, 3, RGB(26, 34, 44));
+    HPEN pen = CreatePen(PS_SOLID, 2, RGB(26, 34, 44));
     HPEN oldPen = reinterpret_cast<HPEN>(SelectObject(hdc, pen));
-    MoveToEx(hdc, 402, y + 14, nullptr); LineTo(hdc, 410, y + 21); LineTo(hdc, 402, y + 28);
+    MoveToEx(hdc, 326, y + 11, nullptr); LineTo(hdc, 333, y + 17); LineTo(hdc, 326, y + 23);
     SelectObject(hdc, oldPen);
     DeleteObject(pen);
   }
@@ -1387,18 +1445,18 @@ static void DrawMenuRow(HDC hdc, int y, int icon, const std::wstring& label, con
 }
 
 static void DrawMenuSelectorRow(HDC hdc, int y, int icon, const std::wstring& label, const std::wstring& value) {
-  DrawMenuIcon(hdc, icon, 24, y + 9, RGB(28, 37, 48));
-  HFONT labelFont = CreateUiFont(17, FW_SEMIBOLD);
-  HFONT valueFont = CreateUiFont(13, FW_NORMAL);
-  RECT labelRc{62, y + 6, 180, y + 34};
+  DrawMenuIcon(hdc, icon, 18, y + 6, RGB(28, 37, 48), 19);
+  HFONT labelFont = CreateUiFont(14, FW_SEMIBOLD);
+  HFONT valueFont = CreateUiFont(11, FW_NORMAL);
+  RECT labelRc{52, y + 4, 145, y + 29};
   DrawTextRect(hdc, label, labelRc, RGB(28, 37, 48), labelFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
 
-  RECT leftRc{238, y + 4, 270, y + 34};
-  RECT rightRc{376, y + 4, 408, y + 34};
+  RECT leftRc{188, y + 3, 216, y + 29};
+  RECT rightRc{306, y + 3, 334, y + 29};
   DrawSelectorButton(hdc, leftRc, true);
   DrawSelectorButton(hdc, rightRc, false);
 
-  RECT valueRc{280, y + 6, 366, y + 34};
+  RECT valueRc{224, y + 4, 298, y + 29};
   DrawTextRect(hdc, value, valueRc, RGB(110, 120, 132), valueFont, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
   DeleteObject(labelFont);
   DeleteObject(valueFont);
@@ -1437,30 +1495,30 @@ static void DrawMenu(HDC hdc, RECT rc) {
   DeleteObject(border);
   DeleteObject(bg);
 
-  DrawMenuRow(hdc, 18, 0, DisplayLabel(), FormatCompactProfile(activeProfile), false);
-  DrawSeparator(hdc, 76);
-  DrawMenuSelectorRow(hdc, 94, 0, L"分辨率", FormatResolution(g_pendingProfile.width, g_pendingProfile.height));
-  DrawMenuSelectorRow(hdc, 148, 1, L"帧率", std::to_wstring(g_pendingProfile.fps) + L" fps");
-  DrawMenuSelectorRow(hdc, 202, 4, L"码率", FormatProfileBitrate(g_pendingProfile.bitrate));
-  DrawSeparator(hdc, 258);
-  DrawMenuRow(hdc, 276, 6, L"立即应用", pendingChanges ? FormatCompactProfile(g_pendingProfile) : L"当前已生效", false);
+  DrawMenuRow(hdc, 14, 0, DisplayLabel(), FormatCompactProfile(activeProfile), false);
+  DrawSeparator(hdc, 62);
+  DrawMenuSelectorRow(hdc, 78, 0, L"分辨率", FormatResolution(g_pendingProfile.width, g_pendingProfile.height));
+  DrawMenuSelectorRow(hdc, 122, 1, L"帧率", std::to_wstring(g_pendingProfile.fps) + L" fps");
+  DrawMenuSelectorRow(hdc, 166, 4, L"码率", FormatProfileBitrate(g_pendingProfile.bitrate));
+  DrawSeparator(hdc, 214);
+  DrawMenuRow(hdc, 230, 6, L"立即应用", pendingChanges ? FormatCompactProfile(g_pendingProfile) : L"当前已生效", false);
   wchar_t statsValue[64];
   if (stats.presentFps > 0.1 || stats.rxToPresentMs > 0.0) {
     swprintf_s(statsValue, L"%.0f fps / %.0f ms", stats.presentFps, stats.rxToPresentMs);
   } else {
     swprintf_s(statsValue, L"%s", g_cfg.udpVideo ? L"UDP 直连" : L"TCP 直连");
   }
-  DrawMenuRow(hdc, 330, 5, L"链路统计", statsValue, true);
-  DrawMenuRow(hdc, 384, 7, g_cfg.fullscreen ? L"退出全屏幕" : L"进入全屏幕", L"F11", false);
-  DrawSeparator(hdc, 438);
-  DrawMenuRow(hdc, 448, 8, L"退出远控", L"", false, true);
+  DrawMenuRow(hdc, 274, 5, L"链路统计", statsValue, true);
+  DrawMenuRow(hdc, 318, 7, g_cfg.fullscreen ? L"退出全屏幕" : L"进入全屏幕", L"F11", false);
+  DrawSeparator(hdc, 358);
+  DrawMenuRow(hdc, 362, 8, L"退出远控", L"", false, true);
 }
 
 static void DrawStatsRow(HDC hdc, int y, const std::wstring& label, const std::wstring& value) {
-  HFONT labelFont = CreateUiFont(16, FW_SEMIBOLD);
-  HFONT valueFont = CreateUiFont(18, FW_NORMAL);
-  RECT labelRc{32, y, 205, y + 32};
-  RECT valueRc{232, y, kStatsWidth - 32, y + 32};
+  HFONT labelFont = CreateUiFont(12, FW_SEMIBOLD);
+  HFONT valueFont = CreateUiFont(13, FW_NORMAL);
+  RECT labelRc{24, y, 168, y + 22};
+  RECT valueRc{178, y, kStatsWidth - 24, y + 22};
   DrawTextRect(hdc, label, labelRc, RGB(146, 151, 160), labelFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
   DrawTextRect(hdc, value, valueRc, RGB(18, 24, 36), valueFont, DT_RIGHT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
   DeleteObject(labelFont);
@@ -1479,57 +1537,67 @@ static void DrawStats(HDC hdc, RECT rc) {
   DeleteObject(border);
   DeleteObject(bg);
 
-  DrawSignalBars(hdc, 38, 34, RGB(17, 190, 122));
-  HFONT titleFont = CreateUiFont(20, FW_BOLD);
+  DrawSignalBars(hdc, 28, 20, RGB(17, 190, 122));
+  HFONT titleFont = CreateUiFont(16, FW_BOLD);
   std::wstring latency = stats.rxToPresentMs > 0.0 ? FormatDouble(stats.rxToPresentMs, L" ms", 0) : L"-- ms";
-  RECT titleRc{92, 30, kStatsWidth - 30, 72};
+  RECT titleRc{78, 22, kStatsWidth - 24, 56};
   DrawTextRect(hdc, L"显示尾延时: " + latency, titleRc, RGB(15, 22, 36), titleFont, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
   DeleteObject(titleFont);
 
   HPEN line = CreatePen(PS_SOLID, 1, RGB(232, 235, 238));
   HPEN oldLine = reinterpret_cast<HPEN>(SelectObject(hdc, line));
-  MoveToEx(hdc, 0, 100, nullptr); LineTo(hdc, kStatsWidth, 100);
+  MoveToEx(hdc, 0, 76, nullptr); LineTo(hdc, kStatsWidth, 76);
   SelectObject(hdc, oldLine);
   DeleteObject(line);
 
-  DrawStatsRow(hdc, 126, L"收帧后延时:", stats.rxToPresentMs > 0.0 ? FormatDouble(stats.rxToPresentMs, L" ms", 0) : L"-- ms");
+  DrawStatsRow(hdc, 96, L"收帧后延时:", stats.rxToPresentMs > 0.0 ? FormatDouble(stats.rxToPresentMs, L" ms", 0) : L"-- ms");
   const VideoProfile activeProfile = ActiveVideoProfile();
-  DrawStatsRow(hdc, 166, L"显示帧率:", stats.presentFps > 0.1 ? FormatDouble(stats.presentFps, L"", 0) : FormatDouble(activeProfile.fps, L"", 0));
-  DrawStatsRow(hdc, 206, L"接收完整帧率:", stats.completeFps > 0.1 ? FormatDouble(stats.completeFps, L"", 0) : L"--");
-  DrawStatsRow(hdc, 246, L"带宽占用:", FormatDouble(stats.mbps, L" Mbps", 1));
-  DrawStatsRow(hdc, 286, L"客户端丢旧帧(当前):", FormatDouble(stats.queueDropPct, L"%", 1));
+  DrawStatsRow(hdc, 126, L"显示帧率:", stats.presentFps > 0.1 ? FormatDouble(stats.presentFps, L"", 0) : FormatDouble(activeProfile.fps, L"", 0));
+  DrawStatsRow(hdc, 156, L"接收完整帧率:", stats.completeFps > 0.1 ? FormatDouble(stats.completeFps, L"", 0) : L"--");
+  DrawStatsRow(hdc, 186, L"带宽占用:", FormatDouble(stats.mbps, L" Mbps", 1));
+  DrawStatsRow(hdc, 216, L"客户端丢旧帧(当前):", FormatDouble(stats.queueDropPct, L"%", 1));
 
-  DrawStatsSeparator(hdc, 332);
-  DrawStatsRow(hdc, 356, L"传输通道:", g_cfg.udpVideo ? L"UDP 局域网直连" : L"TCP 局域网直连");
-  DrawStatsRow(hdc, 396, L"被控端 IP:", g_cfg.hostIp);
-  DrawStatsRow(hdc, 436, L"控制端 IP:", g_localIp);
-  DrawStatsRow(hdc, 476, L"网络拼帧废弃(当前):", FormatDouble(stats.networkDropPct, L"%", 1));
-  DrawStatsRow(hdc, 516, L"被控端系统:", PlatformLabel(g_cfg.hostPlatform));
+  DrawStatsSeparator(hdc, 256);
+  DrawStatsRow(hdc, 276, L"传输通道:", g_cfg.udpVideo ? L"UDP 局域网直连" : L"TCP 局域网直连");
+  DrawStatsRow(hdc, 306, L"被控端 IP:", g_cfg.hostIp);
+  DrawStatsRow(hdc, 336, L"控制端 IP:", g_localIp);
+  DrawStatsRow(hdc, 366, L"网络拼帧废弃(当前):", FormatDouble(stats.networkDropPct, L"%", 1));
+  DrawStatsRow(hdc, 396, L"被控端系统:", PlatformLabel(g_cfg.hostPlatform));
 
-  DrawStatsSeparator(hdc, 562);
-  DrawStatsRow(hdc, 586, L"当前发送码率:", FormatBitrate(g_currentBitrate.load(std::memory_order_relaxed)));
-  DrawStatsRow(hdc, 620, L"编码队列:", std::to_wstring(stats.queueDepth) + L" / " + std::to_wstring(stats.queueTarget) + L" 帧");
-  DrawStatsRow(hdc, 654, L"显示队列:", std::to_wstring(stats.decodedQueueDepth) + L" / " + std::to_wstring(stats.decodedQueueTarget) + L" 帧");
-  DrawStatsRow(hdc, 688, L"显示丢旧帧:", std::to_wstring(stats.renderDropped));
-  DrawStatsRow(hdc, 722, L"编解码器:", L"H.264 / Media Foundation");
-  DrawStatsRow(hdc, 756, L"编码模式:", stats.gpuFrames > 0 ? L"硬编 / 硬解" : L"硬编 / 硬解优先");
-  DrawStatsRow(hdc, 790, L"采集方式:", g_cfg.hostPlatform == L"win32" ? L"DXGI" : L"ScreenCaptureKit");
+  DrawStatsSeparator(hdc, 434);
+  DrawStatsRow(hdc, 448, L"当前发送码率:", FormatBitrate(g_currentBitrate.load(std::memory_order_relaxed)));
+  DrawStatsRow(hdc, 472, L"编码队列:", std::to_wstring(stats.queueDepth) + L" / " + std::to_wstring(stats.queueTarget) + L" 帧");
+  DrawStatsRow(hdc, 496, L"显示队列:", std::to_wstring(stats.decodedQueueDepth) + L" / " + std::to_wstring(stats.decodedQueueTarget) + L" 帧");
+  DrawStatsRow(hdc, 520, L"显示丢旧帧:", std::to_wstring(stats.renderDropped));
+  DrawStatsRow(hdc, 544, L"编解码器:", L"H.264 / Media Foundation");
+  DrawStatsRow(hdc, 568, L"编码模式:", stats.gpuFrames > 0 ? L"硬编 / 硬解" : L"硬编 / 硬解优先");
+  DrawStatsRow(hdc, 592, L"采集方式:", g_cfg.hostPlatform == L"win32" ? L"DXGI" : L"ScreenCaptureKit");
   wchar_t target[128];
   swprintf_s(target, L"%dx%d @ %d fps / %d Mbps",
              activeProfile.width,
              activeProfile.height,
              activeProfile.fps,
              std::max(1, (activeProfile.bitrate + 500'000) / 1'000'000));
-  DrawStatsRow(hdc, 824, L"目标档位:", target);
+  DrawStatsRow(hdc, 616, L"目标档位:", target);
 }
 
 static void HandleToolbarClick(int x, int y) {
-  if (x >= 14 && x <= 48 && y >= 12 && y <= 46) {
+  if (!g_toolbarExpanded) {
+    g_toolbarExpanded = true;
+    UpdateOverlayLayout();
+    if (g_toolbarHwnd) InvalidateRect(g_toolbarHwnd, nullptr, TRUE);
+    return;
+  }
+
+  if (x >= 11 && x <= 38 && y >= 10 && y <= 37) {
     PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
-  } else if (x >= 64 && x <= 274 && y >= 8 && y <= 52) {
+  } else if (x >= 48 && x <= 206 && y >= 7 && y <= 41) {
     TogglePopup(g_menuHwnd);
-  } else if (x >= 286 && x <= 430 && y >= 8 && y <= 52) {
+  } else if (x >= 216 && x <= 330 && y >= 7 && y <= 41) {
     TogglePopup(g_statsHwnd);
+  } else {
+    g_toolbarExpanded = false;
+    HideNativePopups();
   }
 }
 
@@ -1602,18 +1670,18 @@ static void ApplyPendingVideoProfile() {
 }
 
 static bool HandleSelectorClick(int x, int y, int rowY, void (*cycleFn)(int)) {
-  if (y < rowY || y >= rowY + 40) return false;
-  if (x >= 238 && x <= 270) {
+  if (y < rowY || y >= rowY + 34) return false;
+  if (x >= 188 && x <= 216) {
     cycleFn(-1);
     if (g_menuHwnd) InvalidateRect(g_menuHwnd, nullptr, FALSE);
     return true;
   }
-  if (x >= 376 && x <= 408) {
+  if (x >= 306 && x <= 334) {
     cycleFn(1);
     if (g_menuHwnd) InvalidateRect(g_menuHwnd, nullptr, FALSE);
     return true;
   }
-  if (x >= 280 && x <= 366) {
+  if (x >= 224 && x <= 298) {
     cycleFn(1);
     if (g_menuHwnd) InvalidateRect(g_menuHwnd, nullptr, FALSE);
     return true;
@@ -1622,17 +1690,17 @@ static bool HandleSelectorClick(int x, int y, int rowY, void (*cycleFn)(int)) {
 }
 
 static void HandleMenuClick(int x, int y) {
-  if (HandleSelectorClick(x, y, 94, CycleResolution)) return;
-  if (HandleSelectorClick(x, y, 148, CycleFps)) return;
-  if (HandleSelectorClick(x, y, 202, CycleBitrate)) return;
+  if (HandleSelectorClick(x, y, 78, CycleResolution)) return;
+  if (HandleSelectorClick(x, y, 122, CycleFps)) return;
+  if (HandleSelectorClick(x, y, 166, CycleBitrate)) return;
 
-  if (y >= 276 && y < 316) {
+  if (y >= 230 && y < 262) {
     ApplyPendingVideoProfile();
-  } else if (y >= 330 && y < 370) {
+  } else if (y >= 274 && y < 306) {
     ShowOnlyPopup(g_statsHwnd);
-  } else if (y >= 384 && y < 424) {
+  } else if (y >= 318 && y < 350) {
     ToggleNativeFullscreen();
-  } else if (y >= 448 && y < 480) {
+  } else if (y >= 362 && y < 386) {
     PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
   }
 }
@@ -2674,6 +2742,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     }
     case WM_LBUTTONDOWN: case WM_MBUTTONDOWN: case WM_RBUTTONDOWN: {
+      if (NativeOverlayIsOpen()) HideNativePopups();
       SetCapture(hwnd); SetFocus(hwnd);
       float x, y; NormalizedPoint(hwnd, lp, x, y);
       uint16_t b = msg == WM_RBUTTONDOWN ? 2 : (msg == WM_MBUTTONDOWN ? 1 : 0);
