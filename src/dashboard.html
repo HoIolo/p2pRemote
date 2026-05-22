@@ -32,13 +32,10 @@
           <svg class="sideIcon" aria-hidden="true"><use href="assets/icons.svg#icon-reset"></use></svg>
           <span>设置</span>
         </div>
-        <div id="macPermissionCard" class="sideSetting permissionCard" hidden>
-          <span>Mac ????</span>
-          <div class="permissionActions">
-            <button id="openScreenSettings" class="sideMiniBtn" type="button">????</button>
-            <button id="resetScreenPermission" class="sideMiniBtn" type="button">????</button>
-          </div>
-        </div>
+        <button id="macPermissionCard" class="sideSetting permissionCard" type="button" hidden>
+          <span>Mac 权限</span>
+          <small id="permissionCardSummary">检查屏幕录制和辅助功能</small>
+        </button>
       </section>
 
       <section class="sideGroup">
@@ -64,8 +61,7 @@
         </div>
         <div class="topActions">
           <button id="refreshTop" class="iconBtn" title="刷新" aria-label="刷新"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-refresh"></use></svg></button>
-          <button id="openScreenSettings" class="iconBtn" title="屏幕录制权限" aria-label="屏幕录制权限"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-record"></use></svg></button>
-          <button id="resetScreenPermission" class="iconBtn" title="重置屏幕录制权限" aria-label="重置屏幕录制权限"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-reset"></use></svg></button>
+          <button class="iconBtn openPermissionPanel" title="Mac 权限设置" aria-label="Mac 权限设置"><svg class="icon" aria-hidden="true"><use href="assets/icons.svg#icon-record"></use></svg></button>
         </div>
       </header>
 
@@ -97,6 +93,41 @@
         </details>
       </section>
     </main>
+  </div>
+  <div id="permissionModal" class="modalOverlay" hidden>
+    <section class="permissionModal" role="dialog" aria-modal="true" aria-labelledby="permissionModalTitle">
+      <header class="modalHeader">
+        <div>
+          <h2 id="permissionModalTitle">Mac 权限设置</h2>
+          <p id="permissionModalHint">这些权限由 macOS 管理，开关会打开系统授权或重置授权记录。</p>
+        </div>
+        <button id="closePermissionModal" class="modalClose" type="button" aria-label="关闭">×</button>
+      </header>
+      <div class="permissionRows">
+        <div class="permissionRow">
+          <div>
+            <b>屏幕录制</b>
+            <span id="screenPermissionDetail">用于采集 Mac 画面。</span>
+          </div>
+          <button id="screenPermissionToggle" class="permissionSwitch" type="button" role="switch" aria-checked="false">
+            <span></span>
+          </button>
+        </div>
+        <div class="permissionRow">
+          <div>
+            <b>辅助功能</b>
+            <span id="accessibilityPermissionDetail">用于接收 Windows 端鼠标和键盘控制。</span>
+          </div>
+          <button id="accessibilityPermissionToggle" class="permissionSwitch" type="button" role="switch" aria-checked="false">
+            <span></span>
+          </button>
+        </div>
+      </div>
+      <footer class="modalFooter">
+        <button id="refreshPermissionStatus" class="secondaryAction" type="button">刷新状态</button>
+        <button id="openSystemPrivacySettings" class="primaryAction" type="button">打开系统设置</button>
+      </footer>
+    </section>
   </div>
   <script src="dashboard.js"></script>
 </body>

@@ -34,8 +34,11 @@ function resolveRole() {
 const ROLE = resolveRole();
 const SIGNAL_PORT = Number(process.env.P2P_REMOTE_PORT || 7777);
 const DISCOVERY_PORT = Number(process.env.P2P_REMOTE_DISCOVERY_PORT || 47777);
+const NATIVE_V2_HOST_READY_TIMEOUT_MS = 12_000;
+const NATIVE_V2_REMOTE_HOST_TIMEOUT_MS = 15_000;
 const PIN = String(crypto.randomInt(100000, 999999));
 const BUNDLE_ID = 'com.p2premotelan.app';
+const NATIVE_MAC_HOST_BUNDLE_ID = 'com.p2premotelan.native.mac-host';
 
 let win = null;
 let wss = null;
@@ -281,7 +284,9 @@ function nativeV2WinClientCandidates() {
 
 function nativeV2MacHostCandidates() {
   return [
+    path.join(process.resourcesPath || '', 'native-v2', 'mac-host', 'P2P Native Mac Host.app', 'Contents', 'MacOS', 'p2p-native-mac-host'),
     path.join(process.resourcesPath || '', 'native-v2', 'mac-host', 'p2p-native-mac-host'),
+    path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'P2P Native Mac Host.app', 'Contents', 'MacOS', 'p2p-native-mac-host'),
     path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'release', 'p2p-native-mac-host'),
     path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'arm64-apple-macosx', 'release', 'p2p-native-mac-host'),
     path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'x86_64-apple-macosx', 'release', 'p2p-native-mac-host'),
@@ -490,6 +495,48 @@ function relayNativeV2ProcessOutput(kind, proc, chunk) {
   }
 }
 
+function nativeV2HostReadyResult(options, exePath, args, pid) {
+  const videoPort = normalizeNativeV2Number(options.videoPort, 45000, 1, 65535);
+  const inputPort = normalizeNativeV2Number(options.inputPort, 45001, 1, 65535);
+  const width = normalizeNativeV2Number(options.width, 1600, 640, 7680);
+  const height = normalizeNativeV2Number(options.height, 900, 360, 4320);
+  const fps = normalizeNativeV2Number(options.fps, 60, 30, 240);
+  const bitrate = normalizeNativeV2Number(options.bitrate, 10_000_000, 1_000_000, 200_000_000);
+  const keyint = normalizeNativeV2Number(options.keyint, 1, 1, 300);
+  const requestedTransport = options.transport === 'tcp' ? 'tcp' : 'udp';
+  const allowUdpVideo = options.allowUdpVideo !== false && process.env.P2P_NATIVE_V2_DISABLE_UDP !== '1';
+  const transport = requestedTransport === 'udp' && allowUdpVideo ? 'udp' : 'tcp';
+  return {
+    ok: true,
+    pid,
+    exePath,
+    args,
+    clientIp: String(options.clientIp),
+    videoPort,
+    inputPort,
+    width,
+    height,
+    fps,
+    bitrate,
+    keyint,
+    transport,
+  };
+}
+
+function summarizeNativeV2HostFailure(lines, fallback) {
+  const text = lines.join('\n');
+  const fatalLine = [...lines].reverse().find((line) => line.includes('[fatal]'));
+  const permissionLine = [...lines].reverse().find((line) => (
+    line.includes('Screen Recording permission denied') ||
+    line.includes('screen recording permission missing')
+  ));
+  if (permissionLine || text.includes('Screen Recording permission denied')) {
+    return 'Mac 端屏幕录制权限未授权。请在系统设置 > 隐私与安全性 > 屏幕录制 中允许当前运行的 App/Terminal，然后完全退出并重新打开 Mac 端。';
+  }
+  if (fatalLine) return fatalLine.replace(/^\[fatal\]\s*/, '');
+  return fallback;
+}
+
 function stopNativeV2Process(kind) {
   const proc = kind === 'host' ? nativeV2HostProcess : nativeV2ClientProcess;
   if (!proc || proc.killed) return false;
@@ -624,7 +671,64 @@ function startNativeV2Client(options = {}) {
   };
 }
 
-function startNativeV2Host(options = {}) {
+async function waitForNativeV2HostReady(proc, options, exePath, args, pid) {
+  const lines = [];
+  let settled = false;
+
+  return new Promise((resolve, reject) => {
+    const settle = (err, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      proc.stdout?.off('data', onOutput);
+      proc.stderr?.off('data', onOutput);
+      proc.off('exit', onEarlyExit);
+      proc.off('error', onEarlyError);
+      if (err) reject(err);
+      else resolve(result);
+    };
+
+    const onOutput = (chunk) => {
+      const text = chunk.toString('utf8');
+      for (const rawLine of text.split(/\r?\n/)) {
+        const line = rawLine.trim();
+        if (!line) continue;
+        lines.push(line);
+        if (lines.length > 60) lines.shift();
+
+        if (line.includes('[ready]')) {
+          settle(null, nativeV2HostReadyResult(options, exePath, args, pid));
+          return;
+        }
+
+        if (line.includes('[fatal]') || line.includes('Screen Recording permission denied')) {
+          settle(new Error(summarizeNativeV2HostFailure(lines, 'Native v2 macOS host failed before it became ready')));
+          return;
+        }
+      }
+    };
+
+    const onEarlyExit = (code, signal) => {
+      const fallback = `Native v2 macOS host exited before ready code=${code ?? ''} signal=${signal ?? ''}`;
+      settle(new Error(summarizeNativeV2HostFailure(lines, fallback)));
+    };
+
+    const onEarlyError = (err) => {
+      settle(new Error(`Native v2 macOS host failed before ready: ${err.message || String(err)}`));
+    };
+
+    const timer = setTimeout(() => {
+      settle(new Error(summarizeNativeV2HostFailure(lines, 'Native v2 macOS host did not become ready in time')));
+    }, NATIVE_V2_HOST_READY_TIMEOUT_MS);
+
+    proc.stdout?.on('data', onOutput);
+    proc.stderr?.on('data', onOutput);
+    proc.once('exit', onEarlyExit);
+    proc.once('error', onEarlyError);
+  });
+}
+
+async function startNativeV2Host(options = {}) {
   if (process.platform !== 'darwin') {
     throw new Error('Native v2 macOS host can only run on macOS');
   }
@@ -669,6 +773,7 @@ function startNativeV2Host(options = {}) {
 
   const proc = nativeV2HostProcess;
   const pid = nativeV2HostProcess.pid;
+  const readyPromise = waitForNativeV2HostReady(proc, options, exePath, args, pid);
   sendToMainWindow('host-log', {
     level: 'info',
     message: `native-v2 host started pid=${pid} client=${options.clientIp}:${videoPort} transport=${transport}`,
@@ -696,21 +801,20 @@ function startNativeV2Host(options = {}) {
   });
 
   broadcastNativeV2Status();
-  return {
-    ok: true,
-    pid,
-    exePath,
-    args,
-    clientIp: String(options.clientIp),
-    videoPort,
-    inputPort,
-    width,
-    height,
-    fps,
-    bitrate,
-    keyint,
-    transport,
-  };
+  try {
+    return await readyPromise;
+  } catch (err) {
+    if (nativeV2HostProcess === proc && !proc.killed) {
+      try {
+        proc.kill();
+      } catch {
+        // ignore shutdown errors
+      }
+    }
+    if (nativeV2HostProcess === proc) nativeV2HostProcess = null;
+    broadcastNativeV2Status({ error: err.message || String(err) });
+    throw err;
+  }
 }
 
 function requestNativeV2RemoteHost(device, options = {}) {
@@ -757,7 +861,7 @@ function requestNativeV2RemoteHost(device, options = {}) {
 
     const timer = setTimeout(() => {
       finish(new Error(`Native v2 remote host request timed out: ${url}`));
-    }, 10_000);
+    }, NATIVE_V2_REMOTE_HOST_TIMEOUT_MS);
 
     socket.on('open', () => {
       socket.send(JSON.stringify({ type: 'hello', pin: String(device.pin) }));
@@ -804,9 +908,7 @@ function requestNativeV2RemoteHost(device, options = {}) {
 
       if (message.type === 'error') {
         const err = message.error || '';
-        if (err.includes('bad pin') || err.includes('pairing')) {
-          finish(new Error(err || 'Native v2 remote host request failed'));
-        }
+        finish(new Error(err || 'Native v2 remote host request failed'));
       }
     });
 
@@ -827,6 +929,53 @@ function getScreenCaptureStatus() {
   } catch {
     return 'unknown';
   }
+}
+
+function getAccessibilityStatus(prompt = false) {
+  if (process.platform !== 'darwin') return 'unknown';
+  try {
+    return systemPreferences.isTrustedAccessibilityClient(Boolean(prompt)) ? 'granted' : 'denied';
+  } catch {
+    return 'unknown';
+  }
+}
+
+function nativeV2MacHostAppPath() {
+  const exePath = findFirstExistingPath(nativeV2MacHostCandidates());
+  if (!exePath) return null;
+  const marker = `${path.sep}P2P Native Mac Host.app${path.sep}`;
+  const index = exePath.indexOf(marker);
+  if (index < 0) return null;
+  return exePath.slice(0, index + marker.length - 1);
+}
+
+function macPermissionStatus() {
+  return {
+    platform: process.platform,
+    screenCapture: getScreenCaptureStatus(),
+    accessibility: getAccessibilityStatus(false),
+    nativeHostAppPath: nativeV2MacHostAppPath(),
+  };
+}
+
+async function openMacPrivacyPane(pane) {
+  if (process.platform !== 'darwin') return false;
+  await shell.openExternal(`x-apple.systempreferences:com.apple.preference.security?${pane}`);
+  return true;
+}
+
+async function resetMacTccPermission(service) {
+  if (process.platform !== 'darwin') return false;
+  const bundleId = service === 'Accessibility' || service === 'ScreenCapture'
+    ? NATIVE_MAC_HOST_BUNDLE_ID
+    : BUNDLE_ID;
+  await new Promise((resolve, reject) => {
+    execFile('/usr/bin/tccutil', ['reset', service, bundleId], (err) => {
+      if (err) reject(err);
+      else resolve();
+    });
+  });
+  return true;
 }
 
 
@@ -968,6 +1117,7 @@ ipcMain.handle('app-info', () => {
     display: primary.bounds,
     scaleFactor: primary.scaleFactor,
     screenCaptureStatus: getScreenCaptureStatus(),
+    accessibilityStatus: getAccessibilityStatus(false),
   };
 });
 
@@ -1042,21 +1192,34 @@ ipcMain.handle('window-action', (event, action) => {
 
 ipcMain.handle('screen-capture-status', () => getScreenCaptureStatus());
 
+ipcMain.handle('mac-permission-status', () => macPermissionStatus());
+
 ipcMain.handle('open-screen-capture-settings', async () => {
-  if (process.platform !== 'darwin') return false;
-  await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
-  return true;
+  return openMacPrivacyPane('Privacy_ScreenCapture');
 });
 
 ipcMain.handle('reset-screen-capture-permission', async () => {
+  const ok = await resetMacTccPermission('ScreenCapture');
+  if (!ok) return false;
+  await openMacPrivacyPane('Privacy_ScreenCapture');
+  return true;
+});
+
+ipcMain.handle('request-accessibility-permission', async () => {
   if (process.platform !== 'darwin') return false;
-  await new Promise((resolve, reject) => {
-    execFile('/usr/bin/tccutil', ['reset', 'ScreenCapture', BUNDLE_ID], (err) => {
-      if (err) reject(err);
-      else resolve();
-    });
-  });
-  await shell.openExternal('x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture');
+  const granted = getAccessibilityStatus(true) === 'granted';
+  if (!granted) await openMacPrivacyPane('Privacy_Accessibility');
+  return granted;
+});
+
+ipcMain.handle('open-accessibility-settings', async () => {
+  return openMacPrivacyPane('Privacy_Accessibility');
+});
+
+ipcMain.handle('reset-accessibility-permission', async () => {
+  const ok = await resetMacTccPermission('Accessibility');
+  if (!ok) return false;
+  await openMacPrivacyPane('Privacy_Accessibility');
   return true;
 });
 

@@ -10,9 +10,17 @@ const connectSelectedBtn = $('connectSelected');
 const previewImageEl = $('previewImage');
 const refreshDevicesBtn = $('refreshDevices');
 const refreshTopBtn = $('refreshTop');
-const openScreenSettingsBtn = $('openScreenSettings');
-const resetScreenPermissionBtn = $('resetScreenPermission');
 const macPermissionCardEl = $('macPermissionCard');
+const permissionCardSummaryEl = $('permissionCardSummary');
+const permissionModalEl = $('permissionModal');
+const closePermissionModalBtn = $('closePermissionModal');
+const permissionModalHintEl = $('permissionModalHint');
+const screenPermissionToggleBtn = $('screenPermissionToggle');
+const accessibilityPermissionToggleBtn = $('accessibilityPermissionToggle');
+const screenPermissionDetailEl = $('screenPermissionDetail');
+const accessibilityPermissionDetailEl = $('accessibilityPermissionDetail');
+const refreshPermissionStatusBtn = $('refreshPermissionStatus');
+const openSystemPrivacySettingsBtn = $('openSystemPrivacySettings');
 const manualAddBtn = $('manualAdd');
 const nativeV2StatusTextEl = $('nativeV2StatusText');
 const logEl = $('log');
@@ -23,6 +31,11 @@ let selectedId = null;
 let nativeV2Status = null;
 let appInfo = null;
 let nativeV2Connecting = false;
+let macPermissionStatus = {
+  platform: 'unknown',
+  screenCapture: 'unknown',
+  accessibility: 'unknown',
+};
 
 function iconSvg(name, className = 'icon') {
   return `<svg class="${className}" aria-hidden="true"><use href="assets/icons.svg#${name}"></use></svg>`;
@@ -46,12 +59,79 @@ function setNativeV2StatusText(message) {
   if (nativeV2StatusTextEl) nativeV2StatusTextEl.textContent = message;
 }
 
+function permissionGranted(status) {
+  return status === 'granted';
+}
+
+function permissionLabel(status) {
+  if (status === 'granted') return '已开启';
+  if (status === 'denied') return '未开启';
+  if (status === 'not-determined') return '未请求';
+  if (status === 'restricted') return '受限制';
+  return '未知';
+}
+
+function renderPermissionStatus() {
+  const screenGranted = permissionGranted(macPermissionStatus.screenCapture);
+  const accessibilityGranted = permissionGranted(macPermissionStatus.accessibility);
+  const allGranted = screenGranted && accessibilityGranted;
+
+  if (permissionCardSummaryEl) {
+    permissionCardSummaryEl.textContent = allGranted
+      ? '屏幕录制和辅助功能已开启'
+      : '需要开启屏幕录制和辅助功能';
+  }
+  if (permissionModalHintEl) {
+    permissionModalHintEl.textContent = macPermissionStatus.nativeHostAppPath
+      ? '开发模式会使用 P2P Native Mac Host.app 申请权限；授权后完全退出并重新运行 npm run host。'
+      : '请先执行 npm run v2:mac:build 生成 P2P Native Mac Host.app，再打开系统设置授权。';
+  }
+
+  if (screenPermissionToggleBtn) {
+    screenPermissionToggleBtn.classList.toggle('on', screenGranted);
+    screenPermissionToggleBtn.setAttribute('aria-checked', String(screenGranted));
+    screenPermissionToggleBtn.title = screenGranted ? '重置屏幕录制权限' : '打开屏幕录制设置';
+  }
+  if (accessibilityPermissionToggleBtn) {
+    accessibilityPermissionToggleBtn.classList.toggle('on', accessibilityGranted);
+    accessibilityPermissionToggleBtn.setAttribute('aria-checked', String(accessibilityGranted));
+    accessibilityPermissionToggleBtn.title = accessibilityGranted ? '重置辅助功能权限' : '请求辅助功能权限';
+  }
+  if (screenPermissionDetailEl) {
+    screenPermissionDetailEl.textContent = `状态：${permissionLabel(macPermissionStatus.screenCapture)}。用于采集 Mac 画面。`;
+  }
+  if (accessibilityPermissionDetailEl) {
+    accessibilityPermissionDetailEl.textContent = `状态：${permissionLabel(macPermissionStatus.accessibility)}。用于接收 Windows 端鼠标和键盘控制。`;
+  }
+}
+
+async function refreshMacPermissionStatus() {
+  try {
+    macPermissionStatus = await window.lanRemote.getMacPermissionStatus();
+  } catch (err) {
+    log(`permission status failed: ${err.message || String(err)}`);
+  }
+  renderPermissionStatus();
+}
+
+async function openPermissionModal() {
+  if (permissionModalEl) permissionModalEl.hidden = false;
+  await refreshMacPermissionStatus();
+}
+
+function closePermissionModal() {
+  if (permissionModalEl) permissionModalEl.hidden = true;
+}
+
 function friendlyNativeV2Error(err, device) {
   const raw = err?.message || String(err || 'Unknown error');
+  if (raw.includes('屏幕录制权限') || raw.includes('Screen Recording permission denied')) {
+    return 'Mac 端屏幕录制权限未授权。请在 Mac 的系统设置 > 隐私与安全性 > 屏幕录制 中允许当前运行的 App/Terminal，然后完全退出并重新打开 Mac 端。';
+  }
   if (raw.includes('timed out') || raw.includes('closed before response')) {
     return [
       `Mac 端没有响应 Native v2 启动请求（${device?.address || 'unknown'}:7777）。`,
-      '请确认 Mac 上运行的是最新版本 App，并且已执行 npm run v2:mac:build。',
+      '请确认 Mac 上运行的是最新版本 App，并且已执行 npm run v2:mac:build；如果刚授权了屏幕录制，请完全退出并重新打开 Mac 端。',
     ].join(' ');
   }
   if (raw.includes('还没有构建') || raw.includes('not built')) return raw;
@@ -404,6 +484,10 @@ async function initApp() {
   if (info.screenCaptureStatus && info.screenCaptureStatus !== 'unknown') {
     log(`macOS screen permission=${info.screenCaptureStatus}`);
   }
+  if (info.accessibilityStatus && info.accessibilityStatus !== 'unknown') {
+    log(`macOS accessibility permission=${info.accessibilityStatus}`);
+  }
+  await refreshMacPermissionStatus();
   await refreshNativeV2Status();
   await refreshDevices();
 }
@@ -428,11 +512,39 @@ enterDesktopBtn.addEventListener('click', openSelected);
 connectSelectedBtn.addEventListener('click', openSelected);
 refreshDevicesBtn.addEventListener('click', refreshDevices);
 refreshTopBtn.addEventListener('click', refreshDevices);
-openScreenSettingsBtn.addEventListener('click', () => window.lanRemote.openScreenCaptureSettings());
-resetScreenPermissionBtn.addEventListener('click', async () => {
-  await window.lanRemote.resetScreenCapturePermission();
-  log('screen permission record reset; enable this app again, then fully quit and reopen it');
+macPermissionCardEl?.addEventListener('click', openPermissionModal);
+for (const button of document.querySelectorAll('.openPermissionPanel')) {
+  button.addEventListener('click', openPermissionModal);
+}
+closePermissionModalBtn?.addEventListener('click', closePermissionModal);
+permissionModalEl?.addEventListener('click', (event) => {
+  if (event.target === permissionModalEl) closePermissionModal();
 });
+document.addEventListener('keydown', (event) => {
+  if (event.key === 'Escape' && permissionModalEl && !permissionModalEl.hidden) closePermissionModal();
+});
+screenPermissionToggleBtn?.addEventListener('click', async () => {
+  if (permissionGranted(macPermissionStatus.screenCapture)) {
+    await window.lanRemote.resetScreenCapturePermission();
+    log('screen permission reset; enable it again in System Settings, then fully quit and reopen the Mac app');
+  } else {
+    await window.lanRemote.openScreenCaptureSettings();
+    log('opened Screen Recording settings; enable this app or Terminal, then fully quit and reopen the Mac app');
+  }
+  await refreshMacPermissionStatus();
+});
+accessibilityPermissionToggleBtn?.addEventListener('click', async () => {
+  if (permissionGranted(macPermissionStatus.accessibility)) {
+    await window.lanRemote.resetAccessibilityPermission();
+    log('accessibility permission reset; enable it again in System Settings, then fully quit and reopen the Mac app');
+  } else {
+    await window.lanRemote.requestAccessibilityPermission();
+    log('requested Accessibility permission; enable this app or Terminal, then fully quit and reopen the Mac app');
+  }
+  await refreshMacPermissionStatus();
+});
+refreshPermissionStatusBtn?.addEventListener('click', refreshMacPermissionStatus);
+openSystemPrivacySettingsBtn?.addEventListener('click', () => window.lanRemote.openScreenCaptureSettings());
 manualAddBtn.addEventListener('click', async () => {
   const endpoint = window.prompt(nativeV2Status?.platform === 'darwin'
     ? '输入 Windows IP（Native v2 不使用 PIN）'

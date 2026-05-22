@@ -271,6 +271,7 @@ body[data-platform="win32"] .topbar { padding-right: 154px; }
 }
 .sideSetting {
   -webkit-app-region: no-drag;
+  width: 100%;
   display: grid;
   gap: 6px;
   padding: 10px;
@@ -280,6 +281,12 @@ body[data-platform="win32"] .topbar { padding-right: 154px; }
   color: #4b4f53;
   font-size: 12px;
   font-weight: 800;
+  text-align: left;
+}
+.sideSetting small {
+  color: #6a6f74;
+  font-size: 11px;
+  line-height: 1.35;
 }
 .permissionCard {
   margin-top: 10px;
@@ -537,6 +544,127 @@ body.nativeV2Connecting .nativeHint span::after {
   background: #f3f3f1;
   color: #3f3f3f;
   border-color: #dededc;
+}
+
+.modalOverlay {
+  -webkit-app-region: no-drag;
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  padding: 22px;
+  background: rgba(17, 24, 39, .34);
+}
+.modalOverlay[hidden] {
+  display: none;
+}
+.permissionModal {
+  width: min(520px, 100%);
+  border-radius: 8px;
+  background: #ffffff;
+  color: #202124;
+  border: 1px solid rgba(0, 0, 0, .1);
+  box-shadow: 0 26px 80px rgba(0, 0, 0, .22);
+  overflow: hidden;
+}
+.modalHeader {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 18px 18px 14px;
+  border-bottom: 1px solid #e4e4e2;
+}
+.modalHeader h2 {
+  margin: 0 0 6px;
+  font-size: 18px;
+}
+.modalHeader p {
+  margin: 0;
+  color: #5f6368;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.modalClose {
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: #5f6368;
+  font-size: 24px;
+  line-height: 1;
+}
+.modalClose:hover {
+  background: #f1f1ef;
+}
+.permissionRows {
+  display: grid;
+}
+.permissionRow {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  min-height: 82px;
+  padding: 16px 18px;
+  border-bottom: 1px solid #ededeb;
+}
+.permissionRow b,
+.permissionRow span {
+  display: block;
+}
+.permissionRow b {
+  margin-bottom: 5px;
+  font-size: 14px;
+}
+.permissionRow span {
+  color: #62666a;
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+.permissionSwitch {
+  flex: 0 0 auto;
+  width: 48px;
+  height: 28px;
+  padding: 2px;
+  border-radius: 999px;
+  background: #c8c9cc;
+  border: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+}
+.permissionSwitch span {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, .22);
+}
+.permissionSwitch.on {
+  justify-content: flex-end;
+  background: #1d1d1f;
+}
+.modalFooter {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  padding: 14px 18px 18px;
+}
+.primaryAction,
+.secondaryAction {
+  border-radius: 8px;
+  padding: 9px 12px;
+  font-size: 13px;
+}
+.primaryAction {
+  background: #1d1d1f;
+  color: #fff;
+}
+.secondaryAction {
+  background: #f1f1ef;
+  color: #202124;
 }
 
 .remoteBody {
