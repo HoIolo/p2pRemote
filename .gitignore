@@ -9,3 +9,5 @@ native-v2/dist/
 
 .playwright-cli/
 build/native-v2/
+
+.codegraph/
