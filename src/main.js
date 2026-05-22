@@ -803,7 +803,10 @@ function requestNativeV2RemoteHost(device, options = {}) {
       }
 
       if (message.type === 'error') {
-        finish(new Error(message.error || 'Native v2 remote host request failed'));
+        const err = message.error || '';
+        if (err.includes('bad pin') || err.includes('pairing')) {
+          finish(new Error(err || 'Native v2 remote host request failed'));
+        }
       }
     });
 
@@ -886,10 +889,8 @@ function startSignalServer() {
         return;
       }
 
-      sendToMainWindow('host-log', { level: 'debug', message: `ignored unsupported message ${msg.type || 'unknown'} from ${clientId.slice(0, 8)}` });
-      if (socket.readyState === WebSocket.OPEN) {
-        socket.send(JSON.stringify({ type: 'error', error: `unsupported message type: ${msg.type || 'unknown'}` }));
-      }
+      // silently ignore unknown message types (e.g. stray ICE candidates from other tools)
+
     });
 
     socket.on('close', (code, reason) => {
