@@ -22,7 +22,15 @@ copyIfExists(
   path.join(root, 'native-v2', 'win-client', 'build', 'Release', 'p2p-native-win-client.exe'),
   path.join(stageRoot, 'win-client', 'p2p-native-win-client.exe')
 );
-copyIfExists(
-  path.join(root, 'native-v2', 'mac-host', '.build', 'release', 'p2p-native-mac-host'),
-  path.join(stageRoot, 'mac-host', 'p2p-native-mac-host')
-);
+
+const macHostApp = path.join(root, 'native-v2', 'mac-host', '.build', 'P2P Native Mac Host.app');
+const stagedMacHostApp = path.join(stageRoot, 'mac-host', 'P2P Native Mac Host.app');
+if (fs.existsSync(macHostApp)) {
+  fs.cpSync(macHostApp, stagedMacHostApp, { recursive: true });
+  console.log(`[native-v2] staged ${macHostApp} -> ${stagedMacHostApp}`);
+} else {
+  copyIfExists(
+    path.join(root, 'native-v2', 'mac-host', '.build', 'release', 'p2p-native-mac-host'),
+    path.join(stageRoot, 'mac-host', 'p2p-native-mac-host')
+  );
+}

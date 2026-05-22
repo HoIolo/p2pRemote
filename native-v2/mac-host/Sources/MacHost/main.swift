@@ -115,8 +115,12 @@ struct MacHostMain {
                     tcpVideo?.sendFrame(frame, keyframe: keyframe, configIncluded: configIncluded, ptsUs: ptsUs)
                 }
             }
-            let output = ScreenCaptureOutput(encoder: encoder)
+            let capturerRef = RefBox<ScreenCapturer?>(nil)
+            let output = ScreenCaptureOutput(encoder: encoder) {
+                capturerRef.value?.markFirstFrame()
+            }
             let capturer = ScreenCapturer(cfg: cfg, output: output)
+            capturerRef.value = capturer
             let displayBounds = try await capturer.start()
 
             let input = try InputReceiver(
