@@ -4,7 +4,7 @@ import Darwin
 let p2VideoHeaderBytes = 36
 let p2TcpVideoHeaderBytes = 32
 let p2InputPacketBytes = 32
-let maxUdpPayloadBytes = 1440
+let maxUdpPayloadBytes = 1472
 let maxVideoFragmentPayload = maxUdpPayloadBytes - p2VideoHeaderBytes
 let p2InputRequestKeyframe: UInt8 = 7
 let p2InputSetVideoProfile: UInt8 = 8

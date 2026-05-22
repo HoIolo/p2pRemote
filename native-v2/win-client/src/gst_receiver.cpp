@@ -50,6 +50,9 @@ static uint64_t g_startedQpc = 0;
 static std::atomic<uint64_t> g_framesPresented{0};
 static std::atomic<uint64_t> g_lastBufferQpc{0};
 static std::atomic<double> g_presentFps{0.0};
+static std::atomic<uint64_t> g_framesReceived{0};
+static std::atomic<uint64_t> g_lastReceiveQpc{0};
+static std::atomic<double> g_receiveFps{0.0};
 static DWORD g_prevWindowStyle = 0;
 static DWORD g_prevWindowExStyle = 0;
 static RECT g_prevWindowRect{};
@@ -1007,6 +1010,14 @@ static void ApplyVideoRenderRectangle(HWND hwnd) {
   if (sink) gst_object_unref(sink);
 }
 
+static GstPadProbeReturn OnRtpPacket(GstPad*, GstPadProbeInfo* info, gpointer) {
+  if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) {
+    g_framesReceived.fetch_add(1, std::memory_order_relaxed);
+    g_lastReceiveQpc.store(QpcNow(), std::memory_order_relaxed);
+  }
+  return GST_PAD_PROBE_OK;
+}
+
 static GstPadProbeReturn OnVideoBuffer(GstPad*, GstPadProbeInfo* info, gpointer) {
   if (GST_PAD_PROBE_INFO_TYPE(info) & GST_PAD_PROBE_TYPE_BUFFER) {
     g_framesPresented.fetch_add(1, std::memory_order_relaxed);
@@ -1022,13 +1033,13 @@ static std::string GstPipelineDescription(HWND hwnd) {
   desc += "udpsrc port=" + std::to_string(g_cfg.videoPort);
   desc += " buffer-size=8388608 ";
   desc += " caps=\"application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000\" ";
-  desc += "! rtpjitterbuffer latency=0 faststart-min-packets=1 drop-on-latency=true do-lost=true mode=0 max-dropout-time=40 max-misorder-time=20 ";
+  desc += "! rtpjitterbuffer latency=30 faststart-min-packets=1 drop-on-latency=true do-lost=false mode=2 max-dropout-time=15 max-misorder-time=10 ";
   desc += "! rtph264depay request-keyframe=true wait-for-keyframe=true ";
   desc += "! h264parse config-interval=-1 disable-passthrough=true ";
-  desc += "! queue max-size-buffers=1 max-size-time=0 max-size-bytes=0 leaky=downstream ";
+  desc += "! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=upstream ";
   desc += "! d3d11h264dec discard-corrupted-frames=true automatic-request-sync-points=true qos=true ";
-  desc += "! queue max-size-buffers=1 max-size-time=0 max-size-bytes=0 leaky=downstream ";
-  desc += "! d3d11videosink name=videosink sync=false async=false qos=true max-lateness=0 force-aspect-ratio=false";
+  desc += "! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=upstream ";
+  desc += "! d3d11videosink name=videosink sync=true async=false qos=true max-lateness=15000000 force-aspect-ratio=false";
   return desc;
 }
 
@@ -1064,6 +1075,32 @@ static bool StartGStreamer(HWND hwnd) {
   }
   if (sink) gst_object_unref(sink);
 
+  GstElement* jitterbuffer = gst_bin_get_by_name(GST_BIN(g_pipeline), "rtpjitterbuffer0");
+  if (!jitterbuffer) {
+    GstIterator* it = gst_bin_iterate_elements(GST_BIN(g_pipeline));
+    if (it) {
+      GValue val = G_VALUE_INIT;
+      while (gst_iterator_next(it, &val) == GST_ITERATOR_OK) {
+        GstElement* elem = GST_ELEMENT(g_value_get_object(&val));
+        if (elem && g_str_has_prefix(GST_OBJECT_NAME(elem), "rtpjitterbuffer")) {
+          jitterbuffer = elem;
+          g_value_reset(&val);
+          break;
+        }
+        g_value_reset(&val);
+      }
+      gst_iterator_free(it);
+    }
+  }
+  if (jitterbuffer) {
+    GstPad* srcPad = gst_element_get_static_pad(jitterbuffer, "src");
+    if (srcPad) {
+      gst_pad_add_probe(srcPad, GST_PAD_PROBE_TYPE_BUFFER, OnRtpPacket, nullptr, nullptr);
+      gst_object_unref(srcPad);
+    }
+    gst_object_unref(jitterbuffer);
+  }
+
   const GstStateChangeReturn ret = gst_element_set_state(g_pipeline, GST_STATE_PLAYING);
   if (ret == GST_STATE_CHANGE_FAILURE) {
     MessageBoxW(hwnd, L"Failed to start GStreamer pipeline", L"P2P Native GStreamer", MB_ICONERROR);
@@ -1088,19 +1125,25 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     case WM_TIMER: {
       static uint64_t lastFrames = 0;
+      static uint64_t lastReceived = 0;
       static uint64_t lastQpc = QpcNow();
       const uint64_t now = QpcNow();
       const uint64_t frames = g_framesPresented.load(std::memory_order_relaxed);
+      const uint64_t received = g_framesReceived.load(std::memory_order_relaxed);
       const double seconds = double(QpcDeltaUs(lastQpc, now)) / 1'000'000.0;
-      const double fps = seconds > 0.001 ? double(frames - lastFrames) / seconds : 0.0;
-      g_presentFps.store(fps, std::memory_order_relaxed);
+      const double renderFps = seconds > 0.001 ? double(frames - lastFrames) / seconds : 0.0;
+      const double receiveFps = seconds > 0.001 ? double(received - lastReceived) / seconds : 0.0;
+      g_presentFps.store(renderFps, std::memory_order_relaxed);
+      g_receiveFps.store(receiveFps, std::memory_order_relaxed);
       lastFrames = frames;
+      lastReceived = received;
       lastQpc = now;
       wchar_t title[512];
       const uint64_t lastBuffer = g_lastBufferQpc.load(std::memory_order_relaxed);
       const double ageMs = lastBuffer ? double(QpcDeltaUs(lastBuffer, now)) / 1000.0 : 0.0;
-      swprintf_s(title, L"P2P Native v2 GStreamer -> %s | %.0f fps | last frame %.0f ms | %dx%d@%d %d Mbps",
-                 g_cfg.hostIp.c_str(), fps, ageMs, g_activeProfile.width, g_activeProfile.height,
+      const double dropRate = receiveFps > 0 ? (receiveFps - renderFps) / receiveFps * 100.0 : 0.0;
+      swprintf_s(title, L"P2P Native v2 GStreamer -> %s | recv:%.0f fps render:%.0f fps drop:%.0f%% | last frame %.0f ms | %dx%d@%d %d Mbps",
+                 g_cfg.hostIp.c_str(), receiveFps, renderFps, dropRate, ageMs, g_activeProfile.width, g_activeProfile.height,
                  g_activeProfile.fps, std::max(1, g_activeProfile.bitrate / 1'000'000));
       SetWindowTextW(hwnd, title);
       if (g_toolbarHwnd) InvalidateRect(g_toolbarHwnd, nullptr, FALSE);
