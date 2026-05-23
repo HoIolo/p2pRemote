@@ -29,6 +29,7 @@ class D3DRenderer {
   void ClearTextureSrvCache();
   bool EnsureCopyNv12Texture();
   bool DrawWithSrvs(ID3D11ShaderResourceView* ySrv, ID3D11ShaderResourceView* uvSrv);
+  D3D11_VIEWPORT FullWindowViewport() const;
   bool UploadNv12(const Nv12Frame& frame);
 
   struct TextureSrvCacheEntry {

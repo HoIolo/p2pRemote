@@ -521,6 +521,7 @@ function writeGameStreamDisplayHelper() {
     '}',
     '',
     'DP="$(find_displayplacer)"',
+    'echo "[p2p-display] using displayplacer: $DP" >&2',
     'if [ -z "$DP" ]; then',
     '  echo "[p2p-display] displayplacer not found; host display stays at its current aspect ratio" >&2',
     '  exit 0',
@@ -539,6 +540,7 @@ function writeGameStreamDisplayHelper() {
     'case "$WIDTH:$HEIGHT" in',
     '  *[!0-9:]*|:*) echo "[p2p-display] invalid client resolution: ${WIDTH}x${HEIGHT}" >&2; exit 0 ;;',
     'esac',
+    'echo "[p2p-display] requested client mode: ${WIDTH}x${HEIGHT}@${FPS:-default}" >&2',
     '',
     'LIST_FILE="${STATE_FILE}.list"',
     '"$DP" list > "$LIST_FILE" 2>/dev/null || true',
@@ -555,7 +557,8 @@ function writeGameStreamDisplayHelper() {
     '  TARGET="res:${WIDTH}x${HEIGHT}${HZ_ARG} scaling:on origin:(0,0) degree:0"',
     'fi',
     '',
-    '"$DP" "$TARGET" || echo "[p2p-display] failed to apply ${WIDTH}x${HEIGHT}; check displayplacer supported modes" >&2',
+    'echo "[p2p-display] applying target: $TARGET" >&2',
+    '"$DP" "$TARGET" && echo "[p2p-display] applied ${WIDTH}x${HEIGHT}" >&2 || echo "[p2p-display] failed to apply ${WIDTH}x${HEIGHT}; check displayplacer supported modes" >&2',
     'exit 0',
     '',
   ].join('\n');
@@ -567,12 +570,16 @@ function writeGameStreamDisplayHelper() {
 function runGameStreamDisplayHelper(action, env = {}) {
   if (process.platform !== 'darwin') return null;
   const helperPath = gameStreamDisplayHelperPath();
-  if (!fs.existsSync(helperPath)) return null;
+  if (!fs.existsSync(helperPath)) {
+    sendToMainWindow('host-log', { level: 'info', message: `game-stream display ${action} skipped: helper not found at ${helperPath}` });
+    return null;
+  }
   const child = spawn('/bin/sh', [helperPath, action], {
     cwd: gameStreamDataDir(),
     env: { ...process.env, ...env },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  sendToMainWindow('host-log', { level: 'info', message: `game-stream display ${action} starting: ${helperPath} ${env.SUNSHINE_CLIENT_WIDTH || ''}x${env.SUNSHINE_CLIENT_HEIGHT || ''}@${env.SUNSHINE_CLIENT_FPS || ''}` });
   attachGameStreamProcess(`display-${action}`, child);
   return child;
 }

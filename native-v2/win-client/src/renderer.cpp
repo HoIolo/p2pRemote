@@ -349,17 +349,22 @@ bool D3DRenderer::EnsureCopyNv12Texture() {
     return SUCCEEDED(device_->CreateShaderResourceView(copyNv12Tex_.Get(), &uvSrvDesc, &copyUvSrv_));
 }
 
+D3D11_VIEWPORT D3DRenderer::FullWindowViewport() const {
+    D3D11_VIEWPORT vp{};
+    vp.TopLeftX = 0;
+    vp.TopLeftY = 0;
+    vp.Width = static_cast<float>(std::max(1, backBufferWidth_));
+    vp.Height = static_cast<float>(std::max(1, backBufferHeight_));
+    vp.MinDepth = 0.0f;
+    vp.MaxDepth = 1.0f;
+    return vp;
+}
+
 bool D3DRenderer::DrawWithSrvs(ID3D11ShaderResourceView* ySrv, ID3D11ShaderResourceView* uvSrv) {
     if (!EnsureBackBufferSize()) return false;
     if (!rtv_ && !CreateBackBufferRtv()) return false;
 
-    D3D11_VIEWPORT vp{};
-    vp.TopLeftX = 0;
-    vp.TopLeftY = 0;
-    vp.Width = static_cast<float>(backBufferWidth_);
-    vp.Height = static_cast<float>(backBufferHeight_);
-    vp.MinDepth = 0.0f;
-    vp.MaxDepth = 1.0f;
+    D3D11_VIEWPORT vp = FullWindowViewport();
     ctx_->RSSetViewports(1, &vp);
     ID3D11RenderTargetView* rtv = rtv_.Get();
     ctx_->OMSetRenderTargets(1, &rtv, nullptr);

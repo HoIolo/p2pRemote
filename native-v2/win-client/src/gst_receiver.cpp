@@ -968,22 +968,11 @@ static void CreateOverlayWindows(HINSTANCE hInst) {
 static VideoRect CurrentVideoRect(HWND hwnd) {
   RECT rc{};
   GetClientRect(hwnd, &rc);
-  const int cw = static_cast<int>(std::max(1L, rc.right - rc.left));
-  const int ch = static_cast<int>(std::max(1L, rc.bottom - rc.top));
-  const double videoAspect = static_cast<double>(std::max(1, g_cfg.width)) / static_cast<double>(std::max(1, g_cfg.height));
-  const double clientAspect = static_cast<double>(cw) / static_cast<double>(ch);
   VideoRect out{};
-  if (clientAspect > videoAspect) {
-    out.height = ch;
-    out.width = std::max(1, static_cast<int>(static_cast<double>(ch) * videoAspect + 0.5));
-    out.left = (cw - out.width) / 2;
-    out.top = 0;
-  } else {
-    out.width = cw;
-    out.height = std::max(1, static_cast<int>(static_cast<double>(cw) / videoAspect + 0.5));
-    out.left = 0;
-    out.top = (ch - out.height) / 2;
-  }
+  out.left = 0;
+  out.top = 0;
+  out.width = static_cast<int>(std::max(1L, rc.right - rc.left));
+  out.height = static_cast<int>(std::max(1L, rc.bottom - rc.top));
   return out;
 }
 
