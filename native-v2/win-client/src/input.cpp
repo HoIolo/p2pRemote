@@ -103,8 +103,12 @@ void SendInputPacket(uint8_t kind, float x, float y, int32_t dx, int32_t dy, uin
 bool InitInputSocket() {
   g_inputSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (g_inputSock == INVALID_SOCKET) return false;
+  u_long nonBlocking = 1;
+  ioctlsocket(g_inputSock, FIONBIO, &nonBlocking);
   int sndbuf = 64 * 1024;
   setsockopt(g_inputSock, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
+  int tos = 0x10; // IPTOS_LOWDELAY
+  setsockopt(g_inputSock, IPPROTO_IP, IP_TOS, reinterpret_cast<const char*>(&tos), sizeof(tos));
   g_inputAddr.sin_family = AF_INET;
   g_inputAddr.sin_port = htons(g_cfg.inputPort);
   std::string ip = WideToUtf8(g_cfg.hostIp);

@@ -368,6 +368,7 @@ function stopNativeV2ClientProfileWatcher() {
 }
 
 async function processNativeV2ClientProfileChange(profile) {
+  const previous = nativeV2ClientLastOptions ? { ...nativeV2ClientLastOptions } : null;
   const normalized = {
     width: normalizeNativeV2Number(profile.width, nativeV2ClientLastOptions?.width || 1600, 640, 7680),
     height: normalizeNativeV2Number(profile.height, nativeV2ClientLastOptions?.height || 900, 360, 4320),
@@ -381,14 +382,22 @@ async function processNativeV2ClientProfileChange(profile) {
       ...normalized,
     };
   }
-  broadcastNativeV2Status();
-  const restarted = await restartNativeV2RemoteHostForClientProfile(normalized);
-  if (!restarted) {
-    sendToMainWindow('host-log', {
-      level: 'info',
-      message: `native-v2 profile changed to ${normalized.width}x${normalized.height}@${normalized.fps} bitrate=${normalized.bitrate}; reconnect or restart the Mac host to apply capture resolution/fps`,
-    });
+  if (nativeV2LastRemoteHostRequest?.options) {
+    nativeV2LastRemoteHostRequest.options = {
+      ...nativeV2LastRemoteHostRequest.options,
+      ...normalized,
+    };
   }
+  broadcastNativeV2Status();
+  const shapeChanged = previous
+    ? previous.width !== normalized.width || previous.height !== normalized.height || previous.fps !== normalized.fps
+    : true;
+  sendToMainWindow('host-log', {
+    level: 'info',
+    message: shapeChanged
+      ? `native-v2 profile changed to ${normalized.width}x${normalized.height}@${normalized.fps} bitrate=${normalized.bitrate}; live control packet sent by Windows client, skipping slow Electron host restart`
+      : `native-v2 bitrate changed to ${normalized.bitrate}; applied live without host restart`,
+  });
 }
 
 function queueNativeV2ClientProfileChange(profile) {

@@ -20,6 +20,11 @@ final class ScreenCaptureOutput: NSObject, SCStreamOutput {
         self.firstFrameCallback = firstFrameCallback
     }
 
+    func resetFirstFrameReport() {
+        reportedFirstFrame = false
+        reportedMissingImageBuffer = false
+    }
+
     func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
         guard type == .screen else { return }
         guard sampleBuffer.isValid else { return }
@@ -64,7 +69,7 @@ final class ScreenCaptureOutput: NSObject, SCStreamOutput {
 
 @available(macOS 13.0, *)
 final class ScreenCapturer: NSObject, SCStreamDelegate {
-    private let cfg: NativeHostConfig
+    private var cfg: NativeHostConfig
     private let output: ScreenCaptureOutput
     private let sampleQueue = DispatchQueue(label: "p2p.native.capture", qos: .userInteractive)
     private let stateQueue = DispatchQueue(label: "p2p.native.capture.state")
@@ -83,6 +88,10 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
     init(cfg: NativeHostConfig, output: ScreenCaptureOutput) {
         self.cfg = cfg
         self.output = output
+    }
+
+    func updateConfig(_ cfg: NativeHostConfig) {
+        self.cfg = cfg
     }
 
     func start() async throws -> CGRect {
@@ -137,10 +146,11 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
     }
 
     private func startStream(display: SCDisplay, mainId: CGDirectDisplayID, pixelFormat: OSType) async throws {
-        resetFirstFrameState()
         if let oldStream = stream {
             try? await oldStream.stopCapture()
         }
+        resetFirstFrameState()
+        output.resetFirstFrameReport()
 
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
         let streamCfg = SCStreamConfiguration()

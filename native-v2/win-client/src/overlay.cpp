@@ -595,6 +595,18 @@ static void SendVideoProfileCommand(const VideoProfile& profile) {
   }
 }
 
+static void SendVideoBitrateCommand(int bitrate) {
+  const int clamped = std::clamp(bitrate, 2'000'000, 80'000'000);
+  for (int i = 0; i < 2; ++i) {
+    SendInputPacket(P2_INPUT_SET_VIDEO_BITRATE, 0, 0, clamped, 0, 0, 0);
+    if (i == 0) Sleep(10);
+  }
+}
+
+static bool SameStreamShape(const VideoProfile& lhs, const VideoProfile& rhs) {
+  return lhs.width == rhs.width && lhs.height == rhs.height && lhs.fps == rhs.fps;
+}
+
 static bool RequestProfileApply(const VideoProfile& requestedProfile, const wchar_t* reason) {
   VideoProfile profile = requestedProfile;
   profile.width = ClampEven(profile.width, g_cfg.width);
@@ -613,13 +625,20 @@ static bool RequestProfileApply(const VideoProfile& requestedProfile, const wcha
     return false;
   }
 
+  const bool streamShapeChanged = !SameStreamShape(activeProfile, profile);
   g_lastProfileApplyQpc.store(QpcNow(), std::memory_order_relaxed);
-  SendVideoProfileCommand(profile);
-  CommitActiveVideoProfile(profile);
-  g_videoProfileGeneration.fetch_add(1, std::memory_order_relaxed);
-  Log(L"profile apply requested: %dx%d@%d bitrate=%d (%s)",
-      profile.width, profile.height, profile.fps, profile.bitrate, reason ? reason : L"manual");
-  EnterVideoRecovery(L"profile changed");
+  if (streamShapeChanged) {
+    SendVideoProfileCommand(profile);
+    CommitActiveVideoProfile(profile);
+    g_videoProfileGeneration.fetch_add(1, std::memory_order_relaxed);
+    Log(L"profile apply requested: %dx%d@%d bitrate=%d (%s)",
+        profile.width, profile.height, profile.fps, profile.bitrate, reason ? reason : L"manual");
+    EnterVideoRecovery(L"profile changed");
+  } else {
+    SendVideoBitrateCommand(profile.bitrate);
+    CommitActiveVideoProfile(profile);
+    Log(L"bitrate apply requested: %d (%s)", profile.bitrate, reason ? reason : L"manual");
+  }
   HideNativePopups();
   if (g_hwnd) InvalidateRect(g_hwnd, nullptr, FALSE);
   if (g_toolbarHwnd) InvalidateRect(g_toolbarHwnd, nullptr, FALSE);

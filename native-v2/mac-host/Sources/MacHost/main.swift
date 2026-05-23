@@ -60,13 +60,48 @@ final actor NativeHostRuntime {
     }
 
     func reconfigureVideo(width: Int, height: Int, fps: Int, bitrateMbps: Int) async {
-        // The native VideoToolbox path applies bitrate immediately. Resolution
-        // and FPS changes are kept for the next reconnect to avoid a multi-second
-        // capture/encoder restart in the middle of a low-latency session.
-        if bitrateMbps > 0 {
-            updateBitrate(bitrateMbps * 1_000_000, reason: "manual profile")
+        let nextWidth = max(640, width)
+        let nextHeight = max(360, height)
+        let nextFps = max(30, min(240, fps))
+        let nextBitrate = bitrateMbps > 0 ? bitrateMbps * 1_000_000 : cfg.bitrate
+
+        let shapeChanged = nextWidth != cfg.width || nextHeight != cfg.height || nextFps != cfg.fps
+        if !shapeChanged {
+            updateBitrate(nextBitrate, reason: "manual profile")
+            requestKeyframe(reason: "bitrate changed")
+            logLine("[control] bitrate-only profile applied live: bitrate=\(nextBitrate)")
+            return
         }
-        logLine("[control] profile request received: \(width)x\(height)@\(fps) bitrateMbps=\(bitrateMbps); bitrate applied, resolution/fps require reconnect")
+
+        var nextCfg = cfg
+        nextCfg.width = nextWidth
+        nextCfg.height = nextHeight
+        nextCfg.fps = nextFps
+        nextCfg.bitrate = max(2_000_000, min(80_000_000, nextBitrate))
+
+        let started = nowUs()
+        logLine("[control] live profile reconfigure start: \(cfg.width)x\(cfg.height)@\(cfg.fps) -> \(nextCfg.width)x\(nextCfg.height)@\(nextCfg.fps) bitrate=\(nextCfg.bitrate)")
+        do {
+            await capturer.stop()
+            try encoder.reconfigure(
+                width: nextCfg.width,
+                height: nextCfg.height,
+                fps: nextCfg.fps,
+                bitrate: nextCfg.bitrate,
+                keyframeSeconds: nextCfg.keyframeSeconds,
+                reason: "manual profile"
+            )
+            cfg = nextCfg
+            udpVideo?.updateTargetBitrate(nextCfg.bitrate)
+            capturer.updateConfig(nextCfg)
+            _ = try await capturer.start()
+            requestKeyframe(reason: "profile changed")
+            let elapsedMs = Double(nowUs() - started) / 1000.0
+            logLine(String(format: "[control] live profile reconfigure done: %dx%d@%d bitrate=%d elapsed=%.0f ms",
+                           nextCfg.width, nextCfg.height, nextCfg.fps, nextCfg.bitrate, elapsedMs))
+        } catch {
+            logLine("[control] live profile reconfigure failed: \(error)")
+        }
     }
 }
 

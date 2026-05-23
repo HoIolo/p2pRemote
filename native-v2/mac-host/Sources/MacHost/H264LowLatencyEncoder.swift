@@ -5,11 +5,11 @@ import CoreVideo
 import Darwin
 
 final class H264LowLatencyEncoder {
-    private let width: Int32
-    private let height: Int32
-    private let fps: Int
-    private let bitrate: Int
-    private let keyframeSeconds: Int
+    private var width: Int32
+    private var height: Int32
+    private var fps: Int
+    private var bitrate: Int
+    private var keyframeSeconds: Int
     private let onFrame: (Data, Bool, Bool, UInt64) -> Void
     private var session: VTCompressionSession?
     private var sps = Data()
@@ -103,10 +103,40 @@ final class H264LowLatencyEncoder {
             return
         }
         currentBitrate = clamped
+        bitrate = clamped
         controlLock.unlock()
         set(kVTCompressionPropertyKey_AverageBitRate, clamped as CFTypeRef)
         setDataRateLimits(bitrate: clamped)
         logLine("[encoder] bitrate updated: \(clamped)")
+    }
+
+    func reconfigure(width newWidth: Int, height newHeight: Int, fps newFps: Int, bitrate newBitrate: Int, keyframeSeconds newKeyframeSeconds: Int, reason: String = "profile changed") throws {
+        let clampedWidth = Int32(max(640, newWidth))
+        let clampedHeight = Int32(max(360, newHeight))
+        let clampedFps = max(30, min(240, newFps))
+        let clampedBitrate = max(2_000_000, min(80_000_000, newBitrate))
+        let clampedKeyframeSeconds = max(1, newKeyframeSeconds)
+
+        controlLock.lock()
+        if let oldSession = session {
+            VTCompressionSessionInvalidate(oldSession)
+        }
+        session = nil
+        width = clampedWidth
+        height = clampedHeight
+        fps = clampedFps
+        bitrate = clampedBitrate
+        currentBitrate = clampedBitrate
+        keyframeSeconds = clampedKeyframeSeconds
+        sps.removeAll(keepingCapacity: true)
+        pps.removeAll(keepingCapacity: true)
+        frameIndex = 0
+        pendingForcedKeyframe = true
+        reportedFirstEncodedFrame = false
+        controlLock.unlock()
+
+        try createSession()
+        logLine("[encoder] reconfigured: \(Int(clampedWidth))x\(Int(clampedHeight))@\(clampedFps) bitrate=\(clampedBitrate) reason=\(reason)")
     }
 
     func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, forceKeyframe: Bool = false) {

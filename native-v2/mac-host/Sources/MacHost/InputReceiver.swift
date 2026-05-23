@@ -6,6 +6,7 @@ import Darwin
 final class InputReceiver {
     private let fd: Int32
     private let displayBounds: CGRect
+    private let eventSource: CGEventSource?
     private let onKeyframeRequest: () -> Void
     private let onVideoProfileRequest: (Int, Int, Int, Int) -> Void
     private let onBitrateRequest: (Int) -> Void
@@ -17,6 +18,7 @@ final class InputReceiver {
     private var lastPacketTime: UInt64 = 0
     private var clientConnected = false
     private static let timeoutUs: UInt64 = 10_000_000
+    private static let maxDrainPackets = 256
 
     init(
         port: UInt16,
@@ -27,6 +29,7 @@ final class InputReceiver {
         onClientTimeout: @escaping () -> Void = {}
     ) throws {
         self.displayBounds = displayBounds
+        self.eventSource = CGEventSource(stateID: .hidSystemState)
         self.onKeyframeRequest = onKeyframeRequest
         self.onVideoProfileRequest = onVideoProfileRequest
         self.onBitrateRequest = onBitrateRequest
@@ -36,6 +39,8 @@ final class InputReceiver {
 
         var reuse: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse, socklen_t(MemoryLayout<Int32>.size))
+        var rcvbuf: Int32 = 64 * 1024
+        setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, socklen_t(MemoryLayout<Int32>.size))
 
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
@@ -87,6 +92,7 @@ final class InputReceiver {
 
     private func loop() {
         var buf = [UInt8](repeating: 0, count: 256)
+        let dontWait = Int32(MSG_DONTWAIT)
         while running {
             let n = recv(fd, &buf, buf.count, 0)
             if n >= p2InputPacketBytes {
@@ -95,8 +101,52 @@ final class InputReceiver {
                     clientConnected = true
                     logLine("[input] client connected (first packet received)")
                 }
-                handle(Array(buf[0..<n]))
+                var packets = [Array(buf[0..<n])]
+                while packets.count < Self.maxDrainPackets {
+                    let m = recv(fd, &buf, buf.count, dontWait)
+                    if m < p2InputPacketBytes { break }
+                    packets.append(Array(buf[0..<m]))
+                }
+                handleCoalesced(packets)
             }
+        }
+    }
+
+    private func packetKind(_ bytes: [UInt8]) -> UInt8? {
+        guard bytes.count >= p2InputPacketBytes else { return nil }
+        guard bytes[0] == 0x50, bytes[1] == 0x32, bytes[2] == 0x49, bytes[3] == 0x32 else { return nil } // P2I2
+        guard bytes[4] == 1 else { return nil }
+        return bytes[5]
+    }
+
+    private func handleCoalesced(_ packets: [[UInt8]]) {
+        // Low-latency cursor model: never replay a backlog of stale mouse moves.
+        // Keep only the newest consecutive move packet, but flush it before any
+        // click, wheel, keyboard, or control packet so event ordering remains
+        // correct. This is the same "drop old pointer samples, keep current
+        // state" strategy used by low-latency desktop/game streamers.
+        var pendingMove: [UInt8]? = nil
+        for packet in packets {
+            guard let kind = packetKind(packet) else { continue }
+            if kind == 1 {
+                pendingMove = packet
+                continue
+            }
+            if kind == p2InputHeartbeat {
+                continue
+            }
+            if kind == p2InputRequestKeyframe || kind == p2InputSetVideoProfile || kind == p2InputSetVideoBitrate {
+                handle(packet)
+                continue
+            }
+            if let move = pendingMove {
+                handle(move)
+                pendingMove = nil
+            }
+            handle(packet)
+        }
+        if let move = pendingMove {
+            handle(move)
         }
     }
 
@@ -195,19 +245,19 @@ final class InputReceiver {
     }
 
     private func postMouse(type: CGEventType, point: CGPoint, button: CGMouseButton) {
-        guard let event = CGEvent(mouseEventSource: nil, mouseType: type, mouseCursorPosition: point, mouseButton: button) else { return }
+        guard let event = CGEvent(mouseEventSource: eventSource, mouseType: type, mouseCursorPosition: point, mouseButton: button) else { return }
         event.post(tap: .cghidEventTap)
     }
 
     private func postWheel(dx: Int32, dy: Int32) {
         let wheelX = Int32(max(-5000, min(5000, -dx)))
         let wheelY = Int32(max(-5000, min(5000, -dy)))
-        guard let event = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2, wheel1: wheelY, wheel2: wheelX, wheel3: 0) else { return }
+        guard let event = CGEvent(scrollWheelEvent2Source: eventSource, units: .pixel, wheelCount: 2, wheel1: wheelY, wheel2: wheelX, wheel3: 0) else { return }
         event.post(tap: .cghidEventTap)
     }
 
     private func postKey(code: CGKeyCode, down: Bool) {
-        guard let event = CGEvent(keyboardEventSource: nil, virtualKey: code, keyDown: down) else { return }
+        guard let event = CGEvent(keyboardEventSource: eventSource, virtualKey: code, keyDown: down) else { return }
         event.post(tap: .cghidEventTap)
     }
 
@@ -223,8 +273,8 @@ final class InputReceiver {
     private func postText(codeUnit: UInt16, modifiers: UInt16) {
         guard codeUnit >= 0x20, codeUnit != 0x7f else { return }
         var chars = [UniChar(codeUnit)]
-        guard let down = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: true),
-              let up = CGEvent(keyboardEventSource: nil, virtualKey: 0, keyDown: false) else { return }
+        guard let down = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: true),
+              let up = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: false) else { return }
         let eventFlags = flags(from: modifiers)
         down.flags = eventFlags
         up.flags = eventFlags
