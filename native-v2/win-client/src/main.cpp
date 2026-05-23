@@ -107,6 +107,12 @@ struct DecodedFrame {
   Nv12Frame nv12;
 };
 
+enum class DecodeStatus {
+  Frame,
+  NeedMoreInput,
+  Error,
+};
+
 static Config g_cfg;
 static HWND g_hwnd = nullptr;
 static HWND g_toolbarHwnd = nullptr;
@@ -141,6 +147,7 @@ static std::atomic<uint64_t> g_gpuRenderFails{0};
 static std::atomic<uint64_t> g_lastPacketQpc{0};
 static std::atomic<uint64_t> g_lastCompleteQpc{0};
 static std::atomic<bool> g_decoderPrimed{false};
+static std::atomic<bool> g_decoderHasKeyframe{false};
 static std::atomic<bool> g_waitingForKeyframe{false};
 static std::atomic<bool> g_loggedFirstDecodedFrame{false};
 static std::atomic<bool> g_loggedFirstPresentedFrame{false};
@@ -313,7 +320,7 @@ static void PushEncoded(EncodedFrame&& f) {
   bool queued = false;
   {
     std::lock_guard lk(g_encodedMu);
-    const size_t queueDepthTarget = EncodedQueueDepthTarget();
+    size_t queueDepthTarget = EncodedQueueDepthTarget();
     if (g_waitingForKeyframe.load(std::memory_order_relaxed)) {
       if (!f.keyframe) {
         RecordClientFrameDrop();
@@ -322,14 +329,32 @@ static void PushEncoded(EncodedFrame&& f) {
       g_waitingForKeyframe.store(false, std::memory_order_relaxed);
     }
 
-    // Until the decoder has successfully produced a frame, keep the newest
-    // keyframe around and drop delta frames that would otherwise starve sync.
-    if (!g_decoderPrimed.load(std::memory_order_relaxed) && !f.keyframe) {
+    if (f.keyframe) {
+      g_decoderHasKeyframe.store(true, std::memory_order_relaxed);
+    }
+
+    if (!g_decoderPrimed.load(std::memory_order_relaxed) &&
+        g_decoderHasKeyframe.load(std::memory_order_relaxed)) {
+      queueDepthTarget = kMaxEncodedQueueDepth;
+      g_encodedQueueTargetNow.store(static_cast<uint32_t>(queueDepthTarget), std::memory_order_relaxed);
+    }
+
+    // Until a keyframe has entered the decode pipeline, delta frames cannot
+    // establish decoder state. Once the first keyframe is queued, keep feeding
+    // subsequent frames because Media Foundation may need more than one sample
+    // before it produces output.
+    if (!g_decoderPrimed.load(std::memory_order_relaxed) &&
+        !g_decoderHasKeyframe.load(std::memory_order_relaxed) &&
+        !f.keyframe) {
       RecordClientFrameDrop();
       return;
     }
 
     while (g_encodedQueue.size() >= queueDepthTarget) {
+      if (!g_decoderPrimed.load(std::memory_order_relaxed) && !f.keyframe) {
+        RecordClientFrameDrop();
+        return;
+      }
       g_encodedQueue.pop_front();
       RecordClientFrameDrop();
     }
@@ -2094,42 +2119,51 @@ class MfDecoder {
     return SetNv12OutputType();
   }
 
-  bool Decode(const EncodedFrame& encoded, DecodedFrame& decoded) {
+  DecodeStatus Decode(const EncodedFrame& encoded, DecodedFrame& decoded) {
     ComPtr<IMFMediaBuffer> buf;
     HRESULT hr = MFCreateMemoryBuffer(static_cast<DWORD>(encoded.bytes.size()), &buf);
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return DecodeStatus::Error;
     BYTE* dst = nullptr; DWORD maxLen = 0;
-    buf->Lock(&dst, &maxLen, nullptr);
+    if (FAILED(buf->Lock(&dst, &maxLen, nullptr))) return DecodeStatus::Error;
     memcpy(dst, encoded.bytes.data(), encoded.bytes.size());
     buf->Unlock();
     buf->SetCurrentLength(static_cast<DWORD>(encoded.bytes.size()));
 
     ComPtr<IMFSample> sample;
-    MFCreateSample(&sample);
-    sample->AddBuffer(buf.Get());
+    if (FAILED(MFCreateSample(&sample))) return DecodeStatus::Error;
+    if (FAILED(sample->AddBuffer(buf.Get()))) return DecodeStatus::Error;
     sample->SetSampleTime(static_cast<LONGLONG>(encoded.ptsUs * 10));
     sample->SetSampleDuration(10'000'000 / fps_);
 
-    hr = mft_->ProcessInput(0, sample.Get(), 0);
-    if (hr == MF_E_NOTACCEPTING) {
-      DrainOne(decoded, encoded);
-      hr = mft_->ProcessInput(0, sample.Get(), 0);
-    }
-    if (FAILED(hr)) return false;
-
     bool gotFrame = false;
     DecodedFrame last;
+
+    hr = mft_->ProcessInput(0, sample.Get(), 0);
+    if (hr == MF_E_NOTACCEPTING) {
+      DecodedFrame drained;
+      const DecodeStatus drainStatus = DrainOne(drained, encoded);
+      if (drainStatus == DecodeStatus::Error) return DecodeStatus::Error;
+      if (drainStatus == DecodeStatus::Frame) {
+        last = std::move(drained);
+        gotFrame = true;
+      }
+      hr = mft_->ProcessInput(0, sample.Get(), 0);
+    }
+    if (FAILED(hr)) return DecodeStatus::Error;
+
     for (int i = 0; i < 4; ++i) {
       DecodedFrame one;
-      if (!DrainOne(one, encoded)) break;
+      const DecodeStatus status = DrainOne(one, encoded);
+      if (status == DecodeStatus::NeedMoreInput) break;
+      if (status == DecodeStatus::Error) return gotFrame ? DecodeStatus::Frame : DecodeStatus::Error;
       last = std::move(one);
       gotFrame = true;
     }
     if (gotFrame) {
       decoded = std::move(last);
-      return true;
+      return DecodeStatus::Frame;
     }
-    return false;
+    return DecodeStatus::NeedMoreInput;
   }
 
  private:
@@ -2170,7 +2204,7 @@ class MfDecoder {
     mft_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(dxgiManager_.Get()));
   }
 
-  bool DrainOne(DecodedFrame& decoded, const EncodedFrame& meta) {
+  DecodeStatus DrainOne(DecodedFrame& decoded, const EncodedFrame& meta) {
     MFT_OUTPUT_STREAM_INFO info{};
     mft_->GetOutputStreamInfo(0, &info);
 
@@ -2186,9 +2220,9 @@ class MfDecoder {
       } else {
         DWORD bufSize = std::max<DWORD>(info.cbSize, static_cast<DWORD>(width_ * height_ * 3 / 2));
         ComPtr<IMFMediaBuffer> outBuf;
-        if (FAILED(MFCreateMemoryBuffer(bufSize, &outBuf))) return false;
-        MFCreateSample(&outSample);
-        outSample->AddBuffer(outBuf.Get());
+        if (FAILED(MFCreateMemoryBuffer(bufSize, &outBuf))) return DecodeStatus::Error;
+        if (FAILED(MFCreateSample(&outSample))) return DecodeStatus::Error;
+        if (FAILED(outSample->AddBuffer(outBuf.Get()))) return DecodeStatus::Error;
       }
       output.pSample = outSample.Get();
     }
@@ -2196,10 +2230,10 @@ class MfDecoder {
     DWORD status = 0;
     HRESULT hr = mft_->ProcessOutput(0, 1, &output, &status);
     if (output.pEvents) output.pEvents->Release();
-    if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return false;
+    if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return DecodeStatus::NeedMoreInput;
     if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
       SetNv12OutputType();
-      return false;
+      return DecodeStatus::NeedMoreInput;
     }
     if (FAILED(hr) && usingDxgiOutputSample) {
       // Some decoder configurations reject caller-provided DXGI samples; retry with a CPU sample.
@@ -2208,30 +2242,31 @@ class MfDecoder {
       output.dwStreamID = 0;
       DWORD bufSize = std::max<DWORD>(info.cbSize, static_cast<DWORD>(width_ * height_ * 3 / 2));
       ComPtr<IMFMediaBuffer> outBuf;
-      if (FAILED(MFCreateMemoryBuffer(bufSize, &outBuf))) return false;
-      MFCreateSample(&outSample);
-      outSample->AddBuffer(outBuf.Get());
+      if (FAILED(MFCreateMemoryBuffer(bufSize, &outBuf))) return DecodeStatus::Error;
+      if (FAILED(MFCreateSample(&outSample))) return DecodeStatus::Error;
+      if (FAILED(outSample->AddBuffer(outBuf.Get()))) return DecodeStatus::Error;
       output.pSample = outSample.Get();
       hr = mft_->ProcessOutput(0, 1, &output, &status);
       if (output.pEvents) output.pEvents->Release();
     }
+    if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return DecodeStatus::NeedMoreInput;
     if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
       SetNv12OutputType();
-      return false;
+      return DecodeStatus::NeedMoreInput;
     }
-    if (FAILED(hr)) return false;
+    if (FAILED(hr)) return DecodeStatus::Error;
 
     if (providesSamples && output.pSample) {
       outSample.Attach(output.pSample);
     }
-    if (!outSample) return false;
+    if (!outSample) return DecodeStatus::Error;
 
     // Zero-copy path: decoder gave us a D3D11 texture from the same device used by the renderer.
     if (sharedDxDevice_ && ExtractDxgi(outSample.Get(), decoded, meta)) {
-      return true;
+      return DecodeStatus::Frame;
     }
 
-    return CopySampleToNv12(outSample.Get(), decoded, meta);
+    return CopySampleToNv12(outSample.Get(), decoded, meta) ? DecodeStatus::Frame : DecodeStatus::Error;
   }
 
   bool CreateDxgiOutputSample(ComPtr<IMFSample>* sampleOut) {
@@ -2349,6 +2384,7 @@ static void DecoderThread() {
           decoder = std::move(rebuilt);
           appliedProfileGeneration = generation;
           g_decoderPrimed.store(false, std::memory_order_relaxed);
+          g_decoderHasKeyframe.store(false, std::memory_order_relaxed);
           Log(L"decoder/render pipeline reconfigured: %dx%d@%d bitrate=%d",
               activeProfile.width, activeProfile.height, activeProfile.fps, activeProfile.bitrate);
         } else {
@@ -2371,7 +2407,8 @@ static void DecoderThread() {
       g_encodedQueueDepthNow.store(static_cast<uint32_t>(g_encodedQueue.size()), std::memory_order_relaxed);
     }
     DecodedFrame frame;
-    if (decoder->Decode(encoded, frame)) {
+    const DecodeStatus status = decoder->Decode(encoded, frame);
+    if (status == DecodeStatus::Frame) {
       g_decoderPrimed.store(true, std::memory_order_relaxed);
       if (!g_loggedFirstDecodedFrame.exchange(true, std::memory_order_relaxed)) {
         Log(L"decoder first frame id=%llu mode=%s",
@@ -2379,7 +2416,7 @@ static void DecoderThread() {
             frame.gpu ? L"gpu" : L"cpu");
       }
       PushDecoded(std::move(frame));
-    } else {
+    } else if (status == DecodeStatus::Error) {
       g_decodeFails.fetch_add(1, std::memory_order_relaxed);
       Log(L"decode failed frame=%llu bytes=%zu keyframe=%d",
           static_cast<unsigned long long>(encoded.frameId),
@@ -2553,6 +2590,7 @@ static void SendInputPacket(uint8_t kind, float x, float y, int32_t dx, int32_t 
 static void EnterVideoRecovery(const wchar_t* reason) {
   g_waitingForKeyframe.store(true, std::memory_order_relaxed);
   g_decoderPrimed.store(false, std::memory_order_relaxed);
+  g_decoderHasKeyframe.store(false, std::memory_order_relaxed);
   {
     std::lock_guard lk(g_encodedMu);
     if (!g_encodedQueue.empty()) {
