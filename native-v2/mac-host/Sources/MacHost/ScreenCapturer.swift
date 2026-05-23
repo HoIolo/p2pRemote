@@ -107,6 +107,13 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
         let bounds = CGDisplayBounds(CGDirectDisplayID(display.displayID))
         selectedDisplayId = CGDirectDisplayID(display.displayID)
         selectedBounds = bounds
+        let physicalWidth = CGDisplayPixelsWide(selectedDisplayId)
+        let physicalHeight = CGDisplayPixelsHigh(selectedDisplayId)
+        let requestedLongEdge = max(cfg.width, cfg.height)
+        let logicalLongEdge = Int(max(bounds.width, bounds.height))
+        if requestedLongEdge > logicalLongEdge {
+            logLine("[capture] HiDPI request: logicalBounds=\(Int(bounds.width))x\(Int(bounds.height)) physical=\(physicalWidth)x\(physicalHeight) stream=\(cfg.width)x\(cfg.height)")
+        }
         try await startStream(display: display, mainId: mainId, pixelFormat: preferredPixelFormats[0])
         let gotFirstFrame = await waitForFirstFrame(timeoutMs: 1_500)
         if preferredPixelFormats.count > 1 && !gotFirstFrame {

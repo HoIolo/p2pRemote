@@ -171,6 +171,14 @@ function deviceName() {
 
 function localDevicePayload() {
   const primary = screen.getPrimaryDisplay();
+  const scaleFactor = Number(primary?.scaleFactor) || 1;
+  const pointBounds = primary?.bounds || null;
+  const pixelBounds = pointBounds ? {
+    x: Math.round(pointBounds.x * scaleFactor),
+    y: Math.round(pointBounds.y * scaleFactor),
+    width: Math.round(pointBounds.width * scaleFactor),
+    height: Math.round(pointBounds.height * scaleFactor),
+  } : null;
   return {
     type: 'p2p-remote-lan:announce',
     version: 1,
@@ -180,13 +188,16 @@ function localDevicePayload() {
     port: SIGNAL_PORT,
     pin: PIN,
     addresses: lanAddresses().map((item) => item.address),
-    display: primary?.bounds ? {
-      x: primary.bounds.x,
-      y: primary.bounds.y,
-      width: primary.bounds.width,
-      height: primary.bounds.height,
+    display: pointBounds ? {
+      x: pointBounds.x,
+      y: pointBounds.y,
+      width: pointBounds.width,
+      height: pointBounds.height,
+      pixelWidth: pixelBounds.width,
+      pixelHeight: pixelBounds.height,
+      displayFrequency: Number(primary.displayFrequency) || 60,
     } : null,
-    scaleFactor: primary?.scaleFactor || 1,
+    scaleFactor,
     ts: Date.now(),
   };
 }

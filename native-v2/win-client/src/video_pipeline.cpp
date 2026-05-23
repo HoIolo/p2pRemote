@@ -12,11 +12,352 @@
 #include <codecapi.h>
 
 #include <algorithm>
+#include <array>
 #include <cstring>
+#include <cwchar>
 #include <memory>
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+static const wchar_t* HrName(HRESULT hr) {
+  switch (hr) {
+    case S_OK: return L"S_OK";
+    case MF_E_TRANSFORM_NEED_MORE_INPUT: return L"MF_E_TRANSFORM_NEED_MORE_INPUT";
+    case MF_E_TRANSFORM_STREAM_CHANGE: return L"MF_E_TRANSFORM_STREAM_CHANGE";
+    case MF_E_NOTACCEPTING: return L"MF_E_NOTACCEPTING";
+    case MF_E_INVALIDMEDIATYPE: return L"MF_E_INVALIDMEDIATYPE";
+    case MF_E_TRANSFORM_TYPE_NOT_SET: return L"MF_E_TRANSFORM_TYPE_NOT_SET";
+    default: return L"";
+  }
+}
+
+static void FormatHr(HRESULT hr, wchar_t* out, size_t outCount) {
+  const wchar_t* name = HrName(hr);
+  if (name && name[0]) swprintf_s(out, outCount, L"%s (0x%08x)", name, static_cast<unsigned>(hr));
+  else swprintf_s(out, outCount, L"0x%08x", static_cast<unsigned>(hr));
+}
+
+static size_t FindAnnexBStartCode(const uint8_t* data, size_t size, size_t offset, size_t* codeLen) {
+  for (size_t i = offset; i + 3 <= size; ++i) {
+    if (data[i] != 0 || data[i + 1] != 0) continue;
+    if (data[i + 2] == 1) {
+      if (codeLen) *codeLen = 3;
+      return i;
+    }
+    if (i + 4 <= size && data[i + 2] == 0 && data[i + 3] == 1) {
+      if (codeLen) *codeLen = 4;
+      return i;
+    }
+  }
+  return size;
+}
+
+static void H264NalSummary(const std::vector<uint8_t>& bytes,
+                           uint32_t& sps,
+                           uint32_t& pps,
+                           uint32_t& idr,
+                           wchar_t* firstTypes,
+                           size_t firstTypesCount) {
+  sps = 0;
+  pps = 0;
+  idr = 0;
+  if (firstTypes && firstTypesCount) firstTypes[0] = 0;
+  const uint8_t* data = bytes.data();
+  const size_t size = bytes.size();
+  size_t len = 0;
+  size_t sc = FindAnnexBStartCode(data, size, 0, &len);
+  uint32_t listed = 0;
+  while (sc < size) {
+    const size_t nalStart = sc + len;
+    if (nalStart >= size) break;
+    size_t nextLen = 0;
+    size_t next = FindAnnexBStartCode(data, size, nalStart, &nextLen);
+    size_t nalEnd = next;
+    while (nalEnd > nalStart && data[nalEnd - 1] == 0) --nalEnd;
+    if (nalEnd > nalStart) {
+      const uint8_t type = data[nalStart] & 0x1f;
+      if (type == 7) ++sps;
+      else if (type == 8) ++pps;
+      else if (type == 5) ++idr;
+      if (firstTypes && firstTypesCount && listed < 12) {
+        wchar_t item[16];
+        swprintf_s(item, L"%s%u", listed == 0 ? L"" : L",", static_cast<unsigned>(type));
+        wcscat_s(firstTypes, firstTypesCount, item);
+        ++listed;
+      }
+    }
+    sc = next;
+    len = nextLen;
+  }
+}
+
+static std::vector<uint8_t> ExtractH264SequenceHeader(const std::vector<uint8_t>& bytes) {
+  std::vector<uint8_t> out;
+  bool haveSps = false;
+  bool havePps = false;
+  const uint8_t* data = bytes.data();
+  const size_t size = bytes.size();
+  size_t len = 0;
+  size_t sc = FindAnnexBStartCode(data, size, 0, &len);
+  while (sc < size) {
+    const size_t nalStart = sc + len;
+    if (nalStart >= size) break;
+    size_t nextLen = 0;
+    size_t next = FindAnnexBStartCode(data, size, nalStart, &nextLen);
+    size_t nalEnd = next;
+    while (nalEnd > nalStart && data[nalEnd - 1] == 0) --nalEnd;
+    if (nalEnd > nalStart) {
+      const uint8_t type = data[nalStart] & 0x1f;
+      if (type == 7 || type == 8) {
+        static const uint8_t kStartCode[] = {0, 0, 0, 1};
+        out.insert(out.end(), std::begin(kStartCode), std::end(kStartCode));
+        out.insert(out.end(), data + nalStart, data + nalEnd);
+        if (type == 7) haveSps = true;
+        if (type == 8) havePps = true;
+      }
+    }
+    if (haveSps && havePps) break;
+    sc = next;
+    len = nextLen;
+  }
+  if (!haveSps || !havePps) out.clear();
+  return out;
+}
+
+static bool EnvFlagEnabled(const wchar_t* name) {
+  wchar_t value[16]{};
+  DWORD n = GetEnvironmentVariableW(name, value, static_cast<DWORD>(std::size(value)));
+  return n > 0 && (_wcsicmp(value, L"1") == 0 || _wcsicmp(value, L"true") == 0 || _wcsicmp(value, L"yes") == 0);
+}
+
+static const wchar_t* VideoSubtypeName(const GUID& subtype) {
+  if (IsEqualGUID(subtype, MFVideoFormat_NV12)) return L"NV12";
+  if (IsEqualGUID(subtype, MFVideoFormat_YV12)) return L"YV12";
+  if (IsEqualGUID(subtype, MFVideoFormat_IYUV)) return L"IYUV";
+  if (IsEqualGUID(subtype, MFVideoFormat_I420)) return L"I420";
+  if (IsEqualGUID(subtype, MFVideoFormat_YUY2)) return L"YUY2";
+  if (IsEqualGUID(subtype, MFVideoFormat_RGB32)) return L"RGB32";
+  if (IsEqualGUID(subtype, MFVideoFormat_ARGB32)) return L"ARGB32";
+  return L"unknown";
+}
+
+static bool IsSupportedDecoderOutputSubtype(const GUID& subtype) {
+  return IsEqualGUID(subtype, MFVideoFormat_NV12) ||
+         IsEqualGUID(subtype, MFVideoFormat_IYUV) ||
+         IsEqualGUID(subtype, MFVideoFormat_I420) ||
+         IsEqualGUID(subtype, MFVideoFormat_YV12) ||
+         IsEqualGUID(subtype, MFVideoFormat_YUY2);
+}
+
+static bool IsPreferredDecoderOutputSubtype(const GUID& subtype, int rank) {
+  switch (rank) {
+    case 0: return IsEqualGUID(subtype, MFVideoFormat_IYUV);
+    case 1: return IsEqualGUID(subtype, MFVideoFormat_I420);
+    case 2: return IsEqualGUID(subtype, MFVideoFormat_YV12);
+    case 3: return IsEqualGUID(subtype, MFVideoFormat_NV12);
+    case 4: return IsEqualGUID(subtype, MFVideoFormat_YUY2);
+    default: return false;
+  }
+}
+
+static bool Planar420ToNv12(const uint8_t* src,
+                            DWORD srcLen,
+                            int width,
+                            int height,
+                            bool yv12,
+                            std::vector<uint8_t>& out) {
+  const int yStride = width;
+  const int chromaWidth = width / 2;
+  const int chromaHeight = height / 2;
+  const int chromaStride = chromaWidth;
+  int surfaceHeight = static_cast<int>((static_cast<uint64_t>(srcLen) * 2) / (3ull * yStride));
+  surfaceHeight &= ~1;
+  if (surfaceHeight < height) surfaceHeight = height;
+  const size_t needed = static_cast<size_t>(yStride) * surfaceHeight +
+                        static_cast<size_t>(chromaStride) * (surfaceHeight / 2) * 2;
+  if (srcLen < needed) return false;
+  const size_t ySize = static_cast<size_t>(width) * height;
+  const uint8_t* yPlane = src;
+  const uint8_t* firstChroma = src + static_cast<size_t>(yStride) * surfaceHeight;
+  const uint8_t* secondChroma = firstChroma + static_cast<size_t>(chromaStride) * (surfaceHeight / 2);
+  const uint8_t* uPlane = yv12 ? secondChroma : firstChroma;
+  const uint8_t* vPlane = yv12 ? firstChroma : secondChroma;
+  out.resize(ySize + ySize / 2);
+  memcpy(out.data(), yPlane, ySize);
+  uint8_t* uvOut = out.data() + ySize;
+  for (int y = 0; y < chromaHeight; ++y) {
+    for (int x = 0; x < chromaWidth; ++x) {
+      const size_t srcIndex = static_cast<size_t>(y) * chromaStride + x;
+      const size_t dstIndex = static_cast<size_t>(y) * width + x * 2;
+      uvOut[dstIndex + 0] = uPlane[srcIndex];
+      uvOut[dstIndex + 1] = vPlane[srcIndex];
+    }
+  }
+  return true;
+}
+
+static bool Yuy2ToNv12(const uint8_t* src,
+                       DWORD srcLen,
+                       int width,
+                       int height,
+                       std::vector<uint8_t>& out) {
+  const size_t needed = static_cast<size_t>(width) * height * 2;
+  if (srcLen < needed) return false;
+  const size_t ySize = static_cast<size_t>(width) * height;
+  out.assign(ySize + ySize / 2, 128);
+  uint8_t* yOut = out.data();
+  uint8_t* uvOut = out.data() + ySize;
+
+  for (int row = 0; row < height; ++row) {
+    const uint8_t* line = src + static_cast<size_t>(row) * width * 2;
+    uint8_t* yLine = yOut + static_cast<size_t>(row) * width;
+    for (int x = 0; x < width; x += 2) {
+      const size_t p = static_cast<size_t>(x) * 2;
+      yLine[x] = line[p + 0];
+      if (x + 1 < width) yLine[x + 1] = line[p + 2];
+    }
+  }
+
+  for (int row = 0; row < height; row += 2) {
+    const uint8_t* line0 = src + static_cast<size_t>(row) * width * 2;
+    const uint8_t* line1 = (row + 1 < height) ? (src + static_cast<size_t>(row + 1) * width * 2) : line0;
+    uint8_t* uvLine = uvOut + static_cast<size_t>(row / 2) * width;
+    for (int x = 0; x < width; x += 2) {
+      const size_t p = static_cast<size_t>(x) * 2;
+      uvLine[x] = static_cast<uint8_t>((static_cast<int>(line0[p + 1]) + static_cast<int>(line1[p + 1]) + 1) / 2);
+      if (x + 1 < width) {
+        uvLine[x + 1] = static_cast<uint8_t>((static_cast<int>(line0[p + 3]) + static_cast<int>(line1[p + 3]) + 1) / 2);
+      }
+    }
+  }
+  return true;
+}
+
+static void CopyPlaneRows(const uint8_t* src,
+                          LONG stride,
+                          int rowBytes,
+                          int rows,
+                          uint8_t* dst,
+                          int dstStride) {
+  if (stride < 0) {
+    src += static_cast<size_t>(rows - 1) * static_cast<size_t>(-stride);
+  }
+  for (int y = 0; y < rows; ++y) {
+    memcpy(dst + static_cast<size_t>(y) * dstStride, src, rowBytes);
+    src += stride;
+  }
+}
+
+static int AbsStride(LONG stride) {
+  return stride < 0 ? static_cast<int>(-stride) : static_cast<int>(stride);
+}
+
+static int Derive420SurfaceHeight(DWORD srcLen, int strideAbs, int visibleHeight) {
+  if (strideAbs <= 0) return visibleHeight;
+  int surfaceHeight = static_cast<int>((static_cast<uint64_t>(srcLen) * 2) / (3ull * strideAbs));
+  surfaceHeight &= ~1;
+  if (surfaceHeight < visibleHeight) surfaceHeight = visibleHeight;
+  return surfaceHeight;
+}
+
+static bool Nv12StridedToNv12(const uint8_t* src,
+                              DWORD srcLen,
+                              LONG yStride,
+                              int width,
+                              int height,
+                              std::vector<uint8_t>& out) {
+  const int yStrideAbs = std::max(width, AbsStride(yStride));
+  const int surfaceHeight = Derive420SurfaceHeight(srcLen, yStrideAbs, height);
+  const size_t yPlaneBytes = static_cast<size_t>(yStrideAbs) * surfaceHeight;
+  if (srcLen < yPlaneBytes + static_cast<size_t>(yStrideAbs) * (surfaceHeight / 2)) return false;
+  const size_t ySize = static_cast<size_t>(width) * height;
+  out.resize(ySize + ySize / 2);
+  uint8_t* yOut = out.data();
+  uint8_t* uvOut = out.data() + ySize;
+  CopyPlaneRows(src, yStride, width, height, yOut, width);
+  const uint8_t* uvPlane = src + yPlaneBytes;
+  CopyPlaneRows(uvPlane, yStrideAbs, width, height / 2, uvOut, width);
+  return true;
+}
+
+static bool Planar420StridedToNv12(const uint8_t* src,
+                                   DWORD srcLen,
+                                   LONG yStride,
+                                   int width,
+                                   int height,
+                                   bool yv12,
+                                   std::vector<uint8_t>& out) {
+  const int yStrideAbs = std::max(width, AbsStride(yStride));
+  const int surfaceHeight = Derive420SurfaceHeight(srcLen, yStrideAbs, height);
+  const int chromaWidth = width / 2;
+  const int chromaHeight = height / 2;
+  const int chromaStride = std::max(chromaWidth, yStrideAbs / 2);
+  const size_t yPlaneBytes = static_cast<size_t>(yStrideAbs) * surfaceHeight;
+  const size_t chromaPlaneBytes = static_cast<size_t>(chromaStride) * (surfaceHeight / 2);
+  if (srcLen < yPlaneBytes + chromaPlaneBytes * 2) return false;
+  const size_t ySize = static_cast<size_t>(width) * height;
+  out.resize(ySize + ySize / 2);
+
+  uint8_t* yOut = out.data();
+  uint8_t* uvOut = out.data() + ySize;
+  const uint8_t* yPlane = src;
+  CopyPlaneRows(yPlane, yStride, width, height, yOut, width);
+
+  const uint8_t* firstChroma = src + yPlaneBytes;
+  const uint8_t* secondChroma = firstChroma + chromaPlaneBytes;
+  const uint8_t* uPlane = yv12 ? secondChroma : firstChroma;
+  const uint8_t* vPlane = yv12 ? firstChroma : secondChroma;
+
+  for (int y = 0; y < chromaHeight; ++y) {
+    const uint8_t* uLine = uPlane + static_cast<size_t>(y) * chromaStride;
+    const uint8_t* vLine = vPlane + static_cast<size_t>(y) * chromaStride;
+    uint8_t* uvLine = uvOut + static_cast<size_t>(y) * width;
+    for (int x = 0; x < chromaWidth; ++x) {
+      uvLine[x * 2 + 0] = uLine[x];
+      uvLine[x * 2 + 1] = vLine[x];
+    }
+  }
+  return true;
+}
+
+static bool Yuy2StridedToNv12(const uint8_t* src,
+                              LONG stride,
+                              int width,
+                              int height,
+                              std::vector<uint8_t>& out) {
+  if (stride < 0) {
+    src += static_cast<size_t>(height - 1) * static_cast<size_t>(-stride);
+  }
+  const size_t ySize = static_cast<size_t>(width) * height;
+  out.assign(ySize + ySize / 2, 128);
+  uint8_t* yOut = out.data();
+  uint8_t* uvOut = out.data() + ySize;
+
+  for (int row = 0; row < height; ++row) {
+    const uint8_t* line = src + static_cast<size_t>(row) * stride;
+    uint8_t* yLine = yOut + static_cast<size_t>(row) * width;
+    for (int x = 0; x < width; x += 2) {
+      const size_t p = static_cast<size_t>(x) * 2;
+      yLine[x] = line[p + 0];
+      if (x + 1 < width) yLine[x + 1] = line[p + 2];
+    }
+  }
+
+  for (int row = 0; row < height; row += 2) {
+    const uint8_t* line0 = src + static_cast<size_t>(row) * stride;
+    const uint8_t* line1 = (row + 1 < height) ? (src + static_cast<size_t>(row + 1) * stride) : line0;
+    uint8_t* uvLine = uvOut + static_cast<size_t>(row / 2) * width;
+    for (int x = 0; x < width; x += 2) {
+      const size_t p = static_cast<size_t>(x) * 2;
+      uvLine[x] = static_cast<uint8_t>((static_cast<int>(line0[p + 1]) + static_cast<int>(line1[p + 1]) + 1) / 2);
+      if (x + 1 < width) {
+        uvLine[x + 1] = static_cast<uint8_t>((static_cast<int>(line0[p + 3]) + static_cast<int>(line1[p + 3]) + 1) / 2);
+      }
+    }
+  }
+  return true;
+}
 
 class VideoReceiver {
  public:
@@ -305,7 +646,7 @@ class TcpVideoReceiver {
 
 
 void RunUdpVideoReceiver(uint16_t port) {
-  VideoReceiver(port)();
+  VideoReceiver{port}();
 }
 
 void RunTcpVideoReceiver(std::wstring hostIp, uint16_t port) {
@@ -344,9 +685,20 @@ class MfDecoder {
     width_ = width;
     height_ = height;
     fps_ = std::max(30, fps);
+    forceCpuOutput_ = !EnvFlagEnabled(L"P2P_NATIVE_V2_ENABLE_DXVA") ||
+                      EnvFlagEnabled(L"P2P_NATIVE_V2_FORCE_CPU_DECODE");
     HRESULT hr = CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&mft_));
-    if (FAILED(hr)) return false;
-    InitDxvaDeviceManager(sharedDevice);
+    if (FAILED(hr)) {
+      wchar_t hrText[96];
+      FormatHr(hr, hrText, std::size(hrText));
+      Log(L"decoder init failed: CoCreateInstance CMSH264DecoderMFT %s", hrText);
+      return false;
+    }
+    if (!forceCpuOutput_) {
+      InitDxvaDeviceManager(sharedDevice);
+    } else {
+      Log(L"decoder init: CPU/system-memory NV12 output (set P2P_NATIVE_V2_ENABLE_DXVA=1 to try DXVA)");
+    }
 
     ComPtr<ICodecAPI> codec;
     if (SUCCEEDED(mft_.As(&codec))) {
@@ -367,19 +719,13 @@ class MfDecoder {
       attrs->SetUINT32(MF_LOW_LATENCY, TRUE);
     }
 
-    ComPtr<IMFMediaType> in;
-    MFCreateMediaType(&in);
-    in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    in->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_H264);
-    MFSetAttributeSize(in.Get(), MF_MT_FRAME_SIZE, width_, height_);
-    MFSetAttributeRatio(in.Get(), MF_MT_FRAME_RATE, fps_, 1);
-    hr = mft_->SetInputType(0, in.Get(), 0);
-    if (FAILED(hr)) return false;
-
-    return SetNv12OutputType();
+    return true;
   }
 
   DecodeStatus Decode(const EncodedFrame& encoded, DecodedFrame& decoded) {
+    if (!inputTypeSet_) {
+      if (!ConfigureInputType(encoded)) return DecodeStatus::Error;
+    }
     ComPtr<IMFMediaBuffer> buf;
     HRESULT hr = MFCreateMemoryBuffer(static_cast<DWORD>(encoded.bytes.size()), &buf);
     if (FAILED(hr)) return DecodeStatus::Error;
@@ -409,7 +755,19 @@ class MfDecoder {
       }
       hr = mft_->ProcessInput(0, sample.Get(), 0);
     }
-    if (FAILED(hr)) return DecodeStatus::Error;
+    if (FAILED(hr)) {
+      if (!reportedProcessInputError_) {
+        reportedProcessInputError_ = true;
+        wchar_t hrText[96];
+        FormatHr(hr, hrText, std::size(hrText));
+        Log(L"decoder ProcessInput failed frame=%llu bytes=%zu keyframe=%d hr=%s",
+            static_cast<unsigned long long>(encoded.frameId),
+            encoded.bytes.size(),
+            encoded.keyframe ? 1 : 0,
+            hrText);
+      }
+      return DecodeStatus::Error;
+    }
 
     for (int i = 0; i < 4; ++i) {
       DecodedFrame one;
@@ -427,16 +785,153 @@ class MfDecoder {
   }
 
  private:
-  bool SetNv12OutputType() {
-    ComPtr<IMFMediaType> out;
-    HRESULT hr = MFCreateMediaType(&out);
-    if (FAILED(hr)) return false;
-    out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
-    out->SetGUID(MF_MT_SUBTYPE, MFVideoFormat_NV12);
-    MFSetAttributeSize(out.Get(), MF_MT_FRAME_SIZE, width_, height_);
-    MFSetAttributeRatio(out.Get(), MF_MT_FRAME_RATE, fps_, 1);
-    hr = mft_->SetOutputType(0, out.Get(), 0);
+  bool ConfigureInputType(const EncodedFrame& encoded) {
+    uint32_t sps = 0, pps = 0, idr = 0;
+    wchar_t firstTypes[96]{};
+    H264NalSummary(encoded.bytes, sps, pps, idr, firstTypes, std::size(firstTypes));
+    std::vector<uint8_t> sequenceHeader = ExtractH264SequenceHeader(encoded.bytes);
+
+    auto trySubtype = [&](const GUID& subtype, const wchar_t* name, bool attachSequenceHeader) -> HRESULT {
+      ComPtr<IMFMediaType> in;
+      HRESULT hr = MFCreateMediaType(&in);
+      if (FAILED(hr)) return hr;
+      in->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+      in->SetGUID(MF_MT_SUBTYPE, subtype);
+      MFSetAttributeSize(in.Get(), MF_MT_FRAME_SIZE, width_, height_);
+      MFSetAttributeRatio(in.Get(), MF_MT_FRAME_RATE, fps_, 1);
+      in->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+      in->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, FALSE);
+      if (attachSequenceHeader && !sequenceHeader.empty()) {
+        in->SetBlob(MF_MT_MPEG_SEQUENCE_HEADER,
+                    sequenceHeader.data(),
+                    static_cast<UINT32>(sequenceHeader.size()));
+      }
+      hr = mft_->SetInputType(0, in.Get(), 0);
+      if (SUCCEEDED(hr)) {
+        if (!SetDecoderOutputType(false)) {
+          Log(L"decoder input accepted but output setup failed: subtype=%s", name);
+          return E_FAIL;
+        }
+        inputTypeSet_ = true;
+        inputSubtypeName_ = name;
+        Log(L"decoder input configured: subtype=%s size=%dx%d@%d seq=%zu firstFrame=%llu bytes=%zu keyframe=%d sps=%u pps=%u idr=%u nals=[%s]",
+            name,
+            width_, height_, fps_,
+            sequenceHeader.size(),
+            static_cast<unsigned long long>(encoded.frameId),
+            encoded.bytes.size(),
+            encoded.keyframe ? 1 : 0,
+            sps, pps, idr,
+            firstTypes[0] ? firstTypes : L"-");
+      } else {
+        wchar_t hrText[96];
+        FormatHr(hr, hrText, std::size(hrText));
+        Log(L"decoder input rejected: subtype=%s seq=%zu hr=%s sps=%u pps=%u idr=%u nals=[%s]",
+            name,
+            sequenceHeader.size(),
+            hrText,
+            sps, pps, idr,
+            firstTypes[0] ? firstTypes : L"-");
+      }
+      return hr;
+    };
+
+    // The Mac VideoToolbox sender gives us complete Annex-B access units.  Some
+    // Windows H.264 MFT builds wait forever when Annex-B is advertised as the
+    // generic frame-aligned H264 subtype without a sequence header; H264_ES is
+    // the tolerant elementary-stream subtype.  Keep H264 as a fallback for older
+    // systems that do not accept H264_ES.
+    HRESULT hr = trySubtype(MFVideoFormat_H264_ES, L"H264_ES", true);
+    if (FAILED(hr)) hr = trySubtype(MFVideoFormat_H264_ES, L"H264_ES", false);
+    if (FAILED(hr)) hr = trySubtype(MFVideoFormat_H264, L"H264", true);
+    if (FAILED(hr)) hr = trySubtype(MFVideoFormat_H264, L"H264", false);
     return SUCCEEDED(hr);
+  }
+
+  bool SetDecoderOutputType(bool clearFirst) {
+    HRESULT lastHr = E_FAIL;
+    if (clearFirst) {
+      // Do not clear with SetOutputType(nullptr) during MF_E_TRANSFORM_STREAM_CHANGE.
+      // Some Windows H.264 decoder MFT builds reject every subsequent candidate
+      // after an explicit clear.  Just mark local state stale and apply one of
+      // the freshly advertised types as-is.
+      outputTypeSet_ = false;
+    }
+
+    bool loggedCandidates = false;
+    for (int rank = 0; rank <= 4; ++rank) {
+      for (DWORD i = 0; ; ++i) {
+        ComPtr<IMFMediaType> candidate;
+        HRESULT hr = mft_->GetOutputAvailableType(0, i, &candidate);
+        if (hr == MF_E_NO_MORE_TYPES) break;
+        if (FAILED(hr)) {
+          lastHr = hr;
+          break;
+        }
+
+        GUID subtype{};
+        if (FAILED(candidate->GetGUID(MF_MT_SUBTYPE, &subtype))) continue;
+        if (!loggedCandidates && i < 8) {
+          Log(L"decoder output candidate[%u]: %s", i, VideoSubtypeName(subtype));
+        }
+        if (!IsPreferredDecoderOutputSubtype(subtype, rank)) continue;
+
+        // Use the advertised type exactly as returned.  It can contain private
+        // decoder attributes; rewriting frame-size/rate/interlace here makes
+        // some MFT implementations reject the otherwise valid type.
+        hr = mft_->SetOutputType(0, candidate.Get(), 0);
+        if (SUCCEEDED(hr)) {
+          outputSubtype_ = subtype;
+          outputTypeSet_ = true;
+          Log(L"decoder output configured: advertised %s candidate=%u",
+              VideoSubtypeName(subtype),
+              i);
+          return true;
+        }
+        if (i < 8) {
+          wchar_t hrText[96];
+          FormatHr(hr, hrText, std::size(hrText));
+          Log(L"decoder output set failed: advertised %s candidate=%u hr=%s",
+              VideoSubtypeName(subtype),
+              i,
+              hrText);
+        }
+        lastHr = hr;
+      }
+      loggedCandidates = true;
+    }
+
+    for (int rank = 0; rank <= 4; ++rank) {
+      GUID subtype = MFVideoFormat_IYUV;
+      if (rank == 1) subtype = MFVideoFormat_I420;
+      else if (rank == 2) subtype = MFVideoFormat_YV12;
+      else if (rank == 3) subtype = MFVideoFormat_NV12;
+      else if (rank == 4) subtype = MFVideoFormat_YUY2;
+
+      ComPtr<IMFMediaType> out;
+      HRESULT hr = MFCreateMediaType(&out);
+      if (FAILED(hr)) return false;
+      out->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
+      out->SetGUID(MF_MT_SUBTYPE, subtype);
+      MFSetAttributeSize(out.Get(), MF_MT_FRAME_SIZE, width_, height_);
+      MFSetAttributeRatio(out.Get(), MF_MT_FRAME_RATE, fps_, 1);
+      out->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
+      hr = mft_->SetOutputType(0, out.Get(), 0);
+      if (SUCCEEDED(hr)) {
+        outputSubtype_ = subtype;
+        outputTypeSet_ = true;
+        Log(L"decoder output configured: manual %s", VideoSubtypeName(subtype));
+        return true;
+      }
+      lastHr = hr;
+    }
+
+    if (FAILED(lastHr)) {
+      wchar_t hrText[96];
+      FormatHr(lastHr, hrText, std::size(hrText));
+      Log(L"decoder output type rejected: %s", hrText);
+    }
+    return false;
   }
 
   void InitDxvaDeviceManager(ID3D11Device* sharedDevice) {
@@ -492,7 +987,8 @@ class MfDecoder {
     if (output.pEvents) output.pEvents->Release();
     if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return DecodeStatus::NeedMoreInput;
     if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-      SetNv12OutputType();
+      Log(L"decoder stream change; resetting output type");
+      SetDecoderOutputType(true);
       return DecodeStatus::NeedMoreInput;
     }
     if (FAILED(hr) && usingDxgiOutputSample) {
@@ -511,10 +1007,22 @@ class MfDecoder {
     }
     if (hr == MF_E_TRANSFORM_NEED_MORE_INPUT) return DecodeStatus::NeedMoreInput;
     if (hr == MF_E_TRANSFORM_STREAM_CHANGE) {
-      SetNv12OutputType();
+      Log(L"decoder stream change after retry; resetting output type");
+      SetDecoderOutputType(true);
       return DecodeStatus::NeedMoreInput;
     }
-    if (FAILED(hr)) return DecodeStatus::Error;
+    if (FAILED(hr)) {
+      if (!reportedProcessOutputError_) {
+        reportedProcessOutputError_ = true;
+        wchar_t hrText[96];
+        FormatHr(hr, hrText, std::size(hrText));
+        Log(L"decoder ProcessOutput failed subtype=%s gpuSample=%d hr=%s",
+            inputSubtypeName_,
+            usingDxgiOutputSample ? 1 : 0,
+            hrText);
+      }
+      return DecodeStatus::Error;
+    }
 
     if (providesSamples && output.pSample) {
       outSample.Attach(output.pSample);
@@ -574,21 +1082,108 @@ class MfDecoder {
   }
 
   bool CopySampleToNv12(IMFSample* sample, DecodedFrame& decoded, const EncodedFrame& meta) {
+    ComPtr<IMFMediaBuffer> original;
+    if (FAILED(sample->GetBufferByIndex(0, &original))) return false;
+
+    ComPtr<IMF2DBuffer> buffer2d;
+    if (SUCCEEDED(original.As(&buffer2d))) {
+      BYTE* scanline0 = nullptr;
+      LONG stride = 0;
+      HRESULT hr = buffer2d->Lock2D(&scanline0, &stride);
+      if (SUCCEEDED(hr)) {
+        Nv12Frame nv12;
+        nv12.width = width_;
+        nv12.height = height_;
+        nv12.frameId = meta.frameId;
+        nv12.recvQpc = meta.recvQpc;
+        bool converted = false;
+        DWORD contiguousLen = 0;
+        original->GetCurrentLength(&contiguousLen);
+        if (IsEqualGUID(outputSubtype_, MFVideoFormat_NV12)) {
+          converted = Nv12StridedToNv12(scanline0, contiguousLen, stride, width_, height_, nv12.bytes);
+        } else if (IsEqualGUID(outputSubtype_, MFVideoFormat_IYUV) ||
+                   IsEqualGUID(outputSubtype_, MFVideoFormat_I420)) {
+          converted = Planar420StridedToNv12(scanline0, contiguousLen, stride, width_, height_, false, nv12.bytes);
+        } else if (IsEqualGUID(outputSubtype_, MFVideoFormat_YV12)) {
+          converted = Planar420StridedToNv12(scanline0, contiguousLen, stride, width_, height_, true, nv12.bytes);
+        } else if (IsEqualGUID(outputSubtype_, MFVideoFormat_YUY2)) {
+          converted = Yuy2StridedToNv12(scanline0, stride, width_, height_, nv12.bytes);
+        }
+        buffer2d->Unlock2D();
+        if (converted && !nv12.bytes.empty()) {
+          decoded = DecodedFrame{};
+          decoded.gpu = false;
+          decoded.nv12 = std::move(nv12);
+          if (!reportedCopyMode_) {
+            reportedCopyMode_ = true;
+            Log(L"decoder output copy mode: IMF2DBuffer subtype=%s stride=%ld",
+                VideoSubtypeName(outputSubtype_),
+                static_cast<long>(stride));
+          }
+          return true;
+        }
+      } else if (!reportedCopyError_) {
+        reportedCopyError_ = true;
+        wchar_t hrText[96];
+        FormatHr(hr, hrText, std::size(hrText));
+        Log(L"decoder IMF2DBuffer Lock2D failed: %s", hrText);
+      }
+    }
+
     ComPtr<IMFMediaBuffer> contiguous;
     if (FAILED(sample->ConvertToContiguousBuffer(&contiguous))) return false;
     BYTE* src = nullptr; DWORD maxLen = 0, curLen = 0;
-    if (FAILED(contiguous->Lock(&src, &maxLen, &curLen))) return false;
+    HRESULT hr = contiguous->Lock(&src, &maxLen, &curLen);
+    if (FAILED(hr)) {
+      if (!reportedCopyError_) {
+        reportedCopyError_ = true;
+        wchar_t hrText[96];
+        FormatHr(hr, hrText, std::size(hrText));
+        Log(L"decoder NV12 copy lock failed: %s", hrText);
+      }
+      return false;
+    }
     const DWORD needed = static_cast<DWORD>(width_ * height_ * 3 / 2);
     Nv12Frame nv12;
-    if (curLen >= needed) {
+    bool converted = false;
+    if (IsEqualGUID(outputSubtype_, MFVideoFormat_NV12) && curLen >= needed) {
       nv12.width = width_;
       nv12.height = height_;
       nv12.frameId = meta.frameId;
       nv12.recvQpc = meta.recvQpc;
       nv12.bytes.assign(src, src + needed);
+      converted = true;
+    } else if ((IsEqualGUID(outputSubtype_, MFVideoFormat_IYUV) ||
+                IsEqualGUID(outputSubtype_, MFVideoFormat_I420) ||
+                IsEqualGUID(outputSubtype_, MFVideoFormat_YV12))) {
+      nv12.width = width_;
+      nv12.height = height_;
+      nv12.frameId = meta.frameId;
+      nv12.recvQpc = meta.recvQpc;
+      converted = Planar420ToNv12(src,
+                                  curLen,
+                                  width_,
+                                  height_,
+                                  IsEqualGUID(outputSubtype_, MFVideoFormat_YV12),
+                                  nv12.bytes);
+    } else if (IsEqualGUID(outputSubtype_, MFVideoFormat_YUY2)) {
+      nv12.width = width_;
+      nv12.height = height_;
+      nv12.frameId = meta.frameId;
+      nv12.recvQpc = meta.recvQpc;
+      converted = Yuy2ToNv12(src, curLen, width_, height_, nv12.bytes);
     }
     contiguous->Unlock();
-    if (nv12.bytes.empty()) return false;
+    if (!converted || nv12.bytes.empty()) {
+      if (!reportedCopyError_) {
+        reportedCopyError_ = true;
+        Log(L"decoder output copy/convert failed: subtype=%s curLen=%u neededNv12=%u",
+            VideoSubtypeName(outputSubtype_),
+            curLen,
+            needed);
+      }
+      return false;
+    }
 
     decoded = DecodedFrame{};
     decoded.gpu = false;
@@ -604,6 +1199,15 @@ class MfDecoder {
   int height_ = 0;
   int fps_ = 60;
   bool sharedDxDevice_ = false;
+  bool forceCpuOutput_ = false;
+  bool inputTypeSet_ = false;
+  bool outputTypeSet_ = false;
+  const wchar_t* inputSubtypeName_ = L"-";
+  GUID outputSubtype_ = MFVideoFormat_NV12;
+  bool reportedProcessInputError_ = false;
+  bool reportedProcessOutputError_ = false;
+  bool reportedCopyError_ = false;
+  bool reportedCopyMode_ = false;
 };
 
 void DecoderThread() {

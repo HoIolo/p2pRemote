@@ -17,7 +17,7 @@ target_compile_features(p2p-native-win-client PRIVATE cxx_std_20)
 target_compile_definitions(p2p-native-win-client PRIVATE UNICODE _UNICODE WIN32_LEAN_AND_MEAN NOMINMAX _WIN32_WINNT=0x0A00 WINVER=0x0A00)
 target_include_directories(p2p-native-win-client PRIVATE ../shared)
 if (MSVC)
-  target_compile_options(p2p-native-win-client PRIVATE /O2 /Ob3 /Ot /fp:fast /EHsc)
+  target_compile_options(p2p-native-win-client PRIVATE /O2 /Ob3 /Ot /fp:fast /utf-8 /EHsc)
   target_link_options(p2p-native-win-client PRIVATE /OPT:REF /OPT:ICF)
 endif()
 

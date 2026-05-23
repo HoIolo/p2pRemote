@@ -232,7 +232,7 @@ function clampEven(value, fallback = 2) {
   return number % 2 === 0 ? number : number - 1;
 }
 
-function scaleResolution(width, height, maxLongEdge = 1600) {
+function scaleResolution(width, height, maxLongEdge = 1920) {
   const longEdge = Math.max(width, height);
   if (!longEdge || longEdge <= maxLongEdge) {
     return { width: clampEven(width, 1600), height: clampEven(height, 900) };
@@ -248,17 +248,39 @@ function autoBitrateForPixels(pixels, fallbackBitrate) {
   let bitrate = fallbackBitrate;
   if (pixels <= 1280 * 720) bitrate = Math.max(bitrate, 6_000_000);
   else if (pixels <= 1600 * 900) bitrate = Math.max(bitrate, 8_000_000);
-  else if (pixels <= 1920 * 1080) bitrate = Math.max(bitrate, 10_000_000);
-  else if (pixels <= 1920 * 1200) bitrate = Math.max(bitrate, 12_000_000);
-  else if (pixels <= 2560 * 1440) bitrate = Math.max(bitrate, 16_000_000);
-  else bitrate = Math.max(bitrate, 20_000_000);
+  else if (pixels <= 1920 * 1080) bitrate = Math.max(bitrate, 12_000_000);
+  else if (pixels <= 1920 * 1200) bitrate = Math.max(bitrate, 14_000_000);
+  else if (pixels <= 2560 * 1440) bitrate = Math.max(bitrate, 20_000_000);
+  else bitrate = Math.max(bitrate, 28_000_000);
   return bitrate;
+}
+
+function remoteDisplayPixelSize(device) {
+  const display = device?.display;
+  if (!display?.width || !display?.height) return null;
+  const scaleFactor = Number(display.scaleFactor || device?.scaleFactor || 1);
+  const pixelWidth = Number(display.pixelWidth || display.nativeWidth || 0);
+  const pixelHeight = Number(display.pixelHeight || display.nativeHeight || 0);
+  if (pixelWidth > 0 && pixelHeight > 0) {
+    return { width: clampEven(pixelWidth, display.width), height: clampEven(pixelHeight, display.height) };
+  }
+  return {
+    width: clampEven(display.width * scaleFactor, display.width),
+    height: clampEven(display.height * scaleFactor, display.height),
+  };
+}
+
+function nativeV2FpsOptions(device) {
+  const defaults = nativeV2Status?.defaults || {};
+  const displayFps = Number(device?.display?.displayFrequency || device?.displayFrequency || 0);
+  const fps = displayFps >= 30 ? displayFps : (defaults.fps || 60);
+  return Math.max(30, Math.min(60, Math.round(fps)));
 }
 
 function nativeV2DisplayOptions(device) {
   const defaults = nativeV2Status?.defaults || {};
-  const display = device?.display;
-  if (!display?.width || !display?.height) {
+  const displayPixels = remoteDisplayPixelSize(device);
+  if (!displayPixels?.width || !displayPixels?.height) {
     const width = clampEven(defaults.width || 1600, 1600);
     const height = clampEven(defaults.height || 900, 900);
     return {
@@ -268,8 +290,8 @@ function nativeV2DisplayOptions(device) {
     };
   }
 
-  const sourceWidth = clampEven(display.width, defaults.width || 1600);
-  const sourceHeight = clampEven(display.height, defaults.height || 900);
+  const sourceWidth = clampEven(displayPixels.width, defaults.width || 1600);
+  const sourceHeight = clampEven(displayPixels.height, defaults.height || 900);
   const scaled = scaleResolution(sourceWidth, sourceHeight);
   const pixels = scaled.width * scaled.height;
   const bitrate = autoBitrateForPixels(pixels, defaults.bitrate || 8_000_000);
@@ -293,7 +315,7 @@ function nativeV2ClientOptions(device) {
     inputPort: defaults.inputPort || 45001,
     width: display.width,
     height: display.height,
-    fps: defaults.fps || 60,
+    fps: nativeV2FpsOptions(device),
     bitrate: display.bitrate,
     fullscreen: true,
     transport,
@@ -311,7 +333,7 @@ function nativeV2HostOptions(device) {
     inputPort: defaults.inputPort || 45001,
     width: display.width,
     height: display.height,
-    fps: defaults.fps || 60,
+    fps: nativeV2FpsOptions(device),
     bitrate: display.bitrate,
     keyint: defaults.keyint || 1,
     transport,
@@ -324,7 +346,7 @@ function nativeV2MacHostCommand(device, routeAddress = '') {
   const display = nativeV2DisplayOptions(device);
   return [
     'cd native-v2/mac-host',
-    `CLIENT_IP=${clientIp} VIDEO_PORT=${defaults.videoPort || 45000} INPUT_PORT=${defaults.inputPort || 45001} WIDTH=${display.width} HEIGHT=${display.height} FPS=${defaults.fps || 60} BITRATE=${display.bitrate} TRANSPORT=${defaults.transport || 'udp'} ./run-ultra.sh`,
+    `CLIENT_IP=${clientIp} VIDEO_PORT=${defaults.videoPort || 45000} INPUT_PORT=${defaults.inputPort || 45001} WIDTH=${display.width} HEIGHT=${display.height} FPS=${nativeV2FpsOptions(device)} BITRATE=${display.bitrate} TRANSPORT=${defaults.transport || 'udp'} ./run-ultra.sh`,
   ].join('\n');
 }
 
