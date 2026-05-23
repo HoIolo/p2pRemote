@@ -161,8 +161,8 @@ function friendlyGameStreamError(err) {
   if (raw.includes('has not been paired') || raw.includes('not been paired')) {
     return 'Moonlight 尚未与 Sunshine 配对。点击“配对”，系统会自动生成 PIN 并提交到 Mac Sunshine。';
   }
-  if (raw.includes('Failed to find application') || raw.includes('Desktop app was not ready') || raw.includes('default Desktop application')) {
-    return 'Sunshine 缺少 Desktop 应用，应用已尝试自动补齐；如果仍失败，请打开 Sunshine Web UI 的 Applications 页面确认存在 Desktop。';
+  if (raw.includes('Failed to find application') || raw.includes('Desktop app was not ready') || raw.includes('default Desktop application') || raw.includes('GameStream app list does not expose')) {
+    return 'Sunshine Web UI 里能看到 Desktop，但 GameStream 应用列表还没有暴露它。请从本 App 点“启动 Host/游戏模式”让它自动刷新；如果仍失败，完全退出旧 Sunshine 后再启动本 App。';
   }
   if (raw.includes('Moonlight 的配对请求') || raw.includes('pairing PIN')) {
     return 'Sunshine 还没收到 Moonlight 的配对请求。请确认 Mac 端 Sunshine 已启动后再点一次“配对”。';
@@ -731,9 +731,14 @@ async function openGameStreamDevice(device) {
         return;
       }
       if (device.pin && device.port) {
-        setGameStreamStatusText(`正在请求 Mac 启动 Sunshine Host：${device.address}:${device.port}`);
-        await window.lanRemote.requestGameStreamRemoteHost(device, gameStreamRemoteHostOptions(device));
-        log(`Mac Sunshine host accepted start request: ${device.address}`);
+        setGameStreamStatusText(`正在请求 Mac 启动 Sunshine Host 并刷新应用列表：${device.address}:${device.port}`);
+        await window.lanRemote.requestGameStreamRemoteHost(device, {
+          ...gameStreamRemoteHostOptions(device),
+          ...gameStreamClientOptions(device),
+          appListTimeoutMs: 15_000,
+          requestTimeoutMs: 20_000,
+        });
+        log(`Mac Sunshine host exposed Desktop app for Moonlight: ${device.address}`);
       } else {
         log('manual game-stream: 请确认 Mac 端 Sunshine 已启动，并完成 Moonlight 配对。');
       }
