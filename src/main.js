@@ -396,6 +396,17 @@ function sunshineExecutableCandidates() {
   return ['/usr/bin/sunshine', '/usr/local/bin/sunshine', 'sunshine'];
 }
 
+function displayplacerExecutableCandidates() {
+  if (process.platform !== 'darwin') return [];
+  return [
+    path.join(gameStreamToolDir('displayplacer'), 'displayplacer'),
+    path.join(os.homedir(), '.p2p-remote-lan', 'bin', 'displayplacer'),
+    '/opt/homebrew/bin/displayplacer',
+    '/usr/local/bin/displayplacer',
+    'displayplacer',
+  ];
+}
+
 function gameStreamDataDir() {
   return path.join(app.getPath('userData'), 'game-stream');
 }
@@ -477,6 +488,80 @@ function gameStreamSunshineCredentialsPathForConfig() {
   }
   return credentialsPath;
 }
+
+function posixShellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+function gameStreamDisplayHelperPath() {
+  return path.join(gameStreamDataDir(), 'p2p-display-match.sh');
+}
+
+function gameStreamDisplayRestorePath() {
+  return path.join(gameStreamDataDir(), 'displayplacer-restore.sh');
+}
+
+function writeGameStreamDisplayHelper() {
+  const helperPath = gameStreamDisplayHelperPath();
+  const restorePath = gameStreamDisplayRestorePath();
+  const bundledDisplayplacerPath = findFirstExistingPath(displayplacerExecutableCandidates()) || path.join(os.homedir(), '.p2p-remote-lan', 'bin', 'displayplacer');
+  const script = [
+    '#!/bin/sh',
+    'set +e',
+    'ACTION="${1:-apply}"',
+    `STATE_FILE=${posixShellQuote(restorePath)}`,
+    '',
+    'find_displayplacer() {',
+    '  if command -v displayplacer >/dev/null 2>&1; then command -v displayplacer; return 0; fi',
+    `  if [ -x ${posixShellQuote(bundledDisplayplacerPath)} ]; then echo ${posixShellQuote(bundledDisplayplacerPath)}; return 0; fi`,
+    '  if [ -x /opt/homebrew/bin/displayplacer ]; then echo /opt/homebrew/bin/displayplacer; return 0; fi',
+    '  if [ -x /usr/local/bin/displayplacer ]; then echo /usr/local/bin/displayplacer; return 0; fi',
+    '  return 1',
+    '}',
+    '',
+    'DP="$(find_displayplacer)"',
+    'if [ -z "$DP" ]; then',
+    '  echo "[p2p-display] displayplacer not found; host display stays at its current aspect ratio" >&2',
+    '  exit 0',
+    'fi',
+    '',
+    'if [ "$ACTION" = "restore" ]; then',
+    '  if [ -s "$STATE_FILE" ]; then',
+    '    sh "$STATE_FILE" || echo "[p2p-display] failed to restore previous display mode" >&2',
+    '  fi',
+    '  exit 0',
+    'fi',
+    '',
+    'WIDTH="${SUNSHINE_CLIENT_WIDTH:-}"',
+    'HEIGHT="${SUNSHINE_CLIENT_HEIGHT:-}"',
+    'FPS="${SUNSHINE_CLIENT_FPS:-}"',
+    'case "$WIDTH:$HEIGHT" in',
+    '  *[!0-9:]*|:*) echo "[p2p-display] invalid client resolution: ${WIDTH}x${HEIGHT}" >&2; exit 0 ;;',
+    'esac',
+    '',
+    'LIST_FILE="${STATE_FILE}.list"',
+    '"$DP" list > "$LIST_FILE" 2>/dev/null || true',
+    `awk '/^displayplacer / { print; found=1 } END { exit found ? 0 : 1 }' "$LIST_FILE" > "$STATE_FILE" 2>/dev/null && chmod +x "$STATE_FILE"`,
+    `SCREEN_ID="$(sed -n 's/.*"id:\\([^ " ]*\\).*/\\1/p' "$STATE_FILE" | sed -n '1p')"`,
+    'HZ_ARG=""',
+    'case "$FPS" in',
+    "  ''|*[!0-9.]* ) ;;",
+    '  * ) HZ_ARG=" hz:${FPS}" ;;',
+    'esac',
+    'if [ -n "$SCREEN_ID" ]; then',
+    '  TARGET="id:${SCREEN_ID} res:${WIDTH}x${HEIGHT}${HZ_ARG} scaling:on origin:(0,0) degree:0"',
+    'else',
+    '  TARGET="res:${WIDTH}x${HEIGHT}${HZ_ARG} scaling:on origin:(0,0) degree:0"',
+    'fi',
+    '',
+    '"$DP" "$TARGET" || echo "[p2p-display] failed to apply ${WIDTH}x${HEIGHT}; check displayplacer supported modes" >&2',
+    'exit 0',
+    '',
+  ].join('\n');
+  fs.writeFileSync(helperPath, script, { mode: 0o755 });
+  fs.chmodSync(helperPath, 0o755);
+  return helperPath;
+}
 function ensureGameStreamSunshineFiles() {
   const dataDir = gameStreamDataDir();
   fs.mkdirSync(dataDir, { recursive: true });
@@ -484,6 +569,7 @@ function ensureGameStreamSunshineFiles() {
   const configPath = gameStreamSunshineConfigPath();
   const statePath = gameStreamSunshineStatePath();
   const credentialsPath = gameStreamSunshineCredentialsPathForConfig();
+  const displayHelperPath = process.platform === 'darwin' ? writeGameStreamDisplayHelper() : '';
   let appsConfig = null;
   let appsRewritten = false;
 
@@ -507,9 +593,16 @@ function ensureGameStreamSunshineFiles() {
     appsConfig.apps = [];
     appsRewritten = true;
   }
-  if (gameStreamSunshineDesktopAppMissing(appsConfig.apps, GAME_STREAM_DEFAULTS.appName)) {
+  const desktopApp = gameStreamSunshineFindApp(appsConfig.apps, GAME_STREAM_DEFAULTS.appName);
+  if (!desktopApp) {
     appsConfig.apps.push(gameStreamDesktopAppFileDefinition(GAME_STREAM_DEFAULTS.appName));
     appsRewritten = true;
+  } else {
+    const updatedDesktopApp = gameStreamDesktopAppFileDefinition(desktopApp.appName, desktopApp.app);
+    if (JSON.stringify(updatedDesktopApp) !== JSON.stringify(desktopApp.app)) {
+      appsConfig.apps[desktopApp.index] = updatedDesktopApp;
+      appsRewritten = true;
+    }
   }
   if (appsRewritten) {
     fs.writeFileSync(appsPath, `${JSON.stringify(appsConfig, null, 2)}\n`);
@@ -530,7 +623,7 @@ function ensureGameStreamSunshineFiles() {
     '',
   ];
   fs.writeFileSync(configPath, lines.join('\n'));
-  return { dataDir, appsPath, configPath, statePath, credentialsPath, appsRewritten };
+  return { dataDir, appsPath, configPath, statePath, credentialsPath, displayHelperPath, appsRewritten };
 }
 
 function canSpawnShellCommand(candidate) {
@@ -617,6 +710,16 @@ function isSunshineClientCertificateRequiredError(err) {
   return text.includes('certificate required') || text.includes('tlsv1_alert_certificate_required') || text.includes('alert number 116');
 }
 
+function gameStreamDesktopPrepCommands() {
+  if (process.platform !== 'darwin') return [];
+  const helper = gameStreamDisplayHelperPath();
+  return [{
+    do: `${posixShellQuote(helper)} apply`,
+    undo: `${posixShellQuote(helper)} restore`,
+    elevated: false,
+  }];
+}
+
 function gameStreamDesktopAppDefinition(appName = GAME_STREAM_DEFAULTS.appName) {
   return {
     name: normalizeGameStreamAppName(appName),
@@ -628,22 +731,27 @@ function gameStreamDesktopAppDefinition(appName = GAME_STREAM_DEFAULTS.appName) 
     'auto-detach': true,
     'wait-all': true,
     'exit-timeout': 5,
-    'prep-cmd': [],
+    'prep-cmd': gameStreamDesktopPrepCommands(),
     detached: [],
     'image-path': 'desktop.png',
   };
 }
 
-function gameStreamDesktopAppFileDefinition(appName = GAME_STREAM_DEFAULTS.appName) {
-  const app = gameStreamDesktopAppDefinition(appName);
+function gameStreamDesktopAppFileDefinition(appName = GAME_STREAM_DEFAULTS.appName, baseApp = null) {
+  const app = {
+    ...gameStreamDesktopAppDefinition(appName),
+    ...(baseApp && typeof baseApp === 'object' ? baseApp : {}),
+    name: normalizeGameStreamAppName(baseApp?.name || baseApp?.AppTitle || baseApp?.title || appName),
+    'prep-cmd': gameStreamDesktopPrepCommands(),
+  };
   delete app.index;
+  if (!Array.isArray(app.detached)) app.detached = [];
   return app;
 }
 
 function gameStreamSunshineAppPayload(app, index, appName = GAME_STREAM_DEFAULTS.appName) {
   const payload = {
-    ...(app && typeof app === 'object' ? app : {}),
-    name: normalizeGameStreamAppName(app?.name || app?.AppTitle || app?.title || appName),
+    ...gameStreamDesktopAppFileDefinition(appName, app),
     index,
   };
   if (!Array.isArray(payload['prep-cmd'])) {
@@ -811,6 +919,7 @@ async function submitSunshinePairPin(options = {}) {
 function gameStreamStatusPayload() {
   const moonlightPath = findFirstExistingPath(moonlightExecutableCandidates());
   const sunshinePath = findFirstExistingPath(sunshineExecutableCandidates());
+  const displayplacerPath = findFirstExistingPath(displayplacerExecutableCandidates());
   return {
     platform: process.platform,
     downloads: GAME_STREAM_DOWNLOADS,
@@ -833,6 +942,10 @@ function gameStreamStatusPayload() {
       statePath: gameStreamSunshineStatePath(),
       credentialsPath: gameStreamSunshineCredentialsPath(),
       webUrl: 'https://localhost:47990/',
+    },
+    displayplacer: {
+      available: Boolean(displayplacerPath),
+      path: displayplacerPath,
     },
   };
 }

@@ -197,7 +197,7 @@ function formatBytes(value) {
 
 function renderGameStreamInstallProgress(progress) {
   if (!gameStreamInstallProgressEl || !progress) return;
-  const tool = progress.tool === 'sunshine' ? 'Sunshine' : 'Moonlight';
+  const tool = progress.tool === 'sunshine' ? 'Sunshine' : (progress.tool === 'displayplacer' ? 'displayplacer' : 'Moonlight');
   if (progress.phase === 'download') {
     const total = Number(progress.total || 0);
     gameStreamInstallProgressEl.textContent = total > 0
@@ -210,24 +210,35 @@ function renderGameStreamInstallProgress(progress) {
     extract: `${tool} 正在解压...`,
     installer: `${tool} 正在运行安装器...`,
     mount: `${tool} 正在挂载 DMG...`,
-    copy: `${tool} 正在复制到 Applications...`,
+    copy: progress.tool === 'displayplacer' ? `${tool} 正在安装到本机工具目录...` : `${tool} 正在复制到 Applications...`,
     done: `${tool} 安装完成`,
   };
   gameStreamInstallProgressEl.textContent = labels[progress.phase] || `${tool} ${progress.phase || '处理中'}...`;
 }
 
+function missingGameStreamTool() {
+  if (gameStreamStatus?.platform === 'darwin') {
+    if (!gameStreamStatus.sunshine?.available) return { tool: 'sunshine', label: 'Sunshine', mode: 'dmg' };
+    if (!gameStreamStatus.displayplacer?.available) return { tool: 'displayplacer', label: 'displayplacer', mode: 'binary' };
+    return null;
+  }
+  if (gameStreamStatus?.platform === 'win32') {
+    if (!gameStreamStatus.moonlight?.available) return { tool: 'moonlight', label: 'Moonlight', mode: 'installer' };
+    return null;
+  }
+  return null;
+}
+
 function requiredGameStreamToolStatus() {
-  if (gameStreamStatus?.platform === 'darwin') return gameStreamStatus.sunshine || {};
-  if (gameStreamStatus?.platform === 'win32') return gameStreamStatus.moonlight || {};
-  return { available: true };
+  return { available: !missingGameStreamTool() };
 }
 
 function requiredGameStreamToolLabel() {
-  return gameStreamStatus?.platform === 'darwin' ? 'Sunshine' : 'Moonlight';
+  return missingGameStreamTool()?.label || (gameStreamStatus?.platform === 'darwin' ? 'Sunshine' : 'Moonlight');
 }
 
 function isRequiredGameStreamToolInstalled() {
-  return Boolean(requiredGameStreamToolStatus().available);
+  return !missingGameStreamTool();
 }
 
 
@@ -241,17 +252,18 @@ async function installGameStreamComponent() {
     renderDevices();
     return;
   }
-  const isMac = gameStreamStatus?.platform === 'darwin';
-  const tool = isMac ? 'sunshine' : 'moonlight';
-  const mode = gameStreamStatus?.platform === 'win32' ? 'installer' : 'dmg';
+  const missingTool = missingGameStreamTool();
+  const tool = missingTool?.tool || (gameStreamStatus?.platform === 'darwin' ? 'sunshine' : 'moonlight');
+  const label = missingTool?.label || (tool === 'sunshine' ? 'Sunshine' : tool === 'moonlight' ? 'Moonlight' : 'displayplacer');
+  const mode = missingTool?.mode || (gameStreamStatus?.platform === 'win32' ? 'installer' : 'dmg');
   gameStreamInstallBusy = true;
-  setGameStreamBusy(true, `正在安装 ${tool === 'sunshine' ? 'Sunshine' : 'Moonlight'}...`);
+  setGameStreamBusy(true, `正在安装 ${label}...`);
   renderGameStreamInstallProgress({ phase: 'start', tool, mode });
   try {
     const result = await window.lanRemote.installGameStreamTool({ tool, mode });
     updateGameStreamStatus(result.status);
     renderGameStreamInstallProgress({ phase: 'done', tool, mode });
-    setGameStreamStatusText(`${tool === 'sunshine' ? 'Sunshine' : 'Moonlight'} 已安装；可以继续启动游戏模式。`);
+    setGameStreamStatusText(`${label} 已安装；可以继续启动游戏模式。`);
     log(`game-stream install completed: ${tool} ${mode}`);
   } catch (err) {
     const message = friendlyGameStreamError(err);
@@ -289,12 +301,15 @@ function updateGameStreamStatus(status) {
   }
 
   if (isMac) {
+    const displayplacer = gameStreamStatus.displayplacer || {};
     if (!sunshine.available) {
       gameStreamStatusTextEl.textContent = '未找到 Sunshine：请安装 Sunshine，或把 sunshine 加入 PATH。';
+    } else if (!displayplacer.available) {
+      gameStreamStatusTextEl.textContent = 'Sunshine 已就绪；还需安装 displayplacer 才能在游戏模式自动切换 Mac 到 Windows 的 16:9 分辨率，消除黑边。';
     } else if (sunshine.running) {
-      gameStreamStatusTextEl.textContent = `Sunshine Host 运行中，pid=${sunshine.pid}；首次连接需在 Sunshine Web UI 配对 Moonlight。`;
+      gameStreamStatusTextEl.textContent = `Sunshine Host 运行中，pid=${sunshine.pid}；会按 Moonlight 请求自动切换 Mac 分辨率。`;
     } else {
-      gameStreamStatusTextEl.textContent = 'Sunshine 已就绪：点击启动 Host 后，用 Windows Moonlight 连接。';
+      gameStreamStatusTextEl.textContent = 'Sunshine/displayplacer 已就绪：启动 Host 后会按 Windows 分辨率铺满。';
     }
     return;
   }
@@ -459,6 +474,10 @@ function remoteDisplayPixelSize(device) {
   };
 }
 
+function localDisplayPixelSize() {
+  return remoteDisplayPixelSize(appInfo?.device);
+}
+
 function nativeV2FpsOptions(device) {
   const defaults = nativeV2Status?.defaults || {};
   const displayFps = Number(device?.display?.displayFrequency || device?.displayFrequency || 0);
@@ -494,14 +513,14 @@ function nativeV2DisplayOptions(device) {
 
 function gameStreamFpsOptions(device) {
   const defaults = gameStreamStatus?.defaults || {};
-  const displayFps = Number(device?.display?.displayFrequency || device?.displayFrequency || 0);
+  const displayFps = Number(appInfo?.device?.display?.displayFrequency || device?.display?.displayFrequency || device?.displayFrequency || 0);
   const fps = displayFps >= 30 ? displayFps : (defaults.fps || 60);
   return Math.max(30, Math.min(120, Math.round(fps)));
 }
 
 function gameStreamClientOptions(device) {
   const defaults = gameStreamStatus?.defaults || {};
-  const displayPixels = remoteDisplayPixelSize(device);
+  const displayPixels = localDisplayPixelSize() || remoteDisplayPixelSize(device);
   const display = displayPixels?.width && displayPixels?.height
     ? scaleResolution(displayPixels.width, displayPixels.height, 1920)
     : { width: defaults.width || 1920, height: defaults.height || 1080 };

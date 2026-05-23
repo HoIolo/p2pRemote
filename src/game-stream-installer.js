@@ -18,6 +18,10 @@ const RELEASES = Object.freeze({
     winInstallerX64: 'https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-Windows-AMD64-installer.exe',
     winPortableX64: 'https://github.com/LizardByte/Sunshine/releases/latest/download/Sunshine-Windows-AMD64-portable.zip',
   }),
+  displayplacer: Object.freeze({
+    macArm64: 'https://github.com/jakehilborn/displayplacer/releases/download/v1.4.0/displayplacer-apple-v140',
+    macX64: 'https://github.com/jakehilborn/displayplacer/releases/download/v1.4.0/displayplacer-intel-v140',
+  }),
 });
 
 function installStatus(platform, toolsDir, downloadDir) {
@@ -30,6 +34,7 @@ function installStatus(platform, toolsDir, downloadDir) {
   } else if (platform === 'darwin') {
     downloads.push({ tool: 'sunshine', kind: 'dmg', url: process.arch === 'arm64' ? RELEASES.sunshine.macArm64Dmg : RELEASES.sunshine.macX64Dmg });
     downloads.push({ tool: 'moonlight', kind: 'dmg', url: RELEASES.moonlight.macDmg });
+    downloads.push({ tool: 'displayplacer', kind: 'binary', url: process.arch === 'arm64' ? RELEASES.displayplacer.macArm64 : RELEASES.displayplacer.macX64 });
   }
   return {
     toolsDir,
@@ -40,7 +45,7 @@ function installStatus(platform, toolsDir, downloadDir) {
 }
 
 function assetFor(platform, arch, tool, mode = '') {
-  const normalizedTool = tool === 'sunshine' ? 'sunshine' : 'moonlight';
+  const normalizedTool = ['sunshine', 'displayplacer'].includes(tool) ? tool : 'moonlight';
   const normalizedMode = String(mode || '').toLowerCase();
   if (platform === 'win32') {
     if (normalizedTool === 'moonlight') {
@@ -55,6 +60,9 @@ function assetFor(platform, arch, tool, mode = '') {
   if (platform === 'darwin') {
     if (normalizedTool === 'sunshine') {
       return { tool: normalizedTool, mode: 'dmg', url: arch === 'arm64' ? RELEASES.sunshine.macArm64Dmg : RELEASES.sunshine.macX64Dmg, filename: `Sunshine-macOS-${arch === 'arm64' ? 'arm64' : 'x86_64'}.dmg` };
+    }
+    if (normalizedTool === 'displayplacer') {
+      return { tool: normalizedTool, mode: 'binary', url: arch === 'arm64' ? RELEASES.displayplacer.macArm64 : RELEASES.displayplacer.macX64, filename: `displayplacer-${arch === 'arm64' ? 'apple' : 'intel'}-v140` };
     }
     return { tool: normalizedTool, mode: 'dmg', url: RELEASES.moonlight.macDmg, filename: 'Moonlight.dmg' };
   }
@@ -139,6 +147,16 @@ async function installWindowsAsset(asset, filePath, toolDir, emitProgress, onOut
   return { installed: true, mode: asset.mode, path: filePath };
 }
 
+async function installMacBinaryAsset(asset, filePath, emitProgress) {
+  const targetDir = path.join(process.env.HOME || '/usr/local', '.p2p-remote-lan', 'bin');
+  const target = path.join(targetDir, asset.tool === 'displayplacer' ? 'displayplacer' : asset.filename);
+  emitProgress({ phase: 'copy', tool: asset.tool, mode: asset.mode, path: target });
+  fs.mkdirSync(targetDir, { recursive: true });
+  fs.copyFileSync(filePath, target);
+  fs.chmodSync(target, 0o755);
+  return { installed: true, mode: asset.mode, path: target };
+}
+
 async function installMacAsset(asset, filePath, emitProgress, onOutput) {
   const mountPoint = path.join('/Volumes', asset.tool === 'sunshine' ? 'Sunshine' : 'Moonlight');
   emitProgress({ phase: 'mount', tool: asset.tool, mode: asset.mode, path: filePath });
@@ -162,7 +180,9 @@ async function installTool({ platform, arch, tool, mode, downloadDir, toolDir, e
   const filePath = await downloadAsset(asset, downloadDir, emitProgress);
   let result;
   if (platform === 'win32') result = await installWindowsAsset(asset, filePath, toolDir, emitProgress, onOutput);
-  else if (platform === 'darwin') result = await installMacAsset(asset, filePath, emitProgress, onOutput);
+  else if (platform === 'darwin') result = asset.mode === 'binary'
+    ? await installMacBinaryAsset(asset, filePath, emitProgress)
+    : await installMacAsset(asset, filePath, emitProgress, onOutput);
   else throw new Error('自动安装目前只支持 Windows 和 macOS。');
   emitProgress({ phase: 'done', tool: asset.tool, mode: asset.mode, result });
   return { ok: true, asset, filePath, result };
