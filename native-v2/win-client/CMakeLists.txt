@@ -4,7 +4,13 @@ project(P2PNativeWinClient LANGUAGES CXX)
 message(STATUS "Building native VideoToolbox/Media Foundation v2 client")
 
 add_executable(p2p-native-win-client WIN32
+  src/app_state.cpp
+  src/input.cpp
   src/main.cpp
+  src/overlay.cpp
+  src/renderer.cpp
+  src/video_pipeline.cpp
+  src/window.cpp
 )
 
 target_compile_features(p2p-native-win-client PRIVATE cxx_std_20)

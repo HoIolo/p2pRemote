@@ -50,7 +50,7 @@ final class ScreenCaptureOutput: NSObject, SCStreamOutput {
         }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let now = nowUs()
-        let forceKeyframe = frames == 0 || now - lastKeyframe >= 2_000_000
+        let forceKeyframe = frames == 0 || now - lastKeyframe >= 1_000_000
         if forceKeyframe { lastKeyframe = now }
         encoder.encode(pixelBuffer, pts: pts, forceKeyframe: forceKeyframe)
         frames += 1
