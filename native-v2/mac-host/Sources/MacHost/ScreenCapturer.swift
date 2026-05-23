@@ -148,7 +148,13 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
         streamCfg.height = cfg.height
         streamCfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(cfg.fps))
         streamCfg.queueDepth = 3
-        streamCfg.showsCursor = true
+        // Keep cursor out of the encoded video.  The Windows client shows the
+        // local OS cursor immediately, which avoids the "two cursors" effect and
+        // removes one-frame+ encode/network/decode latency from pointer motion.
+        // This matches the low-latency cursor model used by game/desktop
+        // streamers such as Parsec: video is for pixels, cursor feedback is
+        // client-local.
+        streamCfg.showsCursor = false
         streamCfg.capturesAudio = false
         streamCfg.pixelFormat = pixelFormat
         streamCfg.colorSpaceName = CGColorSpace.sRGB
