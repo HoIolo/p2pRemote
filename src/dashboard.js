@@ -345,6 +345,23 @@ function selectedDevice() {
   return devices.find((device) => device.id === selectedId) || devices[0] || null;
 }
 
+function selectedDeviceIsMac() {
+  return selectedDevice()?.platform === 'darwin';
+}
+
+function canControlLocalSunshineHost() {
+  return gameStreamStatus?.platform === 'darwin';
+}
+
+function canControlSelectedSunshineHost() {
+  return canControlLocalSunshineHost() || selectedDeviceIsMac();
+}
+
+function selectedSunshineWebHost() {
+  return canControlLocalSunshineHost() ? 'localhost' : selectedDevice()?.address;
+}
+
+
 
 function updateNativeV2Status(status) {
   nativeV2Status = status || nativeV2Status;
@@ -598,8 +615,8 @@ function renderDevices() {
   if (gameStreamConnectBtn) gameStreamConnectBtn.disabled = !selected || anyBusy;
   if (nativeV2ConnectBtn) nativeV2ConnectBtn.disabled = !selected || anyBusy;
   if (gameStreamPairBtn) gameStreamPairBtn.disabled = !selected || anyBusy || gameStreamStatus?.platform !== 'win32';
-  if (gameStreamHostBtn) gameStreamHostBtn.disabled = anyBusy || gameStreamStatus?.platform !== 'darwin';
-  if (gameStreamOpenSunshineBtn) gameStreamOpenSunshineBtn.disabled = gameStreamStatus?.platform !== 'darwin';
+  if (gameStreamHostBtn) gameStreamHostBtn.disabled = anyBusy || !canControlSelectedSunshineHost();
+  if (gameStreamOpenSunshineBtn) gameStreamOpenSunshineBtn.disabled = !canControlSelectedSunshineHost();
   if (gameStreamDownloadBtn) {
     const toolInstalled = isRequiredGameStreamToolInstalled();
     gameStreamDownloadBtn.hidden = toolInstalled && !gameStreamInstallBusy;
@@ -779,12 +796,27 @@ async function pairGameStreamDevice(device) {
   }
 }
 
-async function startLocalGameStreamHost() {
-  setGameStreamBusy(true, '正在启动本机 Sunshine Host...');
+async function startSelectedGameStreamHost() {
+  if (gameStreamBusy) return;
+  const selected = selectedDevice();
+  setGameStreamBusy(true, canControlLocalSunshineHost() ? '正在启动本机 Sunshine Host...' : `正在请求 ${selected?.address || 'Mac'} 启动 Sunshine Host...`);
   try {
-    const result = await window.lanRemote.startGameStreamHost(gameStreamRemoteHostOptions());
-    log(`Sunshine host started pid=${result.pid}; Web UI=${result.webUrl || 'https://localhost:47990/'}`);
-    setGameStreamStatusText(`Sunshine Host 已启动，pid=${result.pid}。首次使用请打开 Sunshine Web UI 完成设置/配对。`);
+    if (canControlLocalSunshineHost()) {
+      const result = await window.lanRemote.startGameStreamHost(gameStreamRemoteHostOptions(selected));
+      log(`Sunshine host started pid=${result.pid}; Web UI=${result.webUrl || 'https://localhost:47990/'}`);
+      setGameStreamStatusText(`Sunshine Host 已启动，pid=${result.pid}。首次使用请打开 Sunshine Web UI 完成设置/配对。`);
+      return;
+    }
+    if (!selected?.pin || !selected?.port) {
+      const message = '需要选中自动发现到的 Mac，才能远程启动 Sunshine Host。手动 IP 只能打开 Sunshine Web。';
+      log(message);
+      setGameStreamStatusText(message);
+      return;
+    }
+    const result = await window.lanRemote.requestGameStreamRemoteHost(selected, gameStreamRemoteHostOptions(selected));
+    log(`Mac Sunshine host accepted start request: ${selected.address}`);
+    setGameStreamStatusText('已请求 Mac 启动 Sunshine Host；可以打开 Sunshine Web 或直接启动游戏模式。');
+    if (result?.pid) log(`remote Sunshine host pid=${result.pid}`);
   } catch (err) {
     const message = friendlyGameStreamError(err);
     log(`Sunshine start failed: ${message}`);
@@ -895,11 +927,9 @@ manualAddBtn.addEventListener('click', async () => {
 gameStreamConnectBtn?.addEventListener('click', async () => openGameStreamDevice(selectedDevice()));
 nativeV2ConnectBtn?.addEventListener('click', async () => openNativeV2Device(selectedDevice()));
 gameStreamPairBtn?.addEventListener('click', async () => pairGameStreamDevice(selectedDevice()));
-gameStreamHostBtn?.addEventListener('click', startLocalGameStreamHost);
+gameStreamHostBtn?.addEventListener('click', startSelectedGameStreamHost);
 gameStreamOpenSunshineBtn?.addEventListener('click', () => {
-  const selected = selectedDevice();
-  const host = gameStreamStatus?.platform === 'darwin' ? 'localhost' : selected?.address;
-  window.lanRemote.openGameStreamSunshine?.(host);
+  window.lanRemote.openGameStreamSunshine?.(selectedSunshineWebHost());
 });
 gameStreamDownloadBtn?.addEventListener('click', installGameStreamComponent);
 
