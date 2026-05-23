@@ -164,6 +164,9 @@ function friendlyGameStreamError(err) {
   if (raw.includes('Failed to find application')) {
     return 'Moonlight 找不到 Sunshine 的 Desktop 应用。请打开 Sunshine Web UI，确认 Applications 里存在 Desktop。';
   }
+  if (raw.includes('Moonlight 的配对请求') || raw.includes('pairing PIN')) {
+    return 'Sunshine 还没收到 Moonlight 的配对请求。请确认 Mac 端 Sunshine 已启动后再点一次“配对”。';
+  }
   if (raw.includes('timed out') || raw.includes('closed before response')) {
     return '远端没有响应游戏串流启动请求。请确认对端 App 在线、PIN 正确、防火墙允许本程序通信。';
   }
@@ -786,21 +789,28 @@ async function pairGameStreamDevice(device) {
     }
     const pairPin = generatePairingPin();
     const pairName = appInfo?.device?.name || 'Windows Moonlight';
-    if (device.pin && device.port) {
-      await window.lanRemote.requestGameStreamRemoteHost(device, {
-        ...gameStreamRemoteHostOptions(device),
-        pairPin,
-        pairName,
-      });
-      log(`Mac Sunshine host accepted automatic pair PIN: ${device.address}`);
-      setGameStreamStatusText('正在自动配对：已生成 PIN 并提交给 Mac Sunshine，无需手动打开 Web UI。');
-    } else {
+    if (!device.pin || !device.port) {
       setGameStreamStatusText('手动 IP 无法自动提交 Sunshine PIN；请用自动发现的 Mac 设备，或手动在 Sunshine Web 输入 PIN。');
       return;
     }
+    setGameStreamStatusText('正在请求 Mac 启动 Sunshine Host...');
+    await window.lanRemote.requestGameStreamRemoteHost(device, gameStreamRemoteHostOptions(device));
+    log(`Mac Sunshine host accepted start request for pairing: ${device.address}`);
+
+    setGameStreamStatusText('正在启动 Moonlight 自动配对...');
     const result = await window.lanRemote.pairGameStreamClient({ hostIp: device.address, pin: pairPin });
     log(`Moonlight pairing started pid=${result.pid}; host=${device.address}`);
-    setGameStreamStatusText('Moonlight 自动配对已启动；如果 Moonlight 提示成功，可直接点“启动游戏模式”。');
+
+    setGameStreamStatusText('正在把自动生成的 PIN 提交给 Mac Sunshine...');
+    const submitted = await window.lanRemote.submitGameStreamPairPin({
+      host: device.address,
+      pin: pairPin,
+      name: pairName,
+      timeoutMs: 15_000,
+      retryDelayMs: 500,
+    });
+    log(`Mac Sunshine accepted automatic pair PIN after ${submitted.attempts || 1} attempt(s): ${device.address}`);
+    setGameStreamStatusText('Moonlight 自动配对已提交；如果 Moonlight 提示成功，可直接点“启动游戏模式”。');
   } catch (err) {
     const message = friendlyGameStreamError(err);
     log(`game-stream pair failed: ${message}`);

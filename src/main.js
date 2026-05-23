@@ -549,6 +549,10 @@ async function waitForPort(host, port, timeoutMs) {
   return false;
 }
 
+function gameStreamDelay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function gameStreamApiRequest(host, requestPath, options = {}) {
   const body = options.body ? JSON.stringify(options.body) : '';
   const headers = {
@@ -626,19 +630,28 @@ async function submitSunshinePairPin(options = {}) {
   const pin = String(options.pin || '').trim();
   if (!/^\d{4}$/.test(pin)) throw new Error('Sunshine pairing PIN must be 4 digits');
   await ensureSunshineWebCredentials(host);
-  const response = await gameStreamApiRequest(host, '/api/pin', {
-    method: 'POST',
-    username: GAME_STREAM_WEB_USERNAME,
-    password: GAME_STREAM_WEB_PASSWORD,
-    body: {
-      pin,
-      name: String(options.name || os.hostname() || 'Windows Moonlight'),
-    },
-  });
-  if (response.json && response.json.status === false) {
-    throw new Error(response.json.error || 'Sunshine rejected the pairing PIN');
+  const name = String(options.name || os.hostname() || 'Windows Moonlight');
+  const timeoutMs = normalizeGameStreamNumber(options.timeoutMs, GAME_STREAM_REMOTE_HOST_TIMEOUT_MS, 1000, 60_000);
+  const retryDelayMs = normalizeGameStreamNumber(options.retryDelayMs, 500, 100, 5_000);
+  const deadline = Date.now() + timeoutMs;
+  let attempts = 0;
+
+  while (true) {
+    attempts += 1;
+    const response = await gameStreamApiRequest(host, '/api/pin', {
+      method: 'POST',
+      username: GAME_STREAM_WEB_USERNAME,
+      password: GAME_STREAM_WEB_PASSWORD,
+      body: { pin, name },
+    });
+    if (!response.json || response.json.status !== false) {
+      return { ok: true, host, pin, status: response.json?.status ?? true, attempts };
+    }
+    if (Date.now() >= deadline) {
+      throw new Error('Sunshine 没有等到 Moonlight 的配对请求，请稍后重试配对。');
+    }
+    await gameStreamDelay(retryDelayMs);
   }
-  return { ok: true, host, pin, status: response.json?.status ?? true };
 }
 
 function gameStreamStatusPayload() {
