@@ -710,12 +710,17 @@ function isSunshineClientCertificateRequiredError(err) {
   return text.includes('certificate required') || text.includes('tlsv1_alert_certificate_required') || text.includes('alert number 116');
 }
 
+function gameStreamDisplayHelperCommand(action) {
+  const helper = gameStreamDisplayHelperPath();
+  const script = `if [ -r ${posixShellQuote(helper)} ]; then /bin/sh ${posixShellQuote(helper)} ${action}; fi; exit 0`;
+  return `/bin/sh -c ${posixShellQuote(script)}`;
+}
+
 function gameStreamDesktopPrepCommands() {
   if (process.platform !== 'darwin') return [];
-  const helper = gameStreamDisplayHelperPath();
   return [{
-    do: `${posixShellQuote(helper)} apply`,
-    undo: `${posixShellQuote(helper)} restore`,
+    do: gameStreamDisplayHelperCommand('apply'),
+    undo: gameStreamDisplayHelperCommand('restore'),
     elevated: false,
   }];
 }
@@ -962,8 +967,11 @@ function emitGameStreamInstallProgress(payload) {
 }
 
 async function installGameStreamTool(options = {}) {
-  const tool = options.tool === 'sunshine' ? 'sunshine' : 'moonlight';
-  const existingPath = findFirstExistingPath(tool === 'sunshine' ? sunshineExecutableCandidates() : moonlightExecutableCandidates());
+  const tool = options.tool === 'sunshine' ? 'sunshine' : (options.tool === 'displayplacer' ? 'displayplacer' : 'moonlight');
+  const candidates = tool === 'sunshine'
+    ? sunshineExecutableCandidates()
+    : (tool === 'displayplacer' ? displayplacerExecutableCandidates() : moonlightExecutableCandidates());
+  const existingPath = findFirstExistingPath(candidates);
   if (existingPath && !options.force) {
     return { ok: true, skipped: true, reason: 'already-installed', tool, path: existingPath, status: gameStreamStatusPayload() };
   }
@@ -971,7 +979,7 @@ async function installGameStreamTool(options = {}) {
     platform: process.platform,
     arch: process.arch,
     tool,
-    mode: options.mode || (process.platform === 'win32' ? 'installer' : 'dmg'),
+    mode: options.mode || (tool === 'displayplacer' ? 'binary' : (process.platform === 'win32' ? 'installer' : 'dmg')),
     downloadDir: gameStreamDownloadDir(),
     toolDir: gameStreamToolDir(tool),
     emitProgress: emitGameStreamInstallProgress,

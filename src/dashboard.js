@@ -219,7 +219,6 @@ function renderGameStreamInstallProgress(progress) {
 function missingGameStreamTool() {
   if (gameStreamStatus?.platform === 'darwin') {
     if (!gameStreamStatus.sunshine?.available) return { tool: 'sunshine', label: 'Sunshine', mode: 'dmg' };
-    if (!gameStreamStatus.displayplacer?.available) return { tool: 'displayplacer', label: 'displayplacer', mode: 'binary' };
     return null;
   }
   if (gameStreamStatus?.platform === 'win32') {
@@ -305,7 +304,7 @@ function updateGameStreamStatus(status) {
     if (!sunshine.available) {
       gameStreamStatusTextEl.textContent = '未找到 Sunshine：请安装 Sunshine，或把 sunshine 加入 PATH。';
     } else if (!displayplacer.available) {
-      gameStreamStatusTextEl.textContent = 'Sunshine 已就绪；还需安装 displayplacer 才能在游戏模式自动切换 Mac 到 Windows 的 16:9 分辨率，消除黑边。';
+      gameStreamStatusTextEl.textContent = 'Sunshine 已就绪；未找到 displayplacer，游戏模式可启动，但 Mac 如果仍是 16:10 会继续有黑边。';
     } else if (sunshine.running) {
       gameStreamStatusTextEl.textContent = `Sunshine Host 运行中，pid=${sunshine.pid}；会按 Moonlight 请求自动切换 Mac 分辨率。`;
     } else {
