@@ -14,6 +14,7 @@ const os = require('os');
 const path = require('path');
 const WebSocket = require('ws');
 const net = require('net');
+const https = require('https');
 const { execFile, spawn } = require('child_process');
 const gameStreamInstaller = require('./game-stream-installer');
 
@@ -40,6 +41,10 @@ const NATIVE_V2_HOST_READY_TIMEOUT_MS = 12_000;
 const NATIVE_V2_REMOTE_HOST_TIMEOUT_MS = 15_000;
 const GAME_STREAM_HOST_READY_TIMEOUT_MS = 12_000;
 const GAME_STREAM_REMOTE_HOST_TIMEOUT_MS = 15_000;
+const GAME_STREAM_API_TIMEOUT_MS = 8_000;
+const GAME_STREAM_PAIR_PIN_DELAY_MS = 1_200;
+const GAME_STREAM_WEB_USERNAME = 'p2p-remote-lan';
+const GAME_STREAM_WEB_PASSWORD = 'p2p-remote-lan-local';
 const GAME_STREAM_DOWNLOADS = Object.freeze({
   sunshine: 'https://github.com/LizardByte/Sunshine/releases/latest',
   moonlight: 'https://github.com/moonlight-stream/moonlight-qt/releases/latest',
@@ -445,11 +450,35 @@ function gameStreamOptions(options = {}) {
   };
 }
 
+function gameStreamSunshineStatePath() {
+  return path.join(gameStreamDataDir(), 'sunshine_state.json');
+}
+
+function gameStreamSunshineCredentialsPath() {
+  return path.join(gameStreamDataDir(), 'sunshine_credentials.json');
+}
+
+function gameStreamSunshineCredentialsPathForConfig() {
+  const credentialsPath = gameStreamSunshineCredentialsPath();
+  try {
+    if (fs.existsSync(credentialsPath)) {
+      const parsed = JSON.parse(fs.readFileSync(credentialsPath, 'utf8'));
+      if (parsed?.username === GAME_STREAM_WEB_USERNAME && !parsed?.salt && !parsed?.password) {
+        fs.rmSync(credentialsPath, { force: true });
+      }
+    }
+  } catch {
+    // Leave user-created Sunshine credentials untouched if they are not parseable here.
+  }
+  return credentialsPath;
+}
 function ensureGameStreamSunshineFiles() {
   const dataDir = gameStreamDataDir();
   fs.mkdirSync(dataDir, { recursive: true });
   const appsPath = gameStreamSunshineAppsPath();
   const configPath = gameStreamSunshineConfigPath();
+  const statePath = gameStreamSunshineStatePath();
+  const credentialsPath = gameStreamSunshineCredentialsPathForConfig();
   if (!fs.existsSync(appsPath)) {
     fs.writeFileSync(appsPath, `${JSON.stringify({ apps: [{ name: GAME_STREAM_DEFAULTS.appName, 'image-path': 'desktop.png' }] }, null, 2)}\n`);
   }
@@ -457,6 +486,8 @@ function ensureGameStreamSunshineFiles() {
     'sunshine_name = P2P Remote LAN Game Stream',
     'min_log_level = info',
     `file_apps = ${appsPath}`,
+    `file_state = ${statePath}`,
+    `credentials_file = ${credentialsPath}`,
     'lan_encryption_mode = 0',
     'origin_web_ui_allowed = lan',
     'vt_realtime = enabled',
@@ -466,7 +497,7 @@ function ensureGameStreamSunshineFiles() {
     '',
   ];
   fs.writeFileSync(configPath, lines.join('\n'));
-  return { dataDir, appsPath, configPath };
+  return { dataDir, appsPath, configPath, statePath, credentialsPath };
 }
 
 function canSpawnShellCommand(candidate) {
@@ -518,6 +549,98 @@ async function waitForPort(host, port, timeoutMs) {
   return false;
 }
 
+function gameStreamApiRequest(host, requestPath, options = {}) {
+  const body = options.body ? JSON.stringify(options.body) : '';
+  const headers = {
+    Accept: 'application/json',
+    ...options.headers,
+  };
+  if (body) {
+    headers['Content-Type'] = 'application/json';
+    headers['Content-Length'] = Buffer.byteLength(body);
+  }
+  if (options.username || options.password) {
+    headers.Authorization = `Basic ${Buffer.from(`${options.username || ''}:${options.password || ''}`).toString('base64')}`;
+  }
+  return new Promise((resolve, reject) => {
+    const req = https.request({
+      host,
+      port: options.port || 47990,
+      method: options.method || 'GET',
+      path: requestPath,
+      headers,
+      rejectUnauthorized: false,
+      timeout: options.timeoutMs || GAME_STREAM_API_TIMEOUT_MS,
+    }, (res) => {
+      const chunks = [];
+      res.on('data', (chunk) => chunks.push(chunk));
+      res.on('end', () => {
+        const text = Buffer.concat(chunks).toString('utf8');
+        let json = null;
+        if (text) {
+          try { json = JSON.parse(text); } catch { /* Sunshine may return plain text on errors. */ }
+        }
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          resolve({ statusCode: res.statusCode, headers: res.headers, text, json });
+          return;
+        }
+        const message = json?.error || text || `HTTP ${res.statusCode}`;
+        const err = new Error(message);
+        err.statusCode = res.statusCode;
+        err.response = { text, json };
+        reject(err);
+      });
+    });
+    req.on('timeout', () => req.destroy(new Error(`Sunshine API request timed out: ${host}${requestPath}`)));
+    req.on('error', reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+async function ensureSunshineWebCredentials(host) {
+  try {
+    await gameStreamApiRequest(host, '/api/config', {
+      username: GAME_STREAM_WEB_USERNAME,
+      password: GAME_STREAM_WEB_PASSWORD,
+    });
+    return { ready: true, created: false };
+  } catch (err) {
+    if (err.statusCode && err.statusCode !== 401 && err.statusCode !== 302) throw err;
+  }
+  await gameStreamApiRequest(host, '/api/password', {
+    method: 'POST',
+    body: {
+      currentUsername: '',
+      currentPassword: '',
+      newUsername: GAME_STREAM_WEB_USERNAME,
+      newPassword: GAME_STREAM_WEB_PASSWORD,
+      confirmNewPassword: GAME_STREAM_WEB_PASSWORD,
+    },
+  });
+  return { ready: true, created: true };
+}
+
+async function submitSunshinePairPin(options = {}) {
+  const host = String(options.host || options.hostIp || 'localhost');
+  const pin = String(options.pin || '').trim();
+  if (!/^\d{4}$/.test(pin)) throw new Error('Sunshine pairing PIN must be 4 digits');
+  await ensureSunshineWebCredentials(host);
+  const response = await gameStreamApiRequest(host, '/api/pin', {
+    method: 'POST',
+    username: GAME_STREAM_WEB_USERNAME,
+    password: GAME_STREAM_WEB_PASSWORD,
+    body: {
+      pin,
+      name: String(options.name || os.hostname() || 'Windows Moonlight'),
+    },
+  });
+  if (response.json && response.json.status === false) {
+    throw new Error(response.json.error || 'Sunshine rejected the pairing PIN');
+  }
+  return { ok: true, host, pin, status: response.json?.status ?? true };
+}
+
 function gameStreamStatusPayload() {
   const moonlightPath = findFirstExistingPath(moonlightExecutableCandidates());
   const sunshinePath = findFirstExistingPath(sunshineExecutableCandidates());
@@ -540,6 +663,8 @@ function gameStreamStatusPayload() {
       pid: gameStreamHostProcess?.pid || null,
       configPath: gameStreamSunshineConfigPath(),
       appsPath: gameStreamSunshineAppsPath(),
+      statePath: gameStreamSunshineStatePath(),
+      credentialsPath: gameStreamSunshineCredentialsPath(),
       webUrl: 'https://localhost:47990/',
     },
   };
@@ -645,6 +770,8 @@ async function startGameStreamHost(options = {}) {
     exePath,
     configPath: files.configPath,
     appsPath: files.appsPath,
+    statePath: files.statePath,
+    credentialsPath: files.credentialsPath,
     webUrl,
   };
 }
@@ -756,7 +883,8 @@ function requestGameStreamRemoteHost(device, options = {}) {
         return;
       }
       if (message.type === 'hello-ok') {
-        socket.send(JSON.stringify({ type: 'game-stream-start-host', requestId, options }));
+        const type = options.pairPin ? 'game-stream-submit-pair-pin' : 'game-stream-start-host';
+        socket.send(JSON.stringify({ type, requestId, options }));
         return;
       }
       if (message.type === 'game-stream-host-started' && message.requestId === requestId) {
@@ -765,6 +893,14 @@ function requestGameStreamRemoteHost(device, options = {}) {
       }
       if (message.type === 'game-stream-host-error' && message.requestId === requestId) {
         finish(new Error(message.error || 'Game stream remote host failed'));
+        return;
+      }
+      if (message.type === 'game-stream-pair-pin-submitted' && message.requestId === requestId) {
+        finish(null, message.result || { ok: true });
+        return;
+      }
+      if (message.type === 'game-stream-pair-pin-error' && message.requestId === requestId) {
+        finish(new Error(message.error || 'Game stream remote pairing failed'));
         return;
       }
       if (message.type === 'error') {
@@ -1567,6 +1703,28 @@ function startSignalServer() {
         return;
       }
 
+      if (msg.type === 'game-stream-submit-pair-pin') {
+        const requestId = msg.requestId || null;
+        Promise.resolve()
+          .then(() => startGameStreamHost(msg.options || {}))
+          .then(() => submitSunshinePairPin({
+            host: 'localhost',
+            pin: msg.options?.pairPin,
+            name: msg.options?.pairName,
+          }))
+          .then((result) => {
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({ type: 'game-stream-pair-pin-submitted', requestId, result }));
+            }
+          })
+          .catch((err) => {
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({ type: 'game-stream-pair-pin-error', requestId, error: err.message || String(err) }));
+            }
+          });
+        return;
+      }
+
       // silently ignore unknown message types (e.g. stray ICE candidates from other tools)
 
     });
@@ -1692,6 +1850,8 @@ ipcMain.handle('game-stream-stop-client', () => {
 });
 
 ipcMain.handle('game-stream-pair-client', (_event, options) => pairGameStreamClient(options));
+
+ipcMain.handle('game-stream-submit-pair-pin', (_event, options) => submitSunshinePairPin(options));
 
 ipcMain.handle('game-stream-request-remote-host', (_event, payload = {}) => {
   return requestGameStreamRemoteHost(payload.device, payload.options);

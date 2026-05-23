@@ -13,6 +13,7 @@ contextBridge.exposeInMainWorld('lanRemote', {
   startGameStreamClient: (options) => ipcRenderer.invoke('game-stream-start-client', options),
   stopGameStreamClient: () => ipcRenderer.invoke('game-stream-stop-client'),
   pairGameStreamClient: (options) => ipcRenderer.invoke('game-stream-pair-client', options),
+  submitGameStreamPairPin: (options) => ipcRenderer.invoke('game-stream-submit-pair-pin', options),
   requestGameStreamRemoteHost: (device, options) => ipcRenderer.invoke('game-stream-request-remote-host', { device, options }),
   openGameStreamSunshine: (host) => ipcRenderer.invoke('game-stream-open-sunshine', host),
   openGameStreamDownload: (target) => ipcRenderer.invoke('game-stream-open-download', target),

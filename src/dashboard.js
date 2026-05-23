@@ -159,7 +159,7 @@ function friendlyGameStreamError(err) {
   if (raw.includes('未找到 Sunshine')) return raw;
   if (raw.includes('未找到 Moonlight')) return raw;
   if (raw.includes('has not been paired') || raw.includes('not been paired')) {
-    return 'Moonlight 尚未与 Sunshine 配对。点击“配对”，在 Sunshine Web UI 的 PIN 页面输入 Moonlight 显示的 4 位 PIN。';
+    return 'Moonlight 尚未与 Sunshine 配对。点击“配对”，系统会自动生成 PIN 并提交到 Mac Sunshine。';
   }
   if (raw.includes('Failed to find application')) {
     return 'Moonlight 找不到 Sunshine 的 Desktop 应用。请打开 Sunshine Web UI，确认 Applications 里存在 Desktop。';
@@ -275,7 +275,7 @@ function updateGameStreamStatus(status) {
     } else if (moonlight.running) {
       gameStreamStatusTextEl.textContent = `Moonlight 游戏串流运行中，pid=${moonlight.pid}。`;
     } else if (moonlight.pairing) {
-      gameStreamStatusTextEl.textContent = 'Moonlight 配对流程运行中；请在 Sunshine Web UI 输入显示的 4 位 PIN。';
+      gameStreamStatusTextEl.textContent = 'Moonlight 自动配对流程运行中；无需手动输入 PIN。';
     } else {
       gameStreamStatusTextEl.textContent = 'Moonlight 已就绪：优先使用 Sunshine/Moonlight 游戏模式，Native v2 作为 fallback。';
     }
@@ -767,6 +767,10 @@ async function openGameStreamDevice(device) {
   }
 }
 
+function generatePairingPin() {
+  return String(Math.floor(1000 + Math.random() * 9000));
+}
+
 async function pairGameStreamDevice(device) {
   if (!device) return;
   setGameStreamBusy(true, `正在启动 Moonlight 配对：${device.address}`);
@@ -780,13 +784,23 @@ async function pairGameStreamDevice(device) {
       setGameStreamStatusText('Moonlight 未安装。请安装 Moonlight Qt 后重试。');
       return;
     }
+    const pairPin = generatePairingPin();
+    const pairName = appInfo?.device?.name || 'Windows Moonlight';
     if (device.pin && device.port) {
-      await window.lanRemote.requestGameStreamRemoteHost(device, gameStreamRemoteHostOptions(device));
-      log(`Mac Sunshine host accepted start request for pairing: ${device.address}`);
+      await window.lanRemote.requestGameStreamRemoteHost(device, {
+        ...gameStreamRemoteHostOptions(device),
+        pairPin,
+        pairName,
+      });
+      log(`Mac Sunshine host accepted automatic pair PIN: ${device.address}`);
+      setGameStreamStatusText('正在自动配对：已生成 PIN 并提交给 Mac Sunshine，无需手动打开 Web UI。');
+    } else {
+      setGameStreamStatusText('手动 IP 无法自动提交 Sunshine PIN；请用自动发现的 Mac 设备，或手动在 Sunshine Web 输入 PIN。');
+      return;
     }
-    const result = await window.lanRemote.pairGameStreamClient({ hostIp: device.address });
+    const result = await window.lanRemote.pairGameStreamClient({ hostIp: device.address, pin: pairPin });
     log(`Moonlight pairing started pid=${result.pid}; host=${device.address}`);
-    setGameStreamStatusText('Moonlight 配对已启动；请把 Moonlight 显示的 4 位 PIN 输入 Sunshine Web UI。');
+    setGameStreamStatusText('Moonlight 自动配对已启动；如果 Moonlight 提示成功，可直接点“启动游戏模式”。');
   } catch (err) {
     const message = friendlyGameStreamError(err);
     log(`game-stream pair failed: ${message}`);
