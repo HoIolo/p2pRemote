@@ -150,7 +150,17 @@ static bool IsSupportedDecoderOutputSubtype(const GUID& subtype) {
          IsEqualGUID(subtype, MFVideoFormat_YUY2);
 }
 
-static bool IsPreferredDecoderOutputSubtype(const GUID& subtype, int rank) {
+static bool IsPreferredDecoderOutputSubtype(const GUID& subtype, int rank, bool preferNv12) {
+  if (preferNv12) {
+    switch (rank) {
+      case 0: return IsEqualGUID(subtype, MFVideoFormat_NV12);
+      case 1: return IsEqualGUID(subtype, MFVideoFormat_IYUV);
+      case 2: return IsEqualGUID(subtype, MFVideoFormat_I420);
+      case 3: return IsEqualGUID(subtype, MFVideoFormat_YV12);
+      case 4: return IsEqualGUID(subtype, MFVideoFormat_YUY2);
+      default: return false;
+    }
+  }
   switch (rank) {
     case 0: return IsEqualGUID(subtype, MFVideoFormat_IYUV);
     case 1: return IsEqualGUID(subtype, MFVideoFormat_I420);
@@ -681,12 +691,13 @@ static void NV12ToBGRA(const uint8_t* src, DWORD srcLen, int width, int height, 
 
 class MfDecoder {
  public:
-  bool Init(int width, int height, int fps, ID3D11Device* sharedDevice) {
+  bool Init(int width, int height, int fps, ID3D11Device* sharedDevice, bool forceCpu) {
     width_ = width;
     height_ = height;
     fps_ = std::max(30, fps);
-    forceCpuOutput_ = !EnvFlagEnabled(L"P2P_NATIVE_V2_ENABLE_DXVA") ||
-                      EnvFlagEnabled(L"P2P_NATIVE_V2_FORCE_CPU_DECODE");
+    forceCpuOutput_ = forceCpu ||
+                      EnvFlagEnabled(L"P2P_NATIVE_V2_FORCE_CPU_DECODE") ||
+                      EnvFlagEnabled(L"P2P_NATIVE_V2_DISABLE_DXVA");
     HRESULT hr = CoCreateInstance(CLSID_CMSH264DecoderMFT, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&mft_));
     if (FAILED(hr)) {
       wchar_t hrText[96];
@@ -697,7 +708,7 @@ class MfDecoder {
     if (!forceCpuOutput_) {
       InitDxvaDeviceManager(sharedDevice);
     } else {
-      Log(L"decoder init: CPU/system-memory NV12 output (set P2P_NATIVE_V2_ENABLE_DXVA=1 to try DXVA)");
+      Log(L"decoder init: CPU/system-memory output (DXVA disabled/forced off)");
     }
 
     ComPtr<ICodecAPI> codec;
@@ -721,6 +732,8 @@ class MfDecoder {
 
     return true;
   }
+
+  bool UsingDxva() const { return dxvaEnabled_; }
 
   DecodeStatus Decode(const EncodedFrame& encoded, DecodedFrame& decoded) {
     if (!inputTypeSet_) {
@@ -812,6 +825,7 @@ class MfDecoder {
           Log(L"decoder input accepted but output setup failed: subtype=%s", name);
           return E_FAIL;
         }
+        StartStreaming();
         inputTypeSet_ = true;
         inputSubtypeName_ = name;
         Log(L"decoder input configured: subtype=%s size=%dx%d@%d seq=%zu firstFrame=%llu bytes=%zu keyframe=%d sps=%u pps=%u idr=%u nals=[%s]",
@@ -874,7 +888,7 @@ class MfDecoder {
         if (!loggedCandidates && i < 8) {
           Log(L"decoder output candidate[%u]: %s", i, VideoSubtypeName(subtype));
         }
-        if (!IsPreferredDecoderOutputSubtype(subtype, rank)) continue;
+        if (!IsPreferredDecoderOutputSubtype(subtype, rank, dxvaEnabled_)) continue;
 
         // Use the advertised type exactly as returned.  It can contain private
         // decoder attributes; rewriting frame-size/rate/interlace here makes
@@ -883,9 +897,10 @@ class MfDecoder {
         if (SUCCEEDED(hr)) {
           outputSubtype_ = subtype;
           outputTypeSet_ = true;
-          Log(L"decoder output configured: advertised %s candidate=%u",
+          Log(L"decoder output configured: advertised %s candidate=%u dxva=%d",
               VideoSubtypeName(subtype),
-              i);
+              i,
+              dxvaEnabled_ ? 1 : 0);
           return true;
         }
         if (i < 8) {
@@ -903,10 +918,18 @@ class MfDecoder {
 
     for (int rank = 0; rank <= 4; ++rank) {
       GUID subtype = MFVideoFormat_IYUV;
-      if (rank == 1) subtype = MFVideoFormat_I420;
-      else if (rank == 2) subtype = MFVideoFormat_YV12;
-      else if (rank == 3) subtype = MFVideoFormat_NV12;
-      else if (rank == 4) subtype = MFVideoFormat_YUY2;
+      if (dxvaEnabled_) {
+        if (rank == 0) subtype = MFVideoFormat_NV12;
+        else if (rank == 1) subtype = MFVideoFormat_IYUV;
+        else if (rank == 2) subtype = MFVideoFormat_I420;
+        else if (rank == 3) subtype = MFVideoFormat_YV12;
+        else if (rank == 4) subtype = MFVideoFormat_YUY2;
+      } else {
+        if (rank == 1) subtype = MFVideoFormat_I420;
+        else if (rank == 2) subtype = MFVideoFormat_YV12;
+        else if (rank == 3) subtype = MFVideoFormat_NV12;
+        else if (rank == 4) subtype = MFVideoFormat_YUY2;
+      }
 
       ComPtr<IMFMediaType> out;
       HRESULT hr = MFCreateMediaType(&out);
@@ -920,7 +943,9 @@ class MfDecoder {
       if (SUCCEEDED(hr)) {
         outputSubtype_ = subtype;
         outputTypeSet_ = true;
-        Log(L"decoder output configured: manual %s", VideoSubtypeName(subtype));
+        Log(L"decoder output configured: manual %s dxva=%d",
+            VideoSubtypeName(subtype),
+            dxvaEnabled_ ? 1 : 0);
         return true;
       }
       lastHr = hr;
@@ -950,13 +975,55 @@ class MfDecoder {
       if (FAILED(D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, flags,
                                    levels, ARRAYSIZE(levels), D3D11_SDK_VERSION,
                                    &dxDevice_, &actual, &dxCtx_))) {
+        Log(L"decoder init: DXVA device create failed; falling back to CPU/system-memory output");
+        forceCpuOutput_ = true;
         return;
       }
     }
+    if (dxDevice_) {
+      ComPtr<ID3D11Multithread> multithread;
+      if (SUCCEEDED(dxDevice_.As(&multithread))) {
+        multithread->SetMultithreadProtected(TRUE);
+      }
+    }
     UINT resetToken = 0;
-    if (FAILED(MFCreateDXGIDeviceManager(&resetToken, &dxgiManager_))) return;
-    if (FAILED(dxgiManager_->ResetDevice(dxDevice_.Get(), resetToken))) return;
-    mft_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(dxgiManager_.Get()));
+    HRESULT hr = MFCreateDXGIDeviceManager(&resetToken, &dxgiManager_);
+    if (FAILED(hr)) {
+      wchar_t hrText[96];
+      FormatHr(hr, hrText, std::size(hrText));
+      Log(L"decoder init: MFCreateDXGIDeviceManager failed %s; falling back to CPU/system-memory output", hrText);
+      dxgiManager_.Reset();
+      forceCpuOutput_ = true;
+      return;
+    }
+    hr = dxgiManager_->ResetDevice(dxDevice_.Get(), resetToken);
+    if (FAILED(hr)) {
+      wchar_t hrText[96];
+      FormatHr(hr, hrText, std::size(hrText));
+      Log(L"decoder init: DXGI ResetDevice failed %s; falling back to CPU/system-memory output", hrText);
+      dxgiManager_.Reset();
+      forceCpuOutput_ = true;
+      return;
+    }
+    hr = mft_->ProcessMessage(MFT_MESSAGE_SET_D3D_MANAGER, reinterpret_cast<ULONG_PTR>(dxgiManager_.Get()));
+    if (FAILED(hr)) {
+      wchar_t hrText[96];
+      FormatHr(hr, hrText, std::size(hrText));
+      Log(L"decoder init: SET_D3D_MANAGER failed %s; falling back to CPU/system-memory output", hrText);
+      dxgiManager_.Reset();
+      forceCpuOutput_ = true;
+      return;
+    }
+    dxvaEnabled_ = true;
+    Log(L"decoder init: DXVA enabled (%s renderer device)",
+        sharedDxDevice_ ? L"shared" : L"private");
+  }
+
+  void StartStreaming() {
+    if (streamingStarted_) return;
+    mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_BEGIN_STREAMING, 0);
+    mft_->ProcessMessage(MFT_MESSAGE_NOTIFY_START_OF_STREAM, 0);
+    streamingStarted_ = true;
   }
 
   DecodeStatus DrainOne(DecodedFrame& decoded, const EncodedFrame& meta) {
@@ -970,7 +1037,8 @@ class MfDecoder {
     const bool providesSamples = (info.dwFlags & MFT_OUTPUT_STREAM_PROVIDES_SAMPLES) != 0;
     bool usingDxgiOutputSample = false;
     if (!providesSamples) {
-      if (sharedDxDevice_ && CreateDxgiOutputSample(&outSample)) {
+      if (dxvaEnabled_ && sharedDxDevice_ && IsEqualGUID(outputSubtype_, MFVideoFormat_NV12) &&
+          CreateDxgiOutputSample(&outSample)) {
         usingDxgiOutputSample = true;
       } else {
         DWORD bufSize = std::max<DWORD>(info.cbSize, static_cast<DWORD>(width_ * height_ * 3 / 2));
@@ -1030,7 +1098,7 @@ class MfDecoder {
     if (!outSample) return DecodeStatus::Error;
 
     // Zero-copy path: decoder gave us a D3D11 texture from the same device used by the renderer.
-    if (sharedDxDevice_ && ExtractDxgi(outSample.Get(), decoded, meta)) {
+    if (dxvaEnabled_ && sharedDxDevice_ && ExtractDxgi(outSample.Get(), decoded, meta)) {
       return DecodeStatus::Frame;
     }
 
@@ -1038,25 +1106,52 @@ class MfDecoder {
   }
 
   bool CreateDxgiOutputSample(ComPtr<IMFSample>* sampleOut) {
-    if (!dxDevice_) return false;
-    D3D11_TEXTURE2D_DESC desc{};
-    desc.Width = static_cast<UINT>(width_);
-    desc.Height = static_cast<UINT>(height_);
-    desc.MipLevels = 1;
-    desc.ArraySize = 1;
-    desc.Format = DXGI_FORMAT_NV12;
-    desc.SampleDesc.Count = 1;
-    desc.Usage = D3D11_USAGE_DEFAULT;
-    desc.BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
+    if (!sampleOut || !EnsureDxgiOutputPool()) return false;
+    *sampleOut = dxgiOutputPool_[dxgiOutputPoolIndex_].sample;
+    dxgiOutputPoolIndex_ = (dxgiOutputPoolIndex_ + 1) % dxgiOutputPool_.size();
+    return true;
+  }
 
-    ComPtr<ID3D11Texture2D> texture;
-    if (FAILED(dxDevice_->CreateTexture2D(&desc, nullptr, &texture))) return false;
-    ComPtr<IMFMediaBuffer> buffer;
-    if (FAILED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), texture.Get(), 0, FALSE, &buffer))) return false;
-    ComPtr<IMFSample> sample;
-    if (FAILED(MFCreateSample(&sample))) return false;
-    if (FAILED(sample->AddBuffer(buffer.Get()))) return false;
-    *sampleOut = sample;
+  bool EnsureDxgiOutputPool() {
+    if (!dxDevice_) return false;
+    if (!dxgiOutputPool_.empty()) return true;
+
+    constexpr size_t kPoolSize = 8;
+    dxgiOutputPool_.reserve(kPoolSize);
+    for (size_t i = 0; i < kPoolSize; ++i) {
+      D3D11_TEXTURE2D_DESC desc{};
+      desc.Width = static_cast<UINT>(width_);
+      desc.Height = static_cast<UINT>(height_);
+      desc.MipLevels = 1;
+      desc.ArraySize = 1;
+      desc.Format = DXGI_FORMAT_NV12;
+      desc.SampleDesc.Count = 1;
+      desc.Usage = D3D11_USAGE_DEFAULT;
+      desc.BindFlags = D3D11_BIND_DECODER | D3D11_BIND_SHADER_RESOURCE;
+
+      ComPtr<ID3D11Texture2D> texture;
+      if (FAILED(dxDevice_->CreateTexture2D(&desc, nullptr, &texture))) {
+        dxgiOutputPool_.clear();
+        return false;
+      }
+      ComPtr<IMFMediaBuffer> buffer;
+      if (FAILED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), texture.Get(), 0, FALSE, &buffer))) {
+        dxgiOutputPool_.clear();
+        return false;
+      }
+      ComPtr<IMFSample> sample;
+      if (FAILED(MFCreateSample(&sample))) {
+        dxgiOutputPool_.clear();
+        return false;
+      }
+      if (FAILED(sample->AddBuffer(buffer.Get()))) {
+        dxgiOutputPool_.clear();
+        return false;
+      }
+      dxgiOutputPool_.push_back(DxgiOutputPoolEntry{sample});
+    }
+    dxgiOutputPoolIndex_ = 0;
+    Log(L"decoder DXGI output sample pool created: %zu textures", dxgiOutputPool_.size());
     return true;
   }
 
@@ -1195,13 +1290,20 @@ class MfDecoder {
   ComPtr<ID3D11Device> dxDevice_;
   ComPtr<ID3D11DeviceContext> dxCtx_;
   ComPtr<IMFDXGIDeviceManager> dxgiManager_;
+  struct DxgiOutputPoolEntry {
+    ComPtr<IMFSample> sample;
+  };
+  std::vector<DxgiOutputPoolEntry> dxgiOutputPool_;
+  size_t dxgiOutputPoolIndex_ = 0;
   int width_ = 0;
   int height_ = 0;
   int fps_ = 60;
   bool sharedDxDevice_ = false;
   bool forceCpuOutput_ = false;
+  bool dxvaEnabled_ = false;
   bool inputTypeSet_ = false;
   bool outputTypeSet_ = false;
+  bool streamingStarted_ = false;
   const wchar_t* inputSubtypeName_ = L"-";
   GUID outputSubtype_ = MFVideoFormat_NV12;
   bool reportedProcessInputError_ = false;
@@ -1219,20 +1321,29 @@ void DecoderThread() {
     return g_renderer && g_renderer->Device();
   };
   bool useSharedDevice = sharedDeviceAvailableNow();
-  auto createDecoder = [&](bool preferSharedDevice) -> std::unique_ptr<MfDecoder> {
+  bool forceCpuAfterDxvaFailure = false;
+  auto createDecoder = [&](bool preferSharedDevice, bool forceCpu) -> std::unique_ptr<MfDecoder> {
     auto decoder = std::make_unique<MfDecoder>();
     ID3D11Device* renderDevice = (preferSharedDevice && g_renderer) ? g_renderer->Device() : nullptr;
     const VideoProfile activeProfile = ActiveVideoProfile();
-    if (!decoder->Init(activeProfile.width, activeProfile.height, activeProfile.fps, renderDevice)) return nullptr;
+    if (!decoder->Init(activeProfile.width, activeProfile.height, activeProfile.fps, renderDevice, forceCpu)) return nullptr;
     return decoder;
   };
 
-  auto decoder = createDecoder(useSharedDevice);
+  auto decoder = createDecoder(useSharedDevice, false);
+  if (decoder && !decoder->UsingDxva() && !EnvFlagEnabled(L"P2P_NATIVE_V2_FORCE_CPU_DECODE") &&
+      !EnvFlagEnabled(L"P2P_NATIVE_V2_DISABLE_DXVA")) {
+    forceCpuAfterDxvaFailure = true;
+  }
   if (!decoder) {
-    MessageBoxW(nullptr, L"Failed to initialize Media Foundation H.264 decoder", L"P2P Native", MB_ICONERROR);
-    MFShutdown();
-    CoUninitialize();
-    return;
+    decoder = createDecoder(false, true);
+    forceCpuAfterDxvaFailure = true;
+    if (!decoder) {
+      MessageBoxW(nullptr, L"Failed to initialize Media Foundation H.264 decoder", L"P2P Native", MB_ICONERROR);
+      MFShutdown();
+      CoUninitialize();
+      return;
+    }
   }
   uint64_t appliedProfileGeneration = g_videoProfileGeneration.load(std::memory_order_relaxed);
 
@@ -1244,7 +1355,7 @@ void DecoderThread() {
       bool reconfigured = !g_renderer || g_renderer->Reconfigure(activeProfile.width, activeProfile.height);
       if (reconfigured) {
         useSharedDevice = sharedDeviceAvailableNow();
-        if (auto rebuilt = createDecoder(useSharedDevice)) {
+        if (auto rebuilt = createDecoder(useSharedDevice, forceCpuAfterDxvaFailure)) {
           decoder = std::move(rebuilt);
           appliedProfileGeneration = generation;
           g_decoderPrimed.store(false, std::memory_order_relaxed);
@@ -1286,6 +1397,16 @@ void DecoderThread() {
           static_cast<unsigned long long>(encoded.frameId),
           encoded.bytes.size(),
           encoded.keyframe ? 1 : 0);
+      if (decoder && decoder->UsingDxva()) {
+        Log(L"DXVA decode failed; falling back to CPU decoder");
+        forceCpuAfterDxvaFailure = true;
+        ClearPendingVideoQueues();
+        if (auto rebuilt = createDecoder(false, true)) {
+          decoder = std::move(rebuilt);
+          g_decoderPrimed.store(false, std::memory_order_relaxed);
+          g_decoderHasKeyframe.store(false, std::memory_order_relaxed);
+        }
+      }
       EnterVideoRecovery(L"decode failed");
     }
   }
@@ -1304,6 +1425,19 @@ void RenderThread() {
       std::unique_lock lk(g_decodedMu);
       g_decodedCv.wait(lk, [] { return !g_running.load() || !g_decodedQueue.empty(); });
       if (!g_running.load()) break;
+
+      // Present can be throttled by DWM / swap-chain frame latency.  Do the
+      // wait before selecting a frame; otherwise we pop a decoded frame, block
+      // inside Present(), and show an already-stale frame while newer decoded
+      // frames pile up behind us.  Waiting first lets us always render the
+      // newest decoded frame available at the moment the swap chain can accept
+      // it, which is the low-latency "latest frame wins" model.
+      lk.unlock();
+      if (g_renderer) g_renderer->WaitForPresentReady();
+      lk.lock();
+      if (!g_running.load()) break;
+      if (g_decodedQueue.empty()) continue;
+
       frame = std::move(g_decodedQueue.back());
       if (g_decodedQueue.size() > 1) {
         g_renderFramesDropped.fetch_add(static_cast<uint64_t>(g_decodedQueue.size() - 1), std::memory_order_relaxed);

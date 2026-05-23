@@ -8,6 +8,14 @@ bool D3DRenderer::Init(HWND hwnd, int width, int height) {
     width_ = width;
     height_ = height;
     allowTearing_ = CheckTearingSupport();
+    RECT rc{};
+    GetClientRect(hwnd_, &rc);
+    backBufferWidth_ = std::max(1L, rc.right - rc.left);
+    backBufferHeight_ = std::max(1L, rc.bottom - rc.top);
+    if (backBufferWidth_ <= 1 || backBufferHeight_ <= 1) {
+      backBufferWidth_ = std::max(1, width_);
+      backBufferHeight_ = std::max(1, height_);
+    }
 
     UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
     D3D_FEATURE_LEVEL levels[] = {
@@ -35,8 +43,8 @@ bool D3DRenderer::Init(HWND hwnd, int width, int height) {
     if (FAILED(adapter->GetParent(IID_PPV_ARGS(&factory)))) return false;
 
     DXGI_SWAP_CHAIN_DESC1 desc{};
-    desc.Width = static_cast<UINT>(width_);
-    desc.Height = static_cast<UINT>(height_);
+    desc.Width = static_cast<UINT>(backBufferWidth_);
+    desc.Height = static_cast<UINT>(backBufferHeight_);
     desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
     desc.Stereo = FALSE;
     desc.SampleDesc.Count = 1;
@@ -59,7 +67,7 @@ bool D3DRenderer::Init(HWND hwnd, int width, int height) {
       frameLatencyWaitable_ = swap2->GetFrameLatencyWaitableObject();
   }
 
-    return CreatePipeline() && CreateNv12Textures();
+    return CreatePipeline() && CreateBackBufferRtv() && CreateNv12Textures();
 }
 
 bool D3DRenderer::Render(const Nv12Frame& frame) {
@@ -96,26 +104,17 @@ bool D3DRenderer::Reconfigure(int width, int height) {
     uvTex_.Reset();
     ySrv_.Reset();
     uvSrv_.Reset();
+    rtv_.Reset();
+    ClearTextureSrvCache();
     copyNv12Tex_.Reset();
     copyYSrv_.Reset();
     copyUvSrv_.Reset();
-    if (!swap_) return CreateNv12Textures();
-    HRESULT hr = swap_->ResizeBuffers(0, static_cast<UINT>(width_), static_cast<UINT>(height_),
-                                      DXGI_FORMAT_UNKNOWN,
-                                      DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
-                                      (allowTearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0));
-    if (FAILED(hr)) return false;
-    ComPtr<IDXGISwapChain2> swap2;
-    if (SUCCEEDED(swap_.As(&swap2))) {
-      swap2->SetMaximumFrameLatency(1);
-      frameLatencyWaitable_ = swap2->GetFrameLatencyWaitableObject();
-  }
-    return CreateNv12Textures();
+    return EnsureBackBufferSize() && CreateNv12Textures();
 }
 
 void D3DRenderer::WaitForPresentReady() {
     if (frameLatencyWaitable_) {
-      WaitForSingleObject(frameLatencyWaitable_, 8);
+      WaitForSingleObject(frameLatencyWaitable_, 20);
   }
 }
 
@@ -183,6 +182,40 @@ float4 main(VSOut i) : SV_Target {
     return SUCCEEDED(device_->CreateSamplerState(&samp, &sampler_));
 }
 
+bool D3DRenderer::CreateBackBufferRtv() {
+    if (!swap_ || !device_) return false;
+    ComPtr<ID3D11Texture2D> backBuffer;
+    HRESULT hr = swap_->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
+    if (FAILED(hr)) return false;
+    return SUCCEEDED(device_->CreateRenderTargetView(backBuffer.Get(), nullptr, &rtv_));
+}
+
+bool D3DRenderer::EnsureBackBufferSize() {
+    if (!swap_) return true;
+    RECT rc{};
+    GetClientRect(hwnd_, &rc);
+    const int nextWidth = std::max(1L, rc.right - rc.left);
+    const int nextHeight = std::max(1L, rc.bottom - rc.top);
+    if (nextWidth == backBufferWidth_ && nextHeight == backBufferHeight_ && rtv_) return true;
+
+    backBufferWidth_ = nextWidth;
+    backBufferHeight_ = nextHeight;
+    rtv_.Reset();
+    HRESULT hr = swap_->ResizeBuffers(0,
+                                      static_cast<UINT>(backBufferWidth_),
+                                      static_cast<UINT>(backBufferHeight_),
+                                      DXGI_FORMAT_UNKNOWN,
+                                      DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT |
+                                      (allowTearing_ ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0));
+    if (FAILED(hr)) return false;
+    ComPtr<IDXGISwapChain2> swap2;
+    if (SUCCEEDED(swap_.As(&swap2))) {
+      swap2->SetMaximumFrameLatency(1);
+      frameLatencyWaitable_ = swap2->GetFrameLatencyWaitableObject();
+    }
+    return CreateBackBufferRtv();
+}
+
 bool D3DRenderer::CreateNv12Textures() {
     D3D11_TEXTURE2D_DESC yDesc{};
     yDesc.Width = static_cast<UINT>(width_);
@@ -216,27 +249,78 @@ bool D3DRenderer::CreateNv12Textures() {
 }
 
 bool D3DRenderer::RenderTexture(ID3D11Texture2D* texture, UINT subresource) {
-    ComPtr<ID3D11ShaderResourceView> ySrv;
-    ComPtr<ID3D11ShaderResourceView> uvSrv;
+    ID3D11ShaderResourceView* ySrv = nullptr;
+    ID3D11ShaderResourceView* uvSrv = nullptr;
+    if (subresource == 0 && GetTextureSrvs(texture, subresource, &ySrv, &uvSrv)) {
+      return DrawWithSrvs(ySrv, uvSrv);
+    }
+
+    {
+      if (!EnsureCopyNv12Texture()) return false;
+      ctx_->CopySubresourceRegion(copyNv12Tex_.Get(), 0, 0, 0, 0, texture, subresource, nullptr);
+      return DrawWithSrvs(copyYSrv_.Get(), copyUvSrv_.Get());
+    }
+}
+
+bool D3DRenderer::GetTextureSrvs(ID3D11Texture2D* texture,
+                                 UINT subresource,
+                                 ID3D11ShaderResourceView** ySrv,
+                                 ID3D11ShaderResourceView** uvSrv) {
+    if (!texture || !ySrv || !uvSrv) return false;
+    ++srvCacheClock_;
+    for (auto& entry : srvCache_) {
+      if (entry.texture.Get() == texture && entry.subresource == subresource &&
+          entry.ySrv && entry.uvSrv) {
+        entry.stamp = srvCacheClock_;
+        *ySrv = entry.ySrv.Get();
+        *uvSrv = entry.uvSrv.Get();
+        return true;
+      }
+    }
+
     D3D11_SHADER_RESOURCE_VIEW_DESC ySrvDesc{};
     ySrvDesc.Format = DXGI_FORMAT_R8_UNORM;
     ySrvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     ySrvDesc.Texture2D.MipLevels = 1;
-    HRESULT hrY = subresource == 0 ? device_->CreateShaderResourceView(texture, &ySrvDesc, &ySrv) : E_FAIL;
 
     D3D11_SHADER_RESOURCE_VIEW_DESC uvSrvDesc{};
     uvSrvDesc.Format = DXGI_FORMAT_R8G8_UNORM;
     uvSrvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
     uvSrvDesc.Texture2D.MipLevels = 1;
-    HRESULT hrUv = subresource == 0 ? device_->CreateShaderResourceView(texture, &uvSrvDesc, &uvSrv) : E_FAIL;
 
-    if (FAILED(hrY) || FAILED(hrUv)) {
-      if (!EnsureCopyNv12Texture()) return false;
-      ctx_->CopySubresourceRegion(copyNv12Tex_.Get(), 0, 0, 0, 0, texture, subresource, nullptr);
-      return DrawWithSrvs(copyYSrv_.Get(), copyUvSrv_.Get());
-  }
+    ComPtr<ID3D11ShaderResourceView> newYSrv;
+    ComPtr<ID3D11ShaderResourceView> newUvSrv;
+    if (FAILED(device_->CreateShaderResourceView(texture, &ySrvDesc, &newYSrv))) return false;
+    if (FAILED(device_->CreateShaderResourceView(texture, &uvSrvDesc, &newUvSrv))) return false;
 
-    return DrawWithSrvs(ySrv.Get(), uvSrv.Get());
+    TextureSrvCacheEntry* victim = nullptr;
+    for (auto& entry : srvCache_) {
+      if (!entry.texture) {
+        victim = &entry;
+        break;
+      }
+      if (!victim || entry.stamp < victim->stamp) victim = &entry;
+    }
+    if (!victim) return false;
+    victim->texture = texture;
+    victim->subresource = subresource;
+    victim->ySrv = newYSrv;
+    victim->uvSrv = newUvSrv;
+    victim->stamp = srvCacheClock_;
+    *ySrv = victim->ySrv.Get();
+    *uvSrv = victim->uvSrv.Get();
+    return true;
+}
+
+void D3DRenderer::ClearTextureSrvCache() {
+    for (auto& entry : srvCache_) {
+      entry.texture.Reset();
+      entry.ySrv.Reset();
+      entry.uvSrv.Reset();
+      entry.subresource = 0;
+      entry.stamp = 0;
+    }
+    srvCacheClock_ = 0;
 }
 
 bool D3DRenderer::EnsureCopyNv12Texture() {
@@ -266,22 +350,19 @@ bool D3DRenderer::EnsureCopyNv12Texture() {
 }
 
 bool D3DRenderer::DrawWithSrvs(ID3D11ShaderResourceView* ySrv, ID3D11ShaderResourceView* uvSrv) {
-    ComPtr<ID3D11Texture2D> backBuffer;
-    HRESULT hr = swap_->GetBuffer(0, IID_PPV_ARGS(&backBuffer));
-    if (FAILED(hr)) return false;
-    ComPtr<ID3D11RenderTargetView> rtv;
-    hr = device_->CreateRenderTargetView(backBuffer.Get(), nullptr, &rtv);
-    if (FAILED(hr)) return false;
+    if (!EnsureBackBufferSize()) return false;
+    if (!rtv_ && !CreateBackBufferRtv()) return false;
 
     D3D11_VIEWPORT vp{};
     vp.TopLeftX = 0;
     vp.TopLeftY = 0;
-    vp.Width = static_cast<float>(width_);
-    vp.Height = static_cast<float>(height_);
+    vp.Width = static_cast<float>(backBufferWidth_);
+    vp.Height = static_cast<float>(backBufferHeight_);
     vp.MinDepth = 0.0f;
     vp.MaxDepth = 1.0f;
     ctx_->RSSetViewports(1, &vp);
-    ctx_->OMSetRenderTargets(1, rtv.GetAddressOf(), nullptr);
+    ID3D11RenderTargetView* rtv = rtv_.Get();
+    ctx_->OMSetRenderTargets(1, &rtv, nullptr);
     ctx_->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
     ctx_->VSSetShader(vs_.Get(), nullptr, 0);
     ctx_->PSSetShader(ps_.Get(), nullptr, 0);
