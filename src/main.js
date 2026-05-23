@@ -611,6 +611,11 @@ async function gameStreamNvHttpRequest(host, requestPath, options = {}) {
   });
 }
 
+function isSunshineClientCertificateRequiredError(err) {
+  const text = [err?.message, err?.code, err?.response?.text].filter(Boolean).join(' ').toLowerCase();
+  return text.includes('certificate required') || text.includes('tlsv1_alert_certificate_required') || text.includes('alert number 116');
+}
+
 function gameStreamNvHttpAppNames(xml) {
   const apps = [];
   const re = /<AppTitle>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))<\/AppTitle>/gi;
@@ -628,13 +633,27 @@ async function waitForSunshineGameStreamApp(host, appName, options = {}) {
   const deadline = Date.now() + timeoutMs;
   let lastApps = [];
 
-  while (Date.now() < deadline) {
-    const response = await gameStreamNvHttpRequest(host, gameStreamApiPathWithQuery('/applist', { uniqueid: 0 }));
-    lastApps = gameStreamNvHttpAppNames(response.text);
-    if (lastApps.some((name) => name === expected)) {
-      return { ready: true, appName: expected, apps: lastApps };
+  try {
+    while (Date.now() < deadline) {
+      const response = await gameStreamNvHttpRequest(host, gameStreamApiPathWithQuery('/applist', { uniqueid: 0 }));
+      lastApps = gameStreamNvHttpAppNames(response.text);
+      if (lastApps.some((name) => name === expected)) {
+        return { ready: true, appName: expected, apps: lastApps };
+      }
+      await gameStreamDelay(retryDelayMs);
     }
-    await gameStreamDelay(retryDelayMs);
+  } catch (err) {
+    if (isSunshineClientCertificateRequiredError(err)) {
+      return {
+        ready: false,
+        skipped: true,
+        reason: 'sunshine-client-certificate-required',
+        appName: expected,
+        apps: lastApps,
+        message: err?.message || 'Sunshine requires a paired Moonlight client certificate for /applist',
+      };
+    }
+    throw err;
   }
 
   throw new Error(`Sunshine GameStream app list does not expose ${expected}; visible apps: ${lastApps.join(', ') || '(none)'}`);

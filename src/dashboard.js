@@ -732,13 +732,17 @@ async function openGameStreamDevice(device) {
       }
       if (device.pin && device.port) {
         setGameStreamStatusText(`正在请求 Mac 启动 Sunshine Host 并刷新应用列表：${device.address}:${device.port}`);
-        await window.lanRemote.requestGameStreamRemoteHost(device, {
+        const hostResult = await window.lanRemote.requestGameStreamRemoteHost(device, {
           ...gameStreamRemoteHostOptions(device),
           ...gameStreamClientOptions(device),
           appListTimeoutMs: 15_000,
           requestTimeoutMs: 20_000,
         });
-        log(`Mac Sunshine host exposed Desktop app for Moonlight: ${device.address}`);
+        if (hostResult?.gameStreamApp?.skipped) {
+          log(`Mac Sunshine requires Moonlight client certificate for app-list preflight; continuing with Moonlight launch: ${device.address}`);
+        } else {
+          log(`Mac Sunshine host exposed Desktop app for Moonlight: ${device.address}`);
+        }
       } else {
         log('manual game-stream: 请确认 Mac 端 Sunshine 已启动，并完成 Moonlight 配对。');
       }
