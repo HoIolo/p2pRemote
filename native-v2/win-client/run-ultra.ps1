@@ -1,11 +1,11 @@
-﻿param(
+param(
   [Parameter(Mandatory=$true)][string]$HostIp,
   [string]$HostName = 'Remote Device',
   [ValidateSet('darwin','win32','linux','unknown')][string]$HostPlatform = 'unknown',
-  [int]$Width = 1600,
-  [int]$Height = 900,
+  [int]$Width = 1920,
+  [int]$Height = 1080,
   [int]$Fps = 60,
-  [int]$Bitrate = 10000000,
+  [int]$Bitrate = 30000000,
   [int]$VideoPort = 45000,
   [int]$InputPort = 45001,
   [ValidateSet('tcp','udp')][string]$Transport = 'udp',

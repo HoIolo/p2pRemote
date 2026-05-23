@@ -106,6 +106,8 @@ struct NativeUiStats {
   double rxToPresentMs = 0.0;
   double packetAgeMs = 0.0;
   double frameAgeMs = 0.0;
+  double presentJitterMs = 0.0;
+  double rxToPresentMaxMs = 0.0;
   double queueDropPct = 0.0;
   double networkDropPct = 0.0;
   uint64_t dropped = 0;
@@ -145,6 +147,9 @@ extern std::atomic<uint64_t> g_framesPresented;
 extern LARGE_INTEGER g_qpcFreq;
 extern std::atomic<uint64_t> g_lastPresentQpc;
 extern std::atomic<uint64_t> g_lastRxToPresentUs;
+extern std::atomic<uint64_t> g_lastPresentIntervalUs;
+extern std::atomic<uint64_t> g_presentJitterUs;
+extern std::atomic<uint64_t> g_maxRxToPresentUs;
 extern std::atomic<uint64_t> g_gpuFrames;
 extern std::atomic<uint64_t> g_cpuFrames;
 extern std::atomic<uint64_t> g_packetsRx;

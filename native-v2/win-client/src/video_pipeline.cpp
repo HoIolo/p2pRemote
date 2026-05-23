@@ -1438,14 +1438,16 @@ void RenderThread() {
       g_decodedCv.wait(lk, [] { return !g_running.load() || !g_decodedQueue.empty(); });
       if (!g_running.load()) break;
 
-      // Present can be throttled by DWM / swap-chain frame latency.  Do the
-      // wait before selecting a frame; otherwise we pop a decoded frame, block
-      // inside Present(), and show an already-stale frame while newer decoded
-      // frames pile up behind us.  Waiting first lets us always render the
-      // newest decoded frame available at the moment the swap chain can accept
-      // it, which is the low-latency "latest frame wins" model.
+      // Present can be throttled by DWM / swap-chain frame latency. Wait before
+      // selecting a frame; otherwise we pop a decoded frame, block inside
+      // Present(), and show an already-stale frame while newer decoded frames
+      // pile up. This mirrors Moonlight's pacer model: synchronize with the
+      // display/render readiness first, then render the newest frame available.
       lk.unlock();
-      if (g_renderer) g_renderer->WaitForPresentReady();
+      if (g_renderer) {
+        g_renderer->WaitForPresentReady();
+        g_renderer->WaitForDisplayVBlank();
+      }
       lk.lock();
       if (!g_running.load()) break;
       if (g_decodedQueue.empty()) continue;
@@ -1480,8 +1482,18 @@ void RenderThread() {
       else g_cpuFrames.fetch_add(1, std::memory_order_relaxed);
       uint64_t presentQpc = QpcNow();
       uint64_t recvQpc = frame.gpu ? frame.dxgi.recvQpc : frame.nv12.recvQpc;
-      g_lastPresentQpc.store(presentQpc, std::memory_order_relaxed);
-      g_lastRxToPresentUs.store(QpcDeltaUs(recvQpc, presentQpc), std::memory_order_relaxed);
+      const uint64_t previousPresentQpc = g_lastPresentQpc.exchange(presentQpc, std::memory_order_relaxed);
+      const uint64_t rxToPresentUs = QpcDeltaUs(recvQpc, presentQpc);
+      g_lastRxToPresentUs.store(rxToPresentUs, std::memory_order_relaxed);
+      uint64_t maxRx = g_maxRxToPresentUs.load(std::memory_order_relaxed);
+      while (rxToPresentUs > maxRx &&
+             !g_maxRxToPresentUs.compare_exchange_weak(maxRx, rxToPresentUs, std::memory_order_relaxed)) {}
+      if (previousPresentQpc) {
+        const uint64_t intervalUs = QpcDeltaUs(previousPresentQpc, presentQpc);
+        g_lastPresentIntervalUs.store(intervalUs, std::memory_order_relaxed);
+        const uint64_t targetUs = 1'000'000ull / static_cast<uint64_t>(std::max(1, g_activeVideoFps.load(std::memory_order_relaxed)));
+        g_presentJitterUs.store(intervalUs > targetUs ? intervalUs - targetUs : targetUs - intervalUs, std::memory_order_relaxed);
+      }
       if (!g_loggedFirstPresentedFrame.exchange(true, std::memory_order_relaxed)) {
         Log(L"present first frame mode=%s", frame.gpu ? L"gpu" : L"cpu");
       }

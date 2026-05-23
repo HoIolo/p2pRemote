@@ -146,12 +146,13 @@ static int ClampEven(int value, int fallback = 2) {
 
 static int AutoBitrateForPixels(int width, int height, int fallback) {
   const int64_t pixels = static_cast<int64_t>(width) * height;
-  int bitrate = std::max(6'000'000, fallback);
-  if (pixels <= 1280ll * 720ll) bitrate = std::max(bitrate, 6'000'000);
-  else if (pixels <= 1600ll * 900ll) bitrate = std::max(bitrate, 10'000'000);
-  else if (pixels <= 1920ll * 1080ll) bitrate = std::max(bitrate, 14'000'000);
-  else if (pixels <= 2560ll * 1440ll) bitrate = std::max(bitrate, 22'000'000);
-  else bitrate = std::max(bitrate, 32'000'000);
+  int bitrate = std::max(12'000'000, fallback);
+  if (pixels <= 1280ll * 720ll) bitrate = std::max(bitrate, 12'000'000);
+  else if (pixels <= 1600ll * 900ll) bitrate = std::max(bitrate, 18'000'000);
+  else if (pixels <= 1920ll * 1080ll) bitrate = std::max(bitrate, 30'000'000);
+  else if (pixels <= 1920ll * 1200ll) bitrate = std::max(bitrate, 34'000'000);
+  else if (pixels <= 2560ll * 1440ll) bitrate = std::max(bitrate, 50'000'000);
+  else bitrate = std::max(bitrate, 80'000'000);
   return bitrate;
 }
 

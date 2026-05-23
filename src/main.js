@@ -1265,13 +1265,13 @@ function readNativeV2ClientProfile(profileFile = nativeV2ClientProfilePath()) {
       bitrate: Number(parsed.bitrate) || undefined,
       profileVersion: Number(parsed.profileVersion) || 0,
     };
-    if (!profile.profileVersion && profile.width && profile.height && Math.max(profile.width, profile.height) > 1920) {
-      const scale = 1600 / Math.max(profile.width, profile.height);
+    if (!profile.profileVersion && profile.width && profile.height && Math.max(profile.width, profile.height) > 2560) {
+      const scale = 2560 / Math.max(profile.width, profile.height);
       profile = {
         ...profile,
         width: Math.max(640, Math.round(profile.width * scale / 2) * 2),
         height: Math.max(360, Math.round(profile.height * scale / 2) * 2),
-        bitrate: Math.min(Number(profile.bitrate) || 10_000_000, 10_000_000),
+        bitrate: Math.min(Number(profile.bitrate) || 50_000_000, 50_000_000),
       };
     }
     return profile;
@@ -1283,10 +1283,10 @@ function readNativeV2ClientProfile(profileFile = nativeV2ClientProfilePath()) {
 function writeNativeV2ClientProfile(profileFile = nativeV2ClientProfilePath(), profile = {}) {
   const payload = {
     profileVersion: 2,
-    width: Number(profile.width) || 1600,
-    height: Number(profile.height) || 900,
+    width: Number(profile.width) || 1920,
+    height: Number(profile.height) || 1080,
     fps: Number(profile.fps) || 60,
-    bitrate: Number(profile.bitrate) || 10_000_000,
+    bitrate: Number(profile.bitrate) || 30_000_000,
   };
   fs.mkdirSync(path.dirname(profileFile), { recursive: true });
   fs.writeFileSync(profileFile, JSON.stringify(payload, null, 2));
@@ -1318,10 +1318,10 @@ function stopNativeV2ClientProfileWatcher() {
 async function processNativeV2ClientProfileChange(profile) {
   const previous = nativeV2ClientLastOptions ? { ...nativeV2ClientLastOptions } : null;
   const normalized = {
-    width: normalizeNativeV2Number(profile.width, nativeV2ClientLastOptions?.width || 1600, 640, 7680),
-    height: normalizeNativeV2Number(profile.height, nativeV2ClientLastOptions?.height || 900, 360, 4320),
+    width: normalizeNativeV2Number(profile.width, nativeV2ClientLastOptions?.width || 1920, 640, 7680),
+    height: normalizeNativeV2Number(profile.height, nativeV2ClientLastOptions?.height || 1080, 360, 4320),
     fps: normalizeNativeV2Number(profile.fps, nativeV2ClientLastOptions?.fps || 60, 30, 240),
-    bitrate: normalizeNativeV2Number(profile.bitrate, nativeV2ClientLastOptions?.bitrate || 10_000_000, 1_000_000, 200_000_000),
+    bitrate: normalizeNativeV2Number(profile.bitrate, nativeV2ClientLastOptions?.bitrate || 30_000_000, 1_000_000, 200_000_000),
     transport: 'udp',
   };
   if (nativeV2ClientLastOptions) {
@@ -1403,10 +1403,10 @@ function nativeV2StatusPayload() {
     defaults: {
       videoPort: 45000,
       inputPort: 45001,
-      width: Number(savedClientProfile.width) || 1600,
-      height: Number(savedClientProfile.height) || 900,
+      width: Number(savedClientProfile.width) || 1920,
+      height: Number(savedClientProfile.height) || 1080,
       fps: Number(savedClientProfile.fps) || 60,
-      bitrate: Number(savedClientProfile.bitrate) || 10_000_000,
+      bitrate: Number(savedClientProfile.bitrate) || 30_000_000,
       keyint: 1,
       transport: 'udp',
     },
@@ -1465,10 +1465,10 @@ function relayNativeV2ProcessOutput(kind, proc, chunk) {
 function nativeV2HostReadyResult(options, exePath, args, pid) {
   const videoPort = normalizeNativeV2Number(options.videoPort, 45000, 1, 65535);
   const inputPort = normalizeNativeV2Number(options.inputPort, 45001, 1, 65535);
-  const width = normalizeNativeV2Number(options.width, 1600, 640, 7680);
-  const height = normalizeNativeV2Number(options.height, 900, 360, 4320);
+  const width = normalizeNativeV2Number(options.width, 1920, 640, 7680);
+  const height = normalizeNativeV2Number(options.height, 1080, 360, 4320);
   const fps = normalizeNativeV2Number(options.fps, 60, 30, 240);
-  const bitrate = normalizeNativeV2Number(options.bitrate, 10_000_000, 1_000_000, 200_000_000);
+  const bitrate = normalizeNativeV2Number(options.bitrate, 30_000_000, 1_000_000, 200_000_000);
   const keyint = normalizeNativeV2Number(options.keyint, 1, 1, 300);
   const requestedTransport = options.transport === 'tcp' ? 'tcp' : 'udp';
   const allowUdpVideo = options.allowUdpVideo !== false && process.env.P2P_NATIVE_V2_DISABLE_UDP !== '1';
@@ -1544,10 +1544,10 @@ function startNativeV2Client(options = {}) {
 
   const videoPort = normalizeNativeV2Number(options.videoPort, 45000, 1, 65535);
   const inputPort = normalizeNativeV2Number(options.inputPort, 45001, 1, 65535);
-  const width = normalizeNativeV2Number(options.width, 1600, 640, 7680);
-  const height = normalizeNativeV2Number(options.height, 900, 360, 4320);
+  const width = normalizeNativeV2Number(options.width, 1920, 640, 7680);
+  const height = normalizeNativeV2Number(options.height, 1080, 360, 4320);
   const fps = normalizeNativeV2Number(options.fps, 60, 30, 240);
-  const bitrate = normalizeNativeV2Number(options.bitrate, 10_000_000, 0, 200_000_000);
+  const bitrate = normalizeNativeV2Number(options.bitrate, 30_000_000, 0, 200_000_000);
   const transport = 'udp';
   const profileFile = String(options.profileFile || nativeV2ClientProfilePath());
   writeNativeV2ClientProfile(profileFile, { width, height, fps, bitrate });
@@ -1727,10 +1727,10 @@ async function startNativeV2Host(options = {}) {
 
   const videoPort = normalizeNativeV2Number(options.videoPort, 45000, 1, 65535);
   const inputPort = normalizeNativeV2Number(options.inputPort, 45001, 1, 65535);
-  const width = normalizeNativeV2Number(options.width, 1600, 640, 7680);
-  const height = normalizeNativeV2Number(options.height, 900, 360, 4320);
+  const width = normalizeNativeV2Number(options.width, 1920, 640, 7680);
+  const height = normalizeNativeV2Number(options.height, 1080, 360, 4320);
   const fps = normalizeNativeV2Number(options.fps, 60, 30, 240);
-  const bitrate = normalizeNativeV2Number(options.bitrate, 10_000_000, 1_000_000, 200_000_000);
+  const bitrate = normalizeNativeV2Number(options.bitrate, 30_000_000, 1_000_000, 200_000_000);
   const keyint = normalizeNativeV2Number(options.keyint, 1, 1, 300);
   const requestedTransport = options.transport === 'tcp' ? 'tcp' : 'udp';
   const transport = requestedTransport === 'udp' && allowUdpVideo ? 'udp' : 'tcp';

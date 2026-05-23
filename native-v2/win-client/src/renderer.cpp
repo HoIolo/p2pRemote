@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <dwmapi.h>
 
 bool D3DRenderer::Init(HWND hwnd, int width, int height) {
     hwnd_ = hwnd;
@@ -116,6 +117,11 @@ void D3DRenderer::WaitForPresentReady() {
     if (frameLatencyWaitable_) {
       WaitForSingleObject(frameLatencyWaitable_, 20);
   }
+}
+
+void D3DRenderer::WaitForDisplayVBlank() {
+    if (frameLatencyWaitable_) return;
+    DwmFlush();
 }
 
 bool D3DRenderer::CheckTearingSupport() {

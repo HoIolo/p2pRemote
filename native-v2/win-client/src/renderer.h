@@ -14,6 +14,7 @@ class D3DRenderer {
   ID3D11Device* Device() const;
   bool Reconfigure(int width, int height);
   void WaitForPresentReady();
+  void WaitForDisplayVBlank();
 
  private:
   bool CheckTearingSupport();

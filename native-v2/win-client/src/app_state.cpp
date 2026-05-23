@@ -32,6 +32,9 @@ std::atomic<uint64_t> g_framesPresented{0};
 LARGE_INTEGER g_qpcFreq{};
 std::atomic<uint64_t> g_lastPresentQpc{0};
 std::atomic<uint64_t> g_lastRxToPresentUs{0};
+std::atomic<uint64_t> g_lastPresentIntervalUs{0};
+std::atomic<uint64_t> g_presentJitterUs{0};
+std::atomic<uint64_t> g_maxRxToPresentUs{0};
 std::atomic<uint64_t> g_gpuFrames{0};
 std::atomic<uint64_t> g_cpuFrames{0};
 std::atomic<uint64_t> g_packetsRx{0};
@@ -251,13 +254,13 @@ int ClampEven(int value, int fallback) {
 
 int DefaultBitrateForPixels(int width, int height, int fallback) {
   const int64_t pixels = static_cast<int64_t>(width) * height;
-  int bitrate = std::max(8'000'000, fallback);
-  if (pixels <= 1280ll * 720ll) bitrate = std::max(bitrate, 8'000'000);
-  else if (pixels <= 1600ll * 900ll) bitrate = std::max(bitrate, 10'000'000);
-  else if (pixels <= 1920ll * 1080ll) bitrate = std::max(bitrate, 12'000'000);
-  else if (pixels <= 1920ll * 1200ll) bitrate = std::max(bitrate, 14'000'000);
-  else if (pixels <= 2560ll * 1440ll) bitrate = std::max(bitrate, 18'000'000);
-  else bitrate = std::max(bitrate, 24'000'000);
+  int bitrate = std::max(12'000'000, fallback);
+  if (pixels <= 1280ll * 720ll) bitrate = std::max(bitrate, 12'000'000);
+  else if (pixels <= 1600ll * 900ll) bitrate = std::max(bitrate, 18'000'000);
+  else if (pixels <= 1920ll * 1080ll) bitrate = std::max(bitrate, 30'000'000);
+  else if (pixels <= 1920ll * 1200ll) bitrate = std::max(bitrate, 34'000'000);
+  else if (pixels <= 2560ll * 1440ll) bitrate = std::max(bitrate, 50'000'000);
+  else bitrate = std::max(bitrate, 80'000'000);
   return bitrate;
 }
 

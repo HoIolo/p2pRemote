@@ -539,14 +539,14 @@ static void DrawStats(HDC hdc, RECT rc) {
   const VideoProfile activeProfile = ActiveVideoProfile();
   DrawStatsRow(hdc, 126, L"显示帧率:", stats.presentFps > 0.1 ? FormatDouble(stats.presentFps, L"", 0) : FormatDouble(activeProfile.fps, L"", 0));
   DrawStatsRow(hdc, 156, L"接收完整帧率:", stats.completeFps > 0.1 ? FormatDouble(stats.completeFps, L"", 0) : L"--");
-  DrawStatsRow(hdc, 186, L"带宽占用:", FormatDouble(stats.mbps, L" Mbps", 1));
-  DrawStatsRow(hdc, 216, L"客户端丢旧帧(当前):", FormatDouble(stats.queueDropPct, L"%", 1));
+  DrawStatsRow(hdc, 186, L"显示抖动:", FormatDouble(stats.presentJitterMs, L" ms", 1));
+  DrawStatsRow(hdc, 216, L"峰值尾延时:", stats.rxToPresentMaxMs > 0.0 ? FormatDouble(stats.rxToPresentMaxMs, L" ms", 0) : L"-- ms");
 
   DrawStatsSeparator(hdc, 256);
-  DrawStatsRow(hdc, 276, L"传输通道:", g_cfg.udpVideo ? L"UDP 局域网直连" : L"TCP 局域网直连");
-  DrawStatsRow(hdc, 306, L"被控端 IP:", g_cfg.hostIp);
-  DrawStatsRow(hdc, 336, L"控制端 IP:", g_localIp);
-  DrawStatsRow(hdc, 366, L"网络拼帧废弃(当前):", FormatDouble(stats.networkDropPct, L"%", 1));
+  DrawStatsRow(hdc, 276, L"带宽占用:", FormatDouble(stats.mbps, L" Mbps", 1));
+  DrawStatsRow(hdc, 306, L"客户端丢旧帧(当前):", FormatDouble(stats.queueDropPct, L"%", 1));
+  DrawStatsRow(hdc, 336, L"网络拼帧废弃(当前):", FormatDouble(stats.networkDropPct, L"%", 1));
+  DrawStatsRow(hdc, 366, L"传输通道:", g_cfg.udpVideo ? L"UDP 局域网直连" : L"TCP 局域网直连");
   DrawStatsRow(hdc, 396, L"被控端系统:", PlatformLabel(g_cfg.hostPlatform));
 
   DrawStatsSeparator(hdc, 434);

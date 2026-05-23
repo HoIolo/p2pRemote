@@ -83,7 +83,7 @@ struct NativeHostConfig {
     var width: Int = 1920
     var height: Int = 1080
     var fps: Int = 60
-    var bitrate: Int = 20_000_000
+    var bitrate: Int = 30_000_000
     var keyframeSeconds: Int = 1
     var transport: String = "udp"
 
@@ -164,6 +164,7 @@ final class UdpVideoSender {
     private var pendingFrame: QueuedFrame?
     private var sendLoopActive = false
     private var nextPacketDueUs: UInt64 = 0
+
     private var nextFrameIdToQueue: UInt64 = 1
 
     private struct QueuedFrame {
@@ -182,13 +183,15 @@ final class UdpVideoSender {
 
         var one: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-        // Keep the kernel queue short. A large UDP send buffer hides stale video
-        // as soon as a scroll/game burst produces more packets than the NIC can
-        // transmit immediately. Pace before send and keep only a small kernel
-        // cushion.
-        var sndbuf: Int32 = 128 * 1024
+        // Sunshine found that large enough UDP send buffers plus bounded batches
+        // avoid NIC/router TX stalls better than trying to sleep before every
+        // tiny packet. Keep a moderate cushion here so packet bursts do not
+        // overflow the kernel queue while still bounding stale video.
+        var sndbuf: Int32 = 1024 * 1024
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, socklen_t(MemoryLayout<Int32>.size))
         var tos: Int32 = 0x10 // IPTOS_LOWDELAY
+        var sndLowat: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_SNDLOWAT, &sndLowat, socklen_t(MemoryLayout<Int32>.size))
         setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, socklen_t(MemoryLayout<Int32>.size))
 
         addr.sin_family = sa_family_t(AF_INET)
@@ -280,12 +283,15 @@ final class UdpVideoSender {
             nextPacketDueUs = now
         }
         if nextPacketDueUs > now {
-            let delay = min(UInt64(2_000), nextPacketDueUs - now)
-            if delay > 0 {
-                usleep(useconds_t(delay))
+            let waitUs = nextPacketDueUs - now
+            if waitUs >= 2_000 {
+                usleep(useconds_t(waitUs - 500))
+            }
+            while nextPacketDueUs > nowUs() {
+                sched_yield()
             }
         }
-        nextPacketDueUs = max(nextPacketDueUs, nowUs()) &+ spacingUs
+        nextPacketDueUs = max(nextPacketDueUs &+ spacingUs, nowUs())
     }
 
     private func sendFrameNow(_ item: QueuedFrame) {
@@ -306,62 +312,76 @@ final class UdpVideoSender {
         var offset = 0
         var fragIndex: UInt16 = 0
 
-        func sendPacket(fragIndex: UInt16, totalFragCount: UInt16, payload: Data, flags: UInt16) {
-            var packet = Data(capacity: p2VideoHeaderBytes + payload.count)
-            packet.append(contentsOf: [0x50, 0x32, 0x56, 0x32]) // P2V2
-            packet.appendU8(1)
-            packet.appendU8(1)
-            packet.appendU16LE(UInt16(p2VideoHeaderBytes))
-            packet.appendU64LE(id)
-            packet.appendU64LE(ptsUs)
-            packet.appendU32LE(UInt32(frame.count))
-            packet.appendU16LE(fragIndex)
-            packet.appendU16LE(totalFragCount)
-            packet.appendU16LE(UInt16(payload.count))
-            packet.appendU16LE(flags)
-            packet.append(payload)
-            waitForPacketSlot(packetBytes: packet.count)
-            packet.withUnsafeBytes { raw in
-                withUnsafePointer(to: &addr) { ptr in
-                    ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
-                        let rc = sendto(fd, raw.baseAddress!, raw.count, 0, sa, socklen_t(MemoryLayout<sockaddr_in>.size))
-                        if rc >= 0 {
-                            sentPackets += 1
-                            sentBytes += UInt64(rc)
-                        } else {
-                            sendErrors += 1
+        frame.withUnsafeBytes { frameRaw in
+            guard frameRaw.baseAddress != nil else { return }
+
+            func sendPacket(fragIndex: UInt16, totalFragCount: UInt16, payload: UnsafeRawBufferPointer, flags: UInt16) {
+                var header = Data(capacity: p2VideoHeaderBytes)
+                header.append(contentsOf: [0x50, 0x32, 0x56, 0x32]) // P2V2
+                header.appendU8(1)
+                header.appendU8(1)
+                header.appendU16LE(UInt16(p2VideoHeaderBytes))
+                header.appendU64LE(id)
+                header.appendU64LE(ptsUs)
+                header.appendU32LE(UInt32(frame.count))
+                header.appendU16LE(fragIndex)
+                header.appendU16LE(totalFragCount)
+                header.appendU16LE(UInt16(payload.count))
+                header.appendU16LE(flags)
+                waitForPacketSlot(packetBytes: p2VideoHeaderBytes + payload.count)
+                header.withUnsafeBytes { headerRaw in
+                    guard let headerBase = headerRaw.baseAddress, let payloadBase = payload.baseAddress else { return }
+                    var iov = [
+                        iovec(iov_base: UnsafeMutableRawPointer(mutating: headerBase), iov_len: headerRaw.count),
+                        iovec(iov_base: UnsafeMutableRawPointer(mutating: payloadBase), iov_len: payload.count),
+                    ]
+                    iov.withUnsafeMutableBufferPointer { iovPtr in
+                        var message = msghdr()
+                        withUnsafePointer(to: &addr) { ptr in
+                            ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
+                                message.msg_name = UnsafeMutableRawPointer(mutating: sa)
+                                message.msg_namelen = socklen_t(MemoryLayout<sockaddr_in>.size)
+                                message.msg_iov = iovPtr.baseAddress
+                                message.msg_iovlen = iovPtr.count
+                                let rc = sendmsg(fd, &message, 0)
+                                if rc >= 0 {
+                                    sentPackets += 1
+                                    sentBytes += UInt64(rc)
+                                } else {
+                                    sendErrors += 1
+                                }
+                            }
                         }
                     }
                 }
             }
-        }
 
-        while offset < frame.count {
-            let n = min(maxVideoFragmentPayload, frame.count - offset)
-            if useFec {
-                parityLen = max(parityLen, n)
-                frame.withUnsafeBytes { raw in
-                    guard let src = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+            while offset < frame.count {
+                let n = min(maxVideoFragmentPayload, frame.count - offset)
+                if useFec {
+                    parityLen = max(parityLen, n)
+                    guard let src = frameRaw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
                     parity.withUnsafeMutableBytes { parityRaw in
                         guard let dst = parityRaw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
                         for i in 0..<n { dst[i] ^= src[offset + i] }
                     }
                 }
+                var flags: UInt16 = 0
+                if keyframe { flags |= p2FlagKeyframe }
+                if configIncluded { flags |= p2FlagConfig }
+                sendPacket(fragIndex: fragIndex, totalFragCount: totalFragCount, payload: UnsafeRawBufferPointer(rebasing: frameRaw[offset..<(offset + n)]), flags: flags)
+                offset += n
+                fragIndex &+= 1
             }
-            var flags: UInt16 = 0
-            if keyframe { flags |= p2FlagKeyframe }
-            if configIncluded { flags |= p2FlagConfig }
-            let payload = frame.subdata(in: offset..<(offset + n))
-            sendPacket(fragIndex: fragIndex, totalFragCount: totalFragCount, payload: payload, flags: flags)
-            offset += n
-            fragIndex &+= 1
-        }
 
-        if useFec && parityLen > 0 {
-            var flags: UInt16 = p2FlagFec
-            if keyframe { flags |= p2FlagKeyframe }
-            if configIncluded { flags |= p2FlagConfig }
-            sendPacket(fragIndex: fragIndex, totalFragCount: totalFragCount, payload: Data(parity.prefix(parityLen)), flags: flags)
+            if useFec && parityLen > 0 {
+                var flags: UInt16 = p2FlagFec
+                if keyframe { flags |= p2FlagKeyframe }
+                if configIncluded { flags |= p2FlagConfig }
+                parity.withUnsafeBytes { parityRaw in
+                    sendPacket(fragIndex: fragIndex, totalFragCount: totalFragCount, payload: UnsafeRawBufferPointer(rebasing: parityRaw[0..<parityLen]), flags: flags)
+                }
+            }
         }
 
         NativeStats.shared.recordFrame(frameId: id, packets: sentPackets, bytes: sentBytes, errors: sendErrors, ptsUs: ptsUs)

@@ -453,12 +453,12 @@ function scaleResolution(width, height, maxLongEdge = 1920) {
 
 function autoBitrateForPixels(pixels, fallbackBitrate) {
   let bitrate = fallbackBitrate;
-  if (pixels <= 1280 * 720) bitrate = Math.max(bitrate, 6_000_000);
-  else if (pixels <= 1600 * 900) bitrate = Math.max(bitrate, 8_000_000);
-  else if (pixels <= 1920 * 1080) bitrate = Math.max(bitrate, 12_000_000);
-  else if (pixels <= 1920 * 1200) bitrate = Math.max(bitrate, 14_000_000);
-  else if (pixels <= 2560 * 1440) bitrate = Math.max(bitrate, 20_000_000);
-  else bitrate = Math.max(bitrate, 28_000_000);
+  if (pixels <= 1280 * 720) bitrate = Math.max(bitrate, 12_000_000);
+  else if (pixels <= 1600 * 900) bitrate = Math.max(bitrate, 18_000_000);
+  else if (pixels <= 1920 * 1080) bitrate = Math.max(bitrate, 30_000_000);
+  else if (pixels <= 1920 * 1200) bitrate = Math.max(bitrate, 34_000_000);
+  else if (pixels <= 2560 * 1440) bitrate = Math.max(bitrate, 50_000_000);
+  else bitrate = Math.max(bitrate, 80_000_000);
   return bitrate;
 }
 
@@ -490,22 +490,22 @@ function nativeV2FpsOptions(device) {
 
 function nativeV2DisplayOptions(device) {
   const defaults = nativeV2Status?.defaults || {};
-  const displayPixels = remoteDisplayPixelSize(device);
+  const displayPixels = localDisplayPixelSize() || remoteDisplayPixelSize(device);
   if (!displayPixels?.width || !displayPixels?.height) {
-    const width = clampEven(defaults.width || 1600, 1600);
-    const height = clampEven(defaults.height || 900, 900);
+    const width = clampEven(defaults.width || 1920, 1920);
+    const height = clampEven(defaults.height || 1080, 1080);
     return {
       width,
       height,
-      bitrate: autoBitrateForPixels(width * height, defaults.bitrate || 8_000_000),
+      bitrate: autoBitrateForPixels(width * height, defaults.bitrate || 30_000_000),
     };
   }
 
-  const sourceWidth = clampEven(displayPixels.width, defaults.width || 1600);
-  const sourceHeight = clampEven(displayPixels.height, defaults.height || 900);
-  const scaled = scaleResolution(sourceWidth, sourceHeight);
+  const sourceWidth = clampEven(displayPixels.width, defaults.width || 1920);
+  const sourceHeight = clampEven(displayPixels.height, defaults.height || 1080);
+  const scaled = scaleResolution(sourceWidth, sourceHeight, 2560);
   const pixels = scaled.width * scaled.height;
-  const bitrate = autoBitrateForPixels(pixels, defaults.bitrate || 8_000_000);
+  const bitrate = autoBitrateForPixels(pixels, defaults.bitrate || 30_000_000);
 
   return {
     width: scaled.width,
