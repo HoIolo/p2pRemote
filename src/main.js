@@ -433,7 +433,7 @@ function normalizeMoonlightChoice(value, allowed, fallback) {
 
 function gameStreamOptions(options = {}) {
   return {
-    appName: String(options.appName || GAME_STREAM_DEFAULTS.appName),
+    appName: normalizeGameStreamAppName(options.appName),
     width: normalizeGameStreamNumber(options.width, GAME_STREAM_DEFAULTS.width, 640, 7680),
     height: normalizeGameStreamNumber(options.height, GAME_STREAM_DEFAULTS.height, 360, 4320),
     fps: normalizeGameStreamNumber(options.fps, GAME_STREAM_DEFAULTS.fps, 30, 240),
@@ -448,6 +448,11 @@ function gameStreamOptions(options = {}) {
     performanceOverlay: options.performanceOverlay !== false,
     quitAfter: options.quitAfter === true,
   };
+}
+
+function normalizeGameStreamAppName(value, fallback = GAME_STREAM_DEFAULTS.appName) {
+  const text = String(value || fallback).trim();
+  return text || fallback;
 }
 
 function gameStreamSunshineStatePath() {
@@ -479,9 +484,37 @@ function ensureGameStreamSunshineFiles() {
   const configPath = gameStreamSunshineConfigPath();
   const statePath = gameStreamSunshineStatePath();
   const credentialsPath = gameStreamSunshineCredentialsPathForConfig();
-  if (!fs.existsSync(appsPath)) {
-    fs.writeFileSync(appsPath, `${JSON.stringify({ apps: [{ name: GAME_STREAM_DEFAULTS.appName, 'image-path': 'desktop.png' }] }, null, 2)}\n`);
+  let appsConfig = null;
+  let appsRewritten = false;
+
+  if (fs.existsSync(appsPath)) {
+    try {
+      appsConfig = JSON.parse(fs.readFileSync(appsPath, 'utf8'));
+    } catch {
+      appsConfig = null;
+    }
   }
+
+  if (!appsConfig || typeof appsConfig !== 'object' || Array.isArray(appsConfig)) {
+    appsConfig = { env: {}, apps: [] };
+    appsRewritten = true;
+  }
+  if (!appsConfig.env || typeof appsConfig.env !== 'object' || Array.isArray(appsConfig.env)) {
+    appsConfig.env = {};
+    appsRewritten = true;
+  }
+  if (!Array.isArray(appsConfig.apps)) {
+    appsConfig.apps = [];
+    appsRewritten = true;
+  }
+  if (gameStreamSunshineDesktopAppMissing(appsConfig.apps, GAME_STREAM_DEFAULTS.appName)) {
+    appsConfig.apps.push(gameStreamDesktopAppFileDefinition(GAME_STREAM_DEFAULTS.appName));
+    appsRewritten = true;
+  }
+  if (appsRewritten) {
+    fs.writeFileSync(appsPath, `${JSON.stringify(appsConfig, null, 2)}\n`);
+  }
+
   const lines = [
     'sunshine_name = P2P Remote LAN Game Stream',
     'min_log_level = info',
@@ -497,7 +530,7 @@ function ensureGameStreamSunshineFiles() {
     '',
   ];
   fs.writeFileSync(configPath, lines.join('\n'));
-  return { dataDir, appsPath, configPath, statePath, credentialsPath };
+  return { dataDir, appsPath, configPath, statePath, credentialsPath, appsRewritten };
 }
 
 function canSpawnShellCommand(candidate) {
@@ -564,21 +597,29 @@ function gameStreamSunshineAppName(app) {
   return String(app?.name || app?.AppTitle || app?.title || '').trim();
 }
 
-function gameStreamSunshineDesktopAppMissing(apps, appName) {
-  const expected = String(appName || GAME_STREAM_DEFAULTS.appName).trim();
-  return !apps.some((app) => gameStreamSunshineAppName(app) === expected);
+function gameStreamSunshineFindApp(apps, appName) {
+  const expected = normalizeGameStreamAppName(appName).toLowerCase();
+  const index = apps.findIndex((app) => gameStreamSunshineAppName(app).toLowerCase() === expected);
+  if (index < 0) return null;
+  return {
+    app: apps[index],
+    index,
+    appName: gameStreamSunshineAppName(apps[index]) || normalizeGameStreamAppName(appName),
+  };
 }
 
+function gameStreamSunshineDesktopAppMissing(apps, appName) {
+  return !gameStreamSunshineFindApp(apps, appName);
+}
 
 function isSunshineClientCertificateRequiredError(err) {
   const text = [err?.message, err?.code, err?.response?.text].filter(Boolean).join(' ').toLowerCase();
   return text.includes('certificate required') || text.includes('tlsv1_alert_certificate_required') || text.includes('alert number 116');
 }
 
-
-function gameStreamDesktopAppDefinition() {
+function gameStreamDesktopAppDefinition(appName = GAME_STREAM_DEFAULTS.appName) {
   return {
-    name: GAME_STREAM_DEFAULTS.appName,
+    name: normalizeGameStreamAppName(appName),
     output: '',
     cmd: '',
     index: -1,
@@ -593,11 +634,34 @@ function gameStreamDesktopAppDefinition() {
   };
 }
 
+function gameStreamDesktopAppFileDefinition(appName = GAME_STREAM_DEFAULTS.appName) {
+  const app = gameStreamDesktopAppDefinition(appName);
+  delete app.index;
+  return app;
+}
+
+function gameStreamSunshineAppPayload(app, index, appName = GAME_STREAM_DEFAULTS.appName) {
+  const payload = {
+    ...(app && typeof app === 'object' ? app : {}),
+    name: normalizeGameStreamAppName(app?.name || app?.AppTitle || app?.title || appName),
+    index,
+  };
+  if (!Array.isArray(payload['prep-cmd'])) {
+    payload['prep-cmd'] = [];
+  }
+  if (!Array.isArray(payload.detached)) {
+    payload.detached = [];
+  }
+  return payload;
+}
+
 async function ensureSunshineDesktopApp(host, options = {}) {
-  const appName = String(options.appName || GAME_STREAM_DEFAULTS.appName).trim() || GAME_STREAM_DEFAULTS.appName;
+  const appName = normalizeGameStreamAppName(options.appName);
   const timeoutMs = normalizeGameStreamNumber(options.timeoutMs, 5_000, 1_000, 30_000);
   const deadline = Date.now() + timeoutMs;
+  const forceRefresh = options.forceRefresh === true;
   let created = false;
+  let refreshed = false;
 
   await ensureSunshineWebCredentials(host);
   while (Date.now() < deadline) {
@@ -606,20 +670,35 @@ async function ensureSunshineDesktopApp(host, options = {}) {
       password: GAME_STREAM_WEB_PASSWORD,
     });
     const apps = gameStreamSunshineAppsFromResponse(response.json);
-    if (!gameStreamSunshineDesktopAppMissing(apps, appName)) {
-      return { ready: true, created, appName, appsCount: apps.length };
+    const existing = gameStreamSunshineFindApp(apps, appName);
+    if (existing) {
+      if (forceRefresh && !refreshed) {
+        const saveResponse = await gameStreamApiRequest(host, '/api/apps', {
+          method: 'POST',
+          username: GAME_STREAM_WEB_USERNAME,
+          password: GAME_STREAM_WEB_PASSWORD,
+          body: gameStreamSunshineAppPayload(existing.app, existing.index, appName),
+        });
+        if (saveResponse.json && saveResponse.json.status === false) {
+          throw new Error(saveResponse.json.error || 'Sunshine rejected the Desktop application refresh');
+        }
+        refreshed = true;
+        continue;
+      }
+      return { ready: true, created, refreshed, appName: existing.appName, appsCount: apps.length };
     }
     if (!created) {
       const saveResponse = await gameStreamApiRequest(host, '/api/apps', {
         method: 'POST',
         username: GAME_STREAM_WEB_USERNAME,
         password: GAME_STREAM_WEB_PASSWORD,
-        body: gameStreamDesktopAppDefinition(),
+        body: gameStreamDesktopAppDefinition(appName),
       });
       if (saveResponse.json && saveResponse.json.status === false) {
         throw new Error(saveResponse.json.error || 'Sunshine rejected the default Desktop application');
       }
       created = true;
+      refreshed = true;
       continue;
     }
     await gameStreamDelay(250);
@@ -830,8 +909,9 @@ async function startGameStreamHost(options = {}) {
     throw new Error('未找到 Sunshine。请安装 Sunshine，或把 sunshine 加入 PATH。下载地址：https://github.com/LizardByte/Sunshine/releases/latest');
   }
   const webUrl = options.webHost ? `https://${options.webHost}:47990/` : 'https://localhost:47990/';
+  const files = ensureGameStreamSunshineFiles();
   if (gameStreamHostProcess && !gameStreamHostProcess.killed) {
-    const desktopApp = await ensureSunshineDesktopApp('localhost');
+    const desktopApp = await ensureSunshineDesktopApp('localhost', { forceRefresh: files.appsRewritten });
     broadcastGameStreamStatus();
     return {
       ok: true,
@@ -843,7 +923,6 @@ async function startGameStreamHost(options = {}) {
     };
   }
 
-  const files = ensureGameStreamSunshineFiles();
   const proc = spawnManagedProcess(exePath, [files.configPath], { cwd: files.dataDir });
   gameStreamHostProcess = proc;
   attachGameStreamProcess('host', proc);
@@ -854,7 +933,7 @@ async function startGameStreamHost(options = {}) {
   if (!ready) {
     throw new Error('Sunshine 已启动但 Web/API 端口 47990 未及时就绪。请检查 Sunshine 权限、防火墙或端口占用。');
   }
-  const desktopApp = await ensureSunshineDesktopApp('localhost');
+  const desktopApp = await ensureSunshineDesktopApp('localhost', { forceRefresh: files.appsRewritten });
   return {
     ok: true,
     pid: proc.pid,
