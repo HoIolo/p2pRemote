@@ -74,8 +74,8 @@ struct NativeHostConfig {
     var width: Int = 1920
     var height: Int = 1080
     var fps: Int = 60
-    var bitrate: Int = 14_000_000
-    var keyframeSeconds: Int = 1
+    var bitrate: Int = 20_000_000
+    var keyframeSeconds: Int = 2
     var transport: String = "udp"
 
     static func parse() -> NativeHostConfig {

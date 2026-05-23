@@ -4,7 +4,7 @@ CLIENT_IP="${CLIENT_IP:-192.168.1.50}"
 WIDTH="${WIDTH:-1600}"
 HEIGHT="${HEIGHT:-900}"
 FPS="${FPS:-60}"
-BITRATE="${BITRATE:-10000000}"
+BITRATE="${BITRATE:-20000000}"
 VIDEO_PORT="${VIDEO_PORT:-45000}"
 INPUT_PORT="${INPUT_PORT:-45001}"
 TRANSPORT="${TRANSPORT:-udp}"
@@ -25,5 +25,5 @@ exec "$BIN" \
   --height "$HEIGHT" \
   --fps "$FPS" \
   --bitrate "$BITRATE" \
-  --keyint 1 \
+  --keyint 2 \
   --transport "$TRANSPORT"
