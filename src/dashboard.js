@@ -161,8 +161,11 @@ function friendlyGameStreamError(err) {
   if (raw.includes('has not been paired') || raw.includes('not been paired')) {
     return 'Moonlight 尚未与 Sunshine 配对。点击“配对”，系统会自动生成 PIN 并提交到 Mac Sunshine。';
   }
-  if (raw.includes('Failed to find application') || raw.includes('Desktop app was not ready') || raw.includes('default Desktop application') || raw.includes('GameStream app list does not expose')) {
-    return 'Sunshine Web UI 里能看到 Desktop，但 GameStream 应用列表还没有暴露它。请从本 App 点“启动 Host/游戏模式”让它自动刷新；如果仍失败，完全退出旧 Sunshine 后再启动本 App。';
+  if (raw.includes('Failed to find application') || raw.includes('Desktop app was not ready') || raw.includes('default Desktop application')) {
+    return 'Sunshine 的应用列表还没准备好 Desktop。请先重新启动 Mac 端 Sunshine，再点一次“游戏模式”或“配对”。';
+  }
+  if (raw.includes('certificate required') || raw.includes('TLSV1_ALERT_CERTIFICATE_REQUIRED') || raw.includes('alert number 116')) {
+    return 'Sunshine 的 GameStream 端口要求 Moonlight 客户端证书。本程序已不再直接访问该端口；请确认 Mac 端也已重启到最新版本后重试。';
   }
   if (raw.includes('Moonlight 的配对请求') || raw.includes('pairing PIN')) {
     return 'Sunshine 还没收到 Moonlight 的配对请求。请确认 Mac 端 Sunshine 已启动后再点一次“配对”。';
@@ -731,17 +734,15 @@ async function openGameStreamDevice(device) {
         return;
       }
       if (device.pin && device.port) {
-        setGameStreamStatusText(`正在请求 Mac 启动 Sunshine Host 并刷新应用列表：${device.address}:${device.port}`);
+        setGameStreamStatusText(`正在请求 Mac 启动 Sunshine Host：${device.address}:${device.port}`);
         const hostResult = await window.lanRemote.requestGameStreamRemoteHost(device, {
           ...gameStreamRemoteHostOptions(device),
-          ...gameStreamClientOptions(device),
-          appListTimeoutMs: 15_000,
           requestTimeoutMs: 20_000,
         });
-        if (hostResult?.gameStreamApp?.skipped) {
-          log(`Mac Sunshine requires Moonlight client certificate for app-list preflight; continuing with Moonlight launch: ${device.address}`);
+        if (hostResult?.skipped) {
+          log(`Mac Sunshine host start returned non-blocking warning: ${hostResult.reason || 'unknown'}`);
         } else {
-          log(`Mac Sunshine host exposed Desktop app for Moonlight: ${device.address}`);
+          log(`Mac Sunshine host accepted start request: ${device.address}`);
         }
       } else {
         log('manual game-stream: 请确认 Mac 端 Sunshine 已启动，并完成 Moonlight 配对。');

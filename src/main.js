@@ -42,7 +42,6 @@ const NATIVE_V2_REMOTE_HOST_TIMEOUT_MS = 15_000;
 const GAME_STREAM_HOST_READY_TIMEOUT_MS = 12_000;
 const GAME_STREAM_REMOTE_HOST_TIMEOUT_MS = 15_000;
 const GAME_STREAM_API_TIMEOUT_MS = 8_000;
-const GAME_STREAM_NVHTTP_PORT = 47984;
 const GAME_STREAM_PAIR_PIN_DELAY_MS = 1_200;
 const GAME_STREAM_WEB_USERNAME = 'p2p-remote-lan';
 const GAME_STREAM_WEB_PASSWORD = 'p2p-remote-lan-local';
@@ -570,94 +569,12 @@ function gameStreamSunshineDesktopAppMissing(apps, appName) {
   return !apps.some((app) => gameStreamSunshineAppName(app) === expected);
 }
 
-function gameStreamApiPathWithQuery(requestPath, params) {
-  const query = new URLSearchParams();
-  for (const [key, value] of Object.entries(params || {})) {
-    if (value === undefined || value === null || value === '') continue;
-    query.set(key, String(value));
-  }
-  const text = query.toString();
-  return text ? `${requestPath}?${text}` : requestPath;
-}
-
-async function gameStreamNvHttpRequest(host, requestPath, options = {}) {
-  const port = options.port || GAME_STREAM_NVHTTP_PORT;
-  return new Promise((resolve, reject) => {
-    const req = https.request({
-      host,
-      port,
-      method: options.method || 'GET',
-      path: requestPath,
-      rejectUnauthorized: false,
-      timeout: options.timeoutMs || GAME_STREAM_API_TIMEOUT_MS,
-    }, (res) => {
-      const chunks = [];
-      res.on('data', (chunk) => chunks.push(chunk));
-      res.on('end', () => {
-        const text = Buffer.concat(chunks).toString('utf8');
-        if (res.statusCode >= 200 && res.statusCode < 300) {
-          resolve({ statusCode: res.statusCode, headers: res.headers, text });
-          return;
-        }
-        const err = new Error(text || `HTTP ${res.statusCode}`);
-        err.statusCode = res.statusCode;
-        err.response = { text };
-        reject(err);
-      });
-    });
-    req.on('timeout', () => req.destroy(new Error(`Sunshine GameStream request timed out: ${host}:${port}${requestPath}`)));
-    req.on('error', reject);
-    req.end();
-  });
-}
 
 function isSunshineClientCertificateRequiredError(err) {
   const text = [err?.message, err?.code, err?.response?.text].filter(Boolean).join(' ').toLowerCase();
   return text.includes('certificate required') || text.includes('tlsv1_alert_certificate_required') || text.includes('alert number 116');
 }
 
-function gameStreamNvHttpAppNames(xml) {
-  const apps = [];
-  const re = /<AppTitle>(?:<!\[CDATA\[([\s\S]*?)\]\]>|([^<]*))<\/AppTitle>/gi;
-  let match;
-  while ((match = re.exec(String(xml || ''))) !== null) {
-    apps.push(String(match[1] ?? match[2] ?? '').trim());
-  }
-  return apps;
-}
-
-async function waitForSunshineGameStreamApp(host, appName, options = {}) {
-  const expected = String(appName || GAME_STREAM_DEFAULTS.appName).trim();
-  const timeoutMs = normalizeGameStreamNumber(options.timeoutMs, 10_000, 1_000, 60_000);
-  const retryDelayMs = normalizeGameStreamNumber(options.retryDelayMs, 500, 100, 5_000);
-  const deadline = Date.now() + timeoutMs;
-  let lastApps = [];
-
-  try {
-    while (Date.now() < deadline) {
-      const response = await gameStreamNvHttpRequest(host, gameStreamApiPathWithQuery('/applist', { uniqueid: 0 }));
-      lastApps = gameStreamNvHttpAppNames(response.text);
-      if (lastApps.some((name) => name === expected)) {
-        return { ready: true, appName: expected, apps: lastApps };
-      }
-      await gameStreamDelay(retryDelayMs);
-    }
-  } catch (err) {
-    if (isSunshineClientCertificateRequiredError(err)) {
-      return {
-        ready: false,
-        skipped: true,
-        reason: 'sunshine-client-certificate-required',
-        appName: expected,
-        apps: lastApps,
-        message: err?.message || 'Sunshine requires a paired Moonlight client certificate for /applist',
-      };
-    }
-    throw err;
-  }
-
-  throw new Error(`Sunshine GameStream app list does not expose ${expected}; visible apps: ${lastApps.join(', ') || '(none)'}`);
-}
 
 function gameStreamDesktopAppDefinition() {
   return {
@@ -915,7 +832,6 @@ async function startGameStreamHost(options = {}) {
   const webUrl = options.webHost ? `https://${options.webHost}:47990/` : 'https://localhost:47990/';
   if (gameStreamHostProcess && !gameStreamHostProcess.killed) {
     const desktopApp = await ensureSunshineDesktopApp('localhost');
-    const gameStreamApp = await waitForSunshineGameStreamApp('localhost', desktopApp.appName);
     broadcastGameStreamStatus();
     return {
       ok: true,
@@ -924,7 +840,6 @@ async function startGameStreamHost(options = {}) {
       exePath,
       webUrl,
       desktopApp,
-      gameStreamApp,
     };
   }
 
@@ -940,7 +855,6 @@ async function startGameStreamHost(options = {}) {
     throw new Error('Sunshine 已启动但 Web/API 端口 47990 未及时就绪。请检查 Sunshine 权限、防火墙或端口占用。');
   }
   const desktopApp = await ensureSunshineDesktopApp('localhost');
-  const gameStreamApp = await waitForSunshineGameStreamApp('localhost', desktopApp.appName);
   return {
     ok: true,
     pid: proc.pid,
@@ -951,19 +865,9 @@ async function startGameStreamHost(options = {}) {
     credentialsPath: files.credentialsPath,
     webUrl,
     desktopApp,
-    gameStreamApp,
   };
 }
 
-async function ensureRemoteSunshineGameStreamApp(device, options = {}) {
-  const result = await requestGameStreamRemoteHost(device, options);
-  const host = String(device.address);
-  const appName = String(options.appName || GAME_STREAM_DEFAULTS.appName);
-  const gameStreamApp = await waitForSunshineGameStreamApp(host, appName, {
-    timeoutMs: normalizeGameStreamNumber(options.appListTimeoutMs, 10_000, 1_000, 60_000),
-  });
-  return { ...result, gameStreamApp };
-}
 
 function moonlightStreamArgs(hostIp, options = {}) {
   const normalized = gameStreamOptions(options);
@@ -1057,7 +961,7 @@ function requestGameStreamRemoteHost(device, options = {}) {
       else resolve(result);
     };
     const requestTimeoutMs = normalizeGameStreamNumber(
-      options.requestTimeoutMs || options.appListTimeoutMs,
+      options.requestTimeoutMs,
       GAME_STREAM_REMOTE_HOST_TIMEOUT_MS,
       1000,
       60_000,
@@ -1087,6 +991,15 @@ function requestGameStreamRemoteHost(device, options = {}) {
         return;
       }
       if (message.type === 'game-stream-host-error' && message.requestId === requestId) {
+        if (isSunshineClientCertificateRequiredError({ message: message.error })) {
+          finish(null, {
+            ok: true,
+            skipped: true,
+            reason: 'remote-sunshine-client-certificate-required',
+            warning: message.error,
+          });
+          return;
+        }
         finish(new Error(message.error || 'Game stream remote host failed'));
         return;
       }
@@ -2049,11 +1962,7 @@ ipcMain.handle('game-stream-pair-client', (_event, options) => pairGameStreamCli
 ipcMain.handle('game-stream-submit-pair-pin', (_event, options) => submitSunshinePairPin(options));
 
 ipcMain.handle('game-stream-request-remote-host', (_event, payload = {}) => {
-  const options = payload.options || {};
-  if (options.appName || options.ensureAppList) {
-    return ensureRemoteSunshineGameStreamApp(payload.device, options);
-  }
-  return requestGameStreamRemoteHost(payload.device, options);
+  return requestGameStreamRemoteHost(payload.device, payload.options || {});
 });
 
 ipcMain.handle('game-stream-open-sunshine', (_event, host) => {
