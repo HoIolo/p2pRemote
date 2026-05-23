@@ -123,31 +123,74 @@ final class InputReceiver {
         // Low-latency cursor model: never replay a backlog of stale mouse moves.
         // Keep only the newest consecutive move packet, but flush it before any
         // click, wheel, keyboard, or control packet so event ordering remains
-        // correct. This is the same "drop old pointer samples, keep current
-        // state" strategy used by low-latency desktop/game streamers.
+        // correct. Wheel events are coalesced only while they target the same
+        // point, because the packet position decides which window/pane scrolls.
         var pendingMove: [UInt8]? = nil
+        var pendingWheelDx: Int64 = 0
+        var pendingWheelDy: Int64 = 0
+        var pendingWheelX: Float = 0
+        var pendingWheelY: Float = 0
+        var pendingWheel = false
+        let wheelBatchLimit: Int64 = 60_000
+
+        func clampedWheelSum(_ current: Int64, _ delta: Int32) -> Int64 {
+            let next = current + Int64(delta)
+            return max(-wheelBatchLimit, min(wheelBatchLimit, next))
+        }
+
+        func flushWheel() {
+            guard pendingWheel else { return }
+            let wheelPoint = point(x: pendingWheelX, y: pendingWheelY)
+            postMouse(type: dragAwareMoveType(), point: wheelPoint, button: dragButton())
+            postWheel(dx: pendingWheelDx, dy: pendingWheelDy)
+            pendingWheel = false
+            pendingWheelDx = 0
+            pendingWheelDy = 0
+        }
+
+        func flushMove() {
+            if let move = pendingMove {
+                handle(move)
+                pendingMove = nil
+            }
+        }
+
         for packet in packets {
             guard let kind = packetKind(packet) else { continue }
             if kind == 1 {
+                flushWheel()
                 pendingMove = packet
+                continue
+            }
+            if kind == 4 {
+                flushMove()
+                let wheelX = readFloatLE(packet, 12)
+                let wheelY = readFloatLE(packet, 16)
+                if pendingWheel && (wheelX != pendingWheelX || wheelY != pendingWheelY) {
+                    flushWheel()
+                }
+                pendingWheelX = wheelX
+                pendingWheelY = wheelY
+                pendingWheelDx = clampedWheelSum(pendingWheelDx, readI32LE(packet, 20))
+                pendingWheelDy = clampedWheelSum(pendingWheelDy, readI32LE(packet, 24))
+                pendingWheel = true
                 continue
             }
             if kind == p2InputHeartbeat {
                 continue
             }
             if kind == p2InputRequestKeyframe || kind == p2InputSetVideoProfile || kind == p2InputSetVideoBitrate {
+                flushWheel()
+                flushMove()
                 handle(packet)
                 continue
             }
-            if let move = pendingMove {
-                handle(move)
-                pendingMove = nil
-            }
+            flushWheel()
+            flushMove()
             handle(packet)
         }
-        if let move = pendingMove {
-            handle(move)
-        }
+        flushWheel()
+        flushMove()
     }
 
     private func point(x: Float, y: Float) -> CGPoint {
@@ -183,7 +226,7 @@ final class InputReceiver {
             downButtons.remove(button)
         case 4:
             postMouse(type: dragAwareMoveType(), point: p, button: dragButton())
-            postWheel(dx: dx, dy: dy)
+            postWheel(dx: Int64(dx), dy: Int64(dy))
         case 5:
             postKey(code: keyCode, down: true)
         case 6:
@@ -249,11 +292,19 @@ final class InputReceiver {
         event.post(tap: .cghidEventTap)
     }
 
-    private func postWheel(dx: Int32, dy: Int32) {
-        let wheelX = Int32(max(-5000, min(5000, -dx)))
-        let wheelY = Int32(max(-5000, min(5000, -dy)))
-        guard let event = CGEvent(scrollWheelEvent2Source: eventSource, units: .pixel, wheelCount: 2, wheel1: wheelY, wheel2: wheelX, wheel3: 0) else { return }
-        event.post(tap: .cghidEventTap)
+    private func postWheel(dx: Int64, dy: Int64) {
+        var remainingX = max(-60_000, min(60_000, dx))
+        var remainingY = max(-60_000, min(60_000, dy))
+        while remainingX != 0 || remainingY != 0 {
+            let stepX = max(-5_000, min(5_000, remainingX))
+            let stepY = max(-5_000, min(5_000, remainingY))
+            let wheelX = Int32(-stepX)
+            let wheelY = Int32(-stepY)
+            guard let event = CGEvent(scrollWheelEvent2Source: eventSource, units: .pixel, wheelCount: 2, wheel1: wheelY, wheel2: wheelX, wheel3: 0) else { return }
+            event.post(tap: .cghidEventTap)
+            remainingX -= stepX
+            remainingY -= stepY
+        }
     }
 
     private func postKey(code: CGKeyCode, down: Bool) {

@@ -8,15 +8,23 @@ import AppKit
 @available(macOS 13.0, *)
 final class ScreenCaptureOutput: NSObject, SCStreamOutput {
     private let encoder: H264LowLatencyEncoder
+    private let shouldEncodeFrame: () -> Bool
     private var frames = 0
     private let started = nowUs()
     private var lastKeyframe = nowUs()
     private let firstFrameCallback: () -> Void
     private var reportedFirstFrame = false
     private var reportedMissingImageBuffer = false
+    private var skippedForBackpressure: UInt64 = 0
+    private var lastBackpressureLog = nowUs()
 
-    init(encoder: H264LowLatencyEncoder, firstFrameCallback: @escaping () -> Void = {}) {
+    init(
+        encoder: H264LowLatencyEncoder,
+        shouldEncodeFrame: @escaping () -> Bool = { true },
+        firstFrameCallback: @escaping () -> Void = {}
+    ) {
         self.encoder = encoder
+        self.shouldEncodeFrame = shouldEncodeFrame
         self.firstFrameCallback = firstFrameCallback
     }
 
@@ -35,7 +43,30 @@ final class ScreenCaptureOutput: NSObject, SCStreamOutput {
             }
             return
         }
-        if !reportedFirstFrame {
+        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
+        let now = nowUs()
+        let isFirstFrameForStream = !reportedFirstFrame
+        let forceKeyframe = isFirstFrameForStream || now - lastKeyframe >= 1_000_000
+
+        // Do not let high-motion scroll bursts build an encode/send backlog.
+        // If the UDP sender already has a newer frame queued while it is still
+        // transmitting the previous one, encoding more stale frames only burns
+        // VideoToolbox/GPU time and makes interaction feel delayed.  Keep one
+        // queued frame at most; the next ScreenCaptureKit sample will refresh it.
+        // Never skip the first sample of a stream: startup/reconfigure readiness
+        // and decoder recovery both depend on a real encoded frame, not a dropped
+        // sample that merely arrived from ScreenCaptureKit.
+        if !isFirstFrameForStream && !shouldEncodeFrame() {
+            skippedForBackpressure &+= 1
+            if now - lastBackpressureLog >= 1_000_000 {
+                logLine("[capture] skipped stale frames for sender backpressure: \(skippedForBackpressure)")
+                skippedForBackpressure = 0
+                lastBackpressureLog = now
+            }
+            return
+        }
+
+        if isFirstFrameForStream {
             reportedFirstFrame = true
             let width = CVPixelBufferGetWidth(pixelBuffer)
             let height = CVPixelBufferGetHeight(pixelBuffer)
@@ -53,9 +84,7 @@ final class ScreenCaptureOutput: NSObject, SCStreamOutput {
             logLine("[capture] first frame \(width)x\(height) nonZeroInFirst4K=\(nonZeroBytes)")
             firstFrameCallback()
         }
-        let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
-        let now = nowUs()
-        let forceKeyframe = frames == 0 || now - lastKeyframe >= 1_000_000
+
         if forceKeyframe { lastKeyframe = now }
         encoder.encode(pixelBuffer, pts: pts, forceKeyframe: forceKeyframe)
         frames += 1
@@ -157,7 +186,10 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
         streamCfg.width = cfg.width
         streamCfg.height = cfg.height
         streamCfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(cfg.fps))
-        streamCfg.queueDepth = 3
+        // Low-latency remote control should prefer the newest screen sample.
+        // A deeper ScreenCaptureKit queue improves throughput, but it also
+        // keeps old scroll frames alive and shows them late.
+        streamCfg.queueDepth = 1
         // Keep cursor out of the encoded video.  The Windows client shows the
         // local OS cursor immediately, which avoids the "two cursors" effect and
         // removes one-frame+ encode/network/decode latency from pointer motion.

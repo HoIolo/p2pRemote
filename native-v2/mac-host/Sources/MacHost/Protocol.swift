@@ -149,8 +149,22 @@ final class UdpVideoSender {
     private var frameId: UInt64 = 1
     private let frameLock = NSLock()
     private let paceLock = NSLock()
+    private let pendingCondition = NSCondition()
+    private let sendQueue = DispatchQueue(label: "p2p.native.udp-video.send", qos: .userInteractive)
     private let fps: Int
     private var targetBitrateBps: Int
+    private var pendingFrame: QueuedFrame?
+    private var sendLoopActive = false
+    private var nextPacketDueUs: UInt64 = 0
+    private var nextFrameIdToQueue: UInt64 = 1
+
+    private struct QueuedFrame {
+        let id: UInt64
+        let frame: Data
+        let keyframe: Bool
+        let configIncluded: Bool
+        let ptsUs: UInt64
+    }
 
     init(clientIP: String, port: UInt16, fps: Int, bitrate: Int) throws {
         fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
@@ -160,7 +174,10 @@ final class UdpVideoSender {
 
         var one: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-        var sndbuf: Int32 = 4 * 1024 * 1024
+        // Keep the kernel queue short.  A multi-megabyte UDP send buffer can
+        // hide >1s of stale video during scroll/high-motion bursts.  Low-latency
+        // streaming should drop old frames in user space, not buffer them.
+        var sndbuf: Int32 = 512 * 1024
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, socklen_t(MemoryLayout<Int32>.size))
         var tos: Int32 = 0x10 // IPTOS_LOWDELAY
         setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, socklen_t(MemoryLayout<Int32>.size))
@@ -180,12 +197,95 @@ final class UdpVideoSender {
         paceLock.unlock()
     }
 
+    func hasQueuedFrameForSend() -> Bool {
+        pendingCondition.lock()
+        let queued = pendingFrame != nil
+        pendingCondition.unlock()
+        return queued
+    }
+
     func sendFrame(_ frame: Data, keyframe: Bool, configIncluded: Bool, ptsUs: UInt64) {
         if frame.isEmpty { return }
         frameLock.lock()
         let id = frameId
         frameId &+= 1
         frameLock.unlock()
+
+        let item = QueuedFrame(id: id, frame: frame, keyframe: keyframe, configIncluded: configIncluded, ptsUs: ptsUs)
+        var shouldStart = false
+        pendingCondition.lock()
+        // Encoded H.264 P-frames may reference prior encoded frames. Dropping or
+        // reordering them here can corrupt the decoder until the next IDR, so
+        // sender backpressure waits for the single pending slot and preserves the
+        // encoder callback order by frame id.
+        while pendingFrame != nil || id != nextFrameIdToQueue {
+            pendingCondition.wait()
+        }
+
+        pendingFrame = item
+        nextFrameIdToQueue &+= 1
+        pendingCondition.broadcast()
+        if !sendLoopActive {
+            sendLoopActive = true
+            shouldStart = true
+        }
+        pendingCondition.unlock()
+
+        if shouldStart {
+            sendQueue.async { [weak self] in
+                self?.sendLoop()
+            }
+        }
+    }
+
+    private func takePendingFrame() -> QueuedFrame? {
+        pendingCondition.lock()
+        let item = pendingFrame
+        pendingFrame = nil
+        pendingCondition.broadcast()
+        if item == nil {
+            sendLoopActive = false
+        }
+        pendingCondition.unlock()
+        return item
+    }
+
+    private func currentTargetBitrate() -> Int {
+        paceLock.lock()
+        let bitrate = targetBitrateBps
+        paceLock.unlock()
+        return max(2_000_000, bitrate)
+    }
+
+    private func sendLoop() {
+        while let item = takePendingFrame() {
+            sendFrameNow(item)
+        }
+    }
+
+    private func paceAfterPacket(packetBytes: Int) {
+        let bitrate = currentTargetBitrate()
+        let spacingUs = max(50, UInt64(packetBytes * 8 * 1_000_000 / bitrate))
+        let now = nowUs()
+        if nextPacketDueUs == 0 || nextPacketDueUs + 100_000 < now {
+            nextPacketDueUs = now
+        }
+        nextPacketDueUs &+= spacingUs
+        let afterSend = nowUs()
+        if nextPacketDueUs > afterSend {
+            let delay = min(UInt64(2_000), nextPacketDueUs - afterSend)
+            if delay > 0 {
+                usleep(useconds_t(delay))
+            }
+        }
+    }
+
+    private func sendFrameNow(_ item: QueuedFrame) {
+        let frame = item.frame
+        let id = item.id
+        let keyframe = item.keyframe
+        let configIncluded = item.configIncluded
+        let ptsUs = item.ptsUs
 
         let fragCount = UInt16((frame.count + maxVideoFragmentPayload - 1) / maxVideoFragmentPayload)
         let useFec = fragCount >= 3
@@ -219,6 +319,7 @@ final class UdpVideoSender {
                         if rc >= 0 {
                             sentPackets += 1
                             sentBytes += UInt64(rc)
+                            paceAfterPacket(packetBytes: rc)
                         } else {
                             sendErrors += 1
                         }

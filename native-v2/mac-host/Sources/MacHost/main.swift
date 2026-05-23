@@ -161,9 +161,22 @@ struct MacHostMain {
                 }
             }
             let capturerRef = RefBox<ScreenCapturer?>(nil)
-            let output = ScreenCaptureOutput(encoder: encoder) {
-                capturerRef.value?.markFirstFrame()
-            }
+            let output = ScreenCaptureOutput(
+                encoder: encoder,
+                shouldEncodeFrame: {
+                    // UDP path is latency sensitive: allow at most one encoded
+                    // frame waiting behind the one currently being sent.  This
+                    // mirrors Parsec-style latest-frame-wins behavior during
+                    // scroll/high-motion bursts.  TCP keeps the old behavior.
+                    if let udpVideo {
+                        return !udpVideo.hasQueuedFrameForSend()
+                    }
+                    return true
+                },
+                firstFrameCallback: {
+                    capturerRef.value?.markFirstFrame()
+                }
+            )
             let capturer = ScreenCapturer(cfg: cfg, output: output)
             capturerRef.value = capturer
             let displayBounds = try await capturer.start()
