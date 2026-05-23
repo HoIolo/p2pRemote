@@ -606,7 +606,7 @@ async function ensureSunshineWebCredentials(host) {
     });
     return { ready: true, created: false };
   } catch (err) {
-    if (err.statusCode && err.statusCode !== 401 && err.statusCode !== 302) throw err;
+    if (err.statusCode && err.statusCode !== 401 && (err.statusCode < 300 || err.statusCode >= 400)) throw err;
   }
   await gameStreamApiRequest(host, '/api/password', {
     method: 'POST',
