@@ -48,6 +48,7 @@ const GAME_STREAM_WEB_PASSWORD = 'p2p-remote-lan-local';
 const GAME_STREAM_DOWNLOADS = Object.freeze({
   sunshine: 'https://github.com/LizardByte/Sunshine/releases/latest',
   moonlight: 'https://github.com/moonlight-stream/moonlight-qt/releases/latest',
+  displayplacer: 'https://github.com/jakehilborn/displayplacer/releases/latest',
 });
 const GAME_STREAM_DEFAULTS = Object.freeze({
   appName: 'Desktop',
@@ -562,6 +563,28 @@ function writeGameStreamDisplayHelper() {
   fs.chmodSync(helperPath, 0o755);
   return helperPath;
 }
+
+function runGameStreamDisplayHelper(action, env = {}) {
+  if (process.platform !== 'darwin') return null;
+  const helperPath = gameStreamDisplayHelperPath();
+  if (!fs.existsSync(helperPath)) return null;
+  const child = spawn('/bin/sh', [helperPath, action], {
+    cwd: gameStreamDataDir(),
+    env: { ...process.env, ...env },
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  attachGameStreamProcess(`display-${action}`, child);
+  return child;
+}
+
+function gameStreamDisplayEnvFromOptions(options = {}) {
+  const normalized = gameStreamOptions(options);
+  return {
+    SUNSHINE_CLIENT_WIDTH: String(normalized.width),
+    SUNSHINE_CLIENT_HEIGHT: String(normalized.height),
+    SUNSHINE_CLIENT_FPS: String(normalized.fps),
+  };
+}
 function ensureGameStreamSunshineFiles() {
   const dataDir = gameStreamDataDir();
   fs.mkdirSync(dataDir, { recursive: true });
@@ -710,19 +733,8 @@ function isSunshineClientCertificateRequiredError(err) {
   return text.includes('certificate required') || text.includes('tlsv1_alert_certificate_required') || text.includes('alert number 116');
 }
 
-function gameStreamDisplayHelperCommand(action) {
-  const helper = gameStreamDisplayHelperPath();
-  const script = `if [ -r ${posixShellQuote(helper)} ]; then /bin/sh ${posixShellQuote(helper)} ${action}; fi; exit 0`;
-  return `/bin/sh -c ${posixShellQuote(script)}`;
-}
-
 function gameStreamDesktopPrepCommands() {
-  if (process.platform !== 'darwin') return [];
-  return [{
-    do: gameStreamDisplayHelperCommand('apply'),
-    undo: gameStreamDisplayHelperCommand('restore'),
-    elevated: false,
-  }];
+  return [];
 }
 
 function gameStreamDesktopAppDefinition(appName = GAME_STREAM_DEFAULTS.appName) {
@@ -768,6 +780,13 @@ function gameStreamSunshineAppPayload(app, index, appName = GAME_STREAM_DEFAULTS
   return payload;
 }
 
+function gameStreamDesktopAppNeedsRefresh(app) {
+  if (!app || typeof app !== 'object') return true;
+  if (!Array.isArray(app['prep-cmd']) || app['prep-cmd'].length !== 0) return true;
+  if (!Array.isArray(app.detached)) return true;
+  return false;
+}
+
 async function ensureSunshineDesktopApp(host, options = {}) {
   const appName = normalizeGameStreamAppName(options.appName);
   const timeoutMs = normalizeGameStreamNumber(options.timeoutMs, 5_000, 1_000, 30_000);
@@ -785,7 +804,7 @@ async function ensureSunshineDesktopApp(host, options = {}) {
     const apps = gameStreamSunshineAppsFromResponse(response.json);
     const existing = gameStreamSunshineFindApp(apps, appName);
     if (existing) {
-      if (forceRefresh && !refreshed) {
+      if ((forceRefresh || gameStreamDesktopAppNeedsRefresh(existing.app)) && !refreshed) {
         const saveResponse = await gameStreamApiRequest(host, '/api/apps', {
           method: 'POST',
           username: GAME_STREAM_WEB_USERNAME,
@@ -1031,6 +1050,9 @@ async function startGameStreamHost(options = {}) {
   }
   const webUrl = options.webHost ? `https://${options.webHost}:47990/` : 'https://localhost:47990/';
   const files = ensureGameStreamSunshineFiles();
+  if (process.platform === 'darwin') {
+    runGameStreamDisplayHelper('apply', gameStreamDisplayEnvFromOptions(options));
+  }
   if (gameStreamHostProcess && !gameStreamHostProcess.killed) {
     const desktopApp = await ensureSunshineDesktopApp('localhost', { forceRefresh: files.appsRewritten });
     broadcastGameStreamStatus();
@@ -2171,7 +2193,9 @@ ipcMain.handle('game-stream-open-sunshine', (_event, host) => {
 });
 
 ipcMain.handle('game-stream-open-download', (_event, target) => {
-  const url = target === 'sunshine' ? GAME_STREAM_DOWNLOADS.sunshine : GAME_STREAM_DOWNLOADS.moonlight;
+  const url = target === 'sunshine'
+    ? GAME_STREAM_DOWNLOADS.sunshine
+    : (target === 'displayplacer' ? GAME_STREAM_DOWNLOADS.displayplacer : GAME_STREAM_DOWNLOADS.moonlight);
   return shell.openExternal(url);
 });
 

@@ -30,6 +30,7 @@ const gameStreamPairBtn = $('gameStreamPair');
 const gameStreamHostBtn = $('gameStreamHost');
 const gameStreamOpenSunshineBtn = $('gameStreamOpenSunshine');
 const gameStreamDownloadBtn = $('gameStreamDownload');
+const gameStreamDisplayplacerBtn = $('gameStreamDisplayplacer');
 const gameStreamInstallProgressEl = $('gameStreamInstallProgress');
 const logEl = $('log');
 
@@ -248,6 +249,9 @@ async function installGameStreamComponent() {
     const label = requiredGameStreamToolLabel();
     if (gameStreamInstallProgressEl) gameStreamInstallProgressEl.textContent = `${label} 已安装，无需重复安装。`;
     setGameStreamStatusText(`${label} 已就绪，无需重复安装。`);
+    if (gameStreamStatus?.platform === 'darwin' && !gameStreamStatus?.displayplacer?.available) {
+      setGameStreamStatusText('Sunshine 已就绪；displayplacer 未安装，游戏模式可启动但可能仍有黑边。可点击“安装 displayplacer”启用自动切换分辨率。');
+    }
     renderDevices();
     return;
   }
@@ -647,6 +651,11 @@ function renderDevices() {
     gameStreamDownloadBtn.disabled = anyBusy || toolInstalled;
     gameStreamDownloadBtn.textContent = gameStreamInstallBusy ? '安装中...' : `安装 ${requiredGameStreamToolLabel()}`;
   }
+  if (gameStreamDisplayplacerBtn) {
+    const showDisplayplacer = gameStreamStatus?.platform === 'darwin' && gameStreamStatus?.sunshine?.available && !gameStreamStatus?.displayplacer?.available;
+    gameStreamDisplayplacerBtn.hidden = !showDisplayplacer;
+    gameStreamDisplayplacerBtn.disabled = anyBusy || gameStreamInstallBusy;
+  }
   const actionLabel = '游戏模式';
   const enterText = enterDesktopBtn.querySelector('span');
   const connectText = connectSelectedBtn.querySelector('span');
@@ -751,10 +760,14 @@ async function openGameStreamDevice(device) {
         setGameStreamStatusText(message);
         return;
       }
+      const options = gameStreamClientOptions(device);
       if (device.pin && device.port) {
         setGameStreamStatusText(`正在请求 Mac 启动 Sunshine Host：${device.address}:${device.port}`);
         const hostResult = await window.lanRemote.requestGameStreamRemoteHost(device, {
           ...gameStreamRemoteHostOptions(device),
+          width: options.width,
+          height: options.height,
+          fps: options.fps,
           requestTimeoutMs: 20_000,
         });
         if (hostResult?.skipped) {
@@ -765,7 +778,6 @@ async function openGameStreamDevice(device) {
       } else {
         log('manual game-stream: 请确认 Mac 端 Sunshine 已启动，并完成 Moonlight 配对。');
       }
-      const options = gameStreamClientOptions(device);
       setGameStreamStatusText(`正在启动 Moonlight：${options.width}x${options.height}@${options.fps} ${options.videoCodec} ${Math.round(options.bitrateKbps / 1000)}Mbps...`);
       const result = await window.lanRemote.startGameStreamClient(options);
       log(`Moonlight started pid=${result.pid}; host=${options.hostIp}; ${options.width}x${options.height}@${options.fps}; codec=${options.videoCodec}; bitrate=${options.bitrateKbps}Kbps`);
@@ -984,6 +996,29 @@ gameStreamOpenSunshineBtn?.addEventListener('click', () => {
   window.lanRemote.openGameStreamSunshine?.(selectedSunshineWebHost());
 });
 gameStreamDownloadBtn?.addEventListener('click', installGameStreamComponent);
+gameStreamDisplayplacerBtn?.addEventListener('click', async () => {
+  if (gameStreamInstallBusy) return;
+  await refreshGameStreamStatus();
+  if (gameStreamStatus?.platform !== 'darwin') return;
+  gameStreamInstallBusy = true;
+  setGameStreamBusy(true, '正在安装 displayplacer...');
+  renderGameStreamInstallProgress({ phase: 'start', tool: 'displayplacer', mode: 'binary' });
+  try {
+    const result = await window.lanRemote.installGameStreamTool({ tool: 'displayplacer', mode: 'binary' });
+    updateGameStreamStatus(result.status);
+    renderGameStreamInstallProgress({ phase: 'done', tool: 'displayplacer', mode: 'binary' });
+    setGameStreamStatusText('displayplacer 已安装；下次启动游戏模式会尝试自动切换 Mac 分辨率。');
+    log('game-stream install completed: displayplacer binary');
+  } catch (err) {
+    const message = friendlyGameStreamError(err);
+    setGameStreamStatusText(`displayplacer 安装失败：${message}`);
+    if (gameStreamInstallProgressEl) gameStreamInstallProgressEl.textContent = `安装失败：${message}`;
+    log(`displayplacer install failed: ${message}`);
+  } finally {
+    gameStreamInstallBusy = false;
+    setGameStreamBusy(false);
+  }
+});
 
 window.lanRemote.onDevicesUpdated((list) => {
   devices = list;
