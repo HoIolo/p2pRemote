@@ -553,6 +553,65 @@ function gameStreamDelay(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function gameStreamSunshineAppsFromResponse(json) {
+  if (Array.isArray(json)) return json;
+  if (Array.isArray(json?.apps)) return json.apps;
+  if (Array.isArray(json?.data?.apps)) return json.data.apps;
+  return [];
+}
+
+function gameStreamDesktopAppDefinition() {
+  return {
+    name: GAME_STREAM_DEFAULTS.appName,
+    output: '',
+    cmd: '',
+    index: -1,
+    'exclude-global-prep-cmd': false,
+    elevated: false,
+    'auto-detach': true,
+    'wait-all': true,
+    'exit-timeout': 5,
+    'prep-cmd': [],
+    detached: [],
+    'image-path': 'desktop.png',
+  };
+}
+
+async function ensureSunshineDesktopApp(host, options = {}) {
+  const appName = String(options.appName || GAME_STREAM_DEFAULTS.appName).trim() || GAME_STREAM_DEFAULTS.appName;
+  const timeoutMs = normalizeGameStreamNumber(options.timeoutMs, 5_000, 1_000, 30_000);
+  const deadline = Date.now() + timeoutMs;
+  let created = false;
+
+  await ensureSunshineWebCredentials(host);
+  while (Date.now() < deadline) {
+    const response = await gameStreamApiRequest(host, '/api/apps', {
+      username: GAME_STREAM_WEB_USERNAME,
+      password: GAME_STREAM_WEB_PASSWORD,
+    });
+    const apps = gameStreamSunshineAppsFromResponse(response.json);
+    if (apps.some((app) => String(app?.name || '').trim() === appName)) {
+      return { ready: true, created, appName, appsCount: apps.length };
+    }
+    if (!created) {
+      const saveResponse = await gameStreamApiRequest(host, '/api/apps', {
+        method: 'POST',
+        username: GAME_STREAM_WEB_USERNAME,
+        password: GAME_STREAM_WEB_PASSWORD,
+        body: gameStreamDesktopAppDefinition(),
+      });
+      if (saveResponse.json && saveResponse.json.status === false) {
+        throw new Error(saveResponse.json.error || 'Sunshine rejected the default Desktop application');
+      }
+      created = true;
+      continue;
+    }
+    await gameStreamDelay(250);
+  }
+
+  throw new Error('Sunshine Desktop app was not ready after automatic setup');
+}
+
 function gameStreamApiRequest(host, requestPath, options = {}) {
   const body = options.body ? JSON.stringify(options.body) : '';
   const headers = {
@@ -756,6 +815,7 @@ async function startGameStreamHost(options = {}) {
   }
   const webUrl = options.webHost ? `https://${options.webHost}:47990/` : 'https://localhost:47990/';
   if (gameStreamHostProcess && !gameStreamHostProcess.killed) {
+    const desktopApp = await ensureSunshineDesktopApp('localhost');
     broadcastGameStreamStatus();
     return {
       ok: true,
@@ -763,6 +823,7 @@ async function startGameStreamHost(options = {}) {
       pid: gameStreamHostProcess.pid,
       exePath,
       webUrl,
+      desktopApp,
     };
   }
 
@@ -777,6 +838,7 @@ async function startGameStreamHost(options = {}) {
   if (!ready) {
     throw new Error('Sunshine 已启动但 Web/API 端口 47990 未及时就绪。请检查 Sunshine 权限、防火墙或端口占用。');
   }
+  const desktopApp = await ensureSunshineDesktopApp('localhost');
   return {
     ok: true,
     pid: proc.pid,
@@ -786,6 +848,7 @@ async function startGameStreamHost(options = {}) {
     statePath: files.statePath,
     credentialsPath: files.credentialsPath,
     webUrl,
+    desktopApp,
   };
 }
 

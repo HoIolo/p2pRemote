@@ -161,8 +161,8 @@ function friendlyGameStreamError(err) {
   if (raw.includes('has not been paired') || raw.includes('not been paired')) {
     return 'Moonlight 尚未与 Sunshine 配对。点击“配对”，系统会自动生成 PIN 并提交到 Mac Sunshine。';
   }
-  if (raw.includes('Failed to find application')) {
-    return 'Moonlight 找不到 Sunshine 的 Desktop 应用。请打开 Sunshine Web UI，确认 Applications 里存在 Desktop。';
+  if (raw.includes('Failed to find application') || raw.includes('Desktop app was not ready') || raw.includes('default Desktop application')) {
+    return 'Sunshine 缺少 Desktop 应用，应用已尝试自动补齐；如果仍失败，请打开 Sunshine Web UI 的 Applications 页面确认存在 Desktop。';
   }
   if (raw.includes('Moonlight 的配对请求') || raw.includes('pairing PIN')) {
     return 'Sunshine 还没收到 Moonlight 的配对请求。请确认 Mac 端 Sunshine 已启动后再点一次“配对”。';
