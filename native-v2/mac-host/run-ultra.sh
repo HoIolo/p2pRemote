@@ -9,10 +9,14 @@ VIDEO_PORT="${VIDEO_PORT:-45000}"
 INPUT_PORT="${INPUT_PORT:-45001}"
 TRANSPORT="${TRANSPORT:-udp}"
 cd "$(dirname "$0")"
-BIN=".build/release/p2p-native-mac-host"
+
+APP_DIR="../dist/mac-host/P2PRemoteMacHost.app"
+BIN="$APP_DIR/Contents/MacOS/p2p-native-mac-host"
+
 if [[ ! -x "$BIN" ]]; then
-  swift build -c release
+  bash build.sh
 fi
+
 exec "$BIN" \
   --client-ip "$CLIENT_IP" \
   --video-port "$VIDEO_PORT" \

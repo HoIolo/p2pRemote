@@ -284,12 +284,11 @@ function nativeV2WinClientCandidates() {
 
 function nativeV2MacHostCandidates() {
   return [
-    path.join(process.resourcesPath || '', 'native-v2', 'mac-host', 'P2P Native Mac Host.app', 'Contents', 'MacOS', 'p2p-native-mac-host'),
-    path.join(process.resourcesPath || '', 'native-v2', 'mac-host', 'p2p-native-mac-host'),
-    path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'P2P Native Mac Host.app', 'Contents', 'MacOS', 'p2p-native-mac-host'),
-    path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'release', 'p2p-native-mac-host'),
-    path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'arm64-apple-macosx', 'release', 'p2p-native-mac-host'),
-    path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'x86_64-apple-macosx', 'release', 'p2p-native-mac-host'),
+    path.join(process.resourcesPath || '', 'native-v2', 'mac-host', 'P2PRemoteMacHost.app'),
+    path.join(process.resourcesPath || '', 'native-v2', 'mac-host', 'P2P Native Mac Host.app'),
+    path.join(__dirname, '..', 'native-v2', 'dist', 'mac-host', 'P2PRemoteMacHost.app'),
+    path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'P2PRemoteMacHost.app'),
+    path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'P2P Native Mac Host.app'),
   ];
 }
 
@@ -736,6 +735,19 @@ async function startNativeV2Host(options = {}) {
   if (!options.clientIp) {
     throw new Error('Native v2 host needs the Windows client IP address');
   }
+
+  // Ensure Electron itself has screen recording permission before spawning mac-host.
+  // The child process inherits TCC permission from the parent Electron process.
+  const screenStatus = getScreenCaptureStatus();
+  if (screenStatus !== 'granted') {
+    sendToMainWindow('host-log', {
+      level: 'warn',
+      message: `屏幕录制权限未授权 (status=${screenStatus})。请在系统设置 > 隐私与安全性 > 屏幕录制 中允许当前运行的 Electron/P2P Remote 应用，然后重启应用。`,
+    });
+    await openMacPrivacyPane('Privacy_ScreenCapture');
+    throw new Error('Mac 端屏幕录制权限未授权。请在系统设置 > 隐私与安全性 > 屏幕录制 中允许当前应用后重启。');
+  }
+
   if (nativeV2HostProcess && !nativeV2HostProcess.killed) {
     stopNativeV2Process('host');
   }
@@ -766,8 +778,13 @@ async function startNativeV2Host(options = {}) {
     '--transport', transport,
   ];
 
-  nativeV2HostProcess = spawn(exePath, args, {
-    cwd: path.dirname(exePath),
+  // Spawn the binary directly from the .app bundle path.
+  // Screen recording permission is inherited from the parent Electron process.
+  // The binary path inside .app/Contents/MacOS/ lets macOS identify the bundle context.
+  const binPath = path.join(exePath, 'Contents', 'MacOS', 'p2p-native-mac-host');
+  const actualExe = fs.existsSync(binPath) ? binPath : exePath;
+  nativeV2HostProcess = spawn(actualExe, args, {
+    cwd: path.dirname(actualExe),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
 

@@ -34,7 +34,18 @@ final class ScreenCaptureOutput: NSObject, SCStreamOutput {
             reportedFirstFrame = true
             let width = CVPixelBufferGetWidth(pixelBuffer)
             let height = CVPixelBufferGetHeight(pixelBuffer)
-            logLine("[capture] first frame \(width)x\(height)")
+            CVPixelBufferLockBaseAddress(pixelBuffer, .readOnly)
+            var nonZeroBytes = 0
+            if let base = CVPixelBufferGetBaseAddress(pixelBuffer) {
+                let totalBytes = CVPixelBufferGetDataSize(pixelBuffer)
+                let ptr = base.assumingMemoryBound(to: UInt8.self)
+                let checkCount = min(totalBytes, 4096)
+                for i in 0..<checkCount {
+                    if ptr[i] != 0 { nonZeroBytes += 1 }
+                }
+            }
+            CVPixelBufferUnlockBaseAddress(pixelBuffer, .readOnly)
+            logLine("[capture] first frame \(width)x\(height) nonZeroInFirst4K=\(nonZeroBytes)")
             firstFrameCallback()
         }
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
@@ -129,8 +140,8 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
         streamCfg.width = cfg.width
         streamCfg.height = cfg.height
         streamCfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(cfg.fps))
-        streamCfg.queueDepth = 1
-        streamCfg.showsCursor = false
+        streamCfg.queueDepth = 3
+        streamCfg.showsCursor = true
         streamCfg.capturesAudio = false
         streamCfg.pixelFormat = pixelFormat
         streamCfg.colorSpaceName = CGColorSpace.sRGB
@@ -215,31 +226,32 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
     }
 
     private func ensureScreenCapturePermission() async throws {
-        let ready = await MainActor.run {
-            CGPreflightScreenCaptureAccess()
-        }
-        if ready {
-            logLine("[capture] screen recording permission ready for native host")
+        if CGPreflightScreenCaptureAccess() {
+            logLine("[capture] screen recording permission ready")
             return
         }
 
-        logLine("[capture] screen recording permission missing for native host; requesting access")
-        let granted = await MainActor.run {
-            NSApp.activate(ignoringOtherApps: true)
-            return CGRequestScreenCaptureAccess()
-        }
-        guard granted else {
-            throw NSError(
-                domain: "P2PNative",
-                code: 2,
-                userInfo: [
-                    NSLocalizedDescriptionKey: "Screen Recording permission denied for p2p-native-mac-host. Enable it in System Settings -> Privacy & Security -> Screen Recording, then fully restart the Mac app."
-                ]
-            )
+        logLine("[capture] screen recording permission missing; requesting access...")
+        _ = CGRequestScreenCaptureAccess()
+
+        // Give macOS a moment to register the permission change
+        try await Task.sleep(nanoseconds: 1_000_000_000)
+
+        if CGPreflightScreenCaptureAccess() {
+            logLine("[capture] screen recording permission granted")
+            return
         }
 
-        logLine("[capture] screen recording permission granted for native host; if macOS still returns no frames, fully restart the Mac app once and reconnect")
-        try? await Task.sleep(nanoseconds: 300_000_000)
+        // When launched as a child of Electron, permission is inherited from the parent.
+        // If still not granted, the parent app needs screen recording permission.
+        let parentName = ProcessInfo.processInfo.environment["__CFBundleIdentifier"] ?? "unknown"
+        throw NSError(
+            domain: "P2PNative",
+            code: 2,
+            userInfo: [
+                NSLocalizedDescriptionKey: "Screen Recording permission not granted. The parent app (\(parentName)) needs screen recording permission in System Settings → Privacy & Security → Screen Recording. Restart the app after granting."
+            ]
+        )
     }
 
     func markFirstFrame() {

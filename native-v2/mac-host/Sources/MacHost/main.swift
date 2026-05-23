@@ -83,6 +83,16 @@ struct MacHostMain {
 
         setbuf(__stdoutp, nil)
         setbuf(__stderrp, nil)
+
+        signal(SIGINT) { _ in
+            logLine("[signal] SIGINT received, exiting")
+            exit(0)
+        }
+        signal(SIGTERM) { _ in
+            logLine("[signal] SIGTERM received, exiting")
+            exit(0)
+        }
+
         let app = NSApplication.shared
         app.setActivationPolicy(.accessory)
 

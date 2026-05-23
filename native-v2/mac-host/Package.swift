@@ -11,6 +11,7 @@ let package = Package(
         .executableTarget(
             name: "MacHost",
             path: "Sources/MacHost",
+            exclude: ["Info.plist"],
             swiftSettings: [
                 .unsafeFlags(["-parse-as-library"])
             ],
