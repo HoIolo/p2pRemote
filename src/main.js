@@ -13,7 +13,9 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const WebSocket = require('ws');
+const net = require('net');
 const { execFile, spawn } = require('child_process');
+const gameStreamInstaller = require('./game-stream-installer');
 
 // Native v2 owns the media/input hot path. Keep Chromium timers responsive for the dashboard.
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
@@ -36,6 +38,25 @@ const SIGNAL_PORT = Number(process.env.P2P_REMOTE_PORT || 7777);
 const DISCOVERY_PORT = Number(process.env.P2P_REMOTE_DISCOVERY_PORT || 47777);
 const NATIVE_V2_HOST_READY_TIMEOUT_MS = 12_000;
 const NATIVE_V2_REMOTE_HOST_TIMEOUT_MS = 15_000;
+const GAME_STREAM_HOST_READY_TIMEOUT_MS = 12_000;
+const GAME_STREAM_REMOTE_HOST_TIMEOUT_MS = 15_000;
+const GAME_STREAM_DOWNLOADS = Object.freeze({
+  sunshine: 'https://github.com/LizardByte/Sunshine/releases/latest',
+  moonlight: 'https://github.com/moonlight-stream/moonlight-qt/releases/latest',
+});
+const GAME_STREAM_DEFAULTS = Object.freeze({
+  appName: 'Desktop',
+  width: 1920,
+  height: 1080,
+  fps: 60,
+  bitrateKbps: 30_000,
+  videoCodec: 'HEVC',
+  videoDecoder: 'hardware',
+  displayMode: 'fullscreen',
+  captureSystemKeys: 'always',
+  absoluteMouse: true,
+  performanceOverlay: true,
+});
 const PIN = String(crypto.randomInt(100000, 999999));
 const BUNDLE_ID = 'com.p2premotelan.app';
 const NATIVE_MAC_HOST_BUNDLE_ID = 'com.p2premotelan.native.mac-host';
@@ -59,6 +80,9 @@ let nativeV2ClientProfileWatchPath = null;
 let nativeV2ClientProfileLastJson = '';
 let nativeV2ClientProfileChangeInFlight = false;
 let nativeV2ClientProfilePending = null;
+let gameStreamClientProcess = null;
+let gameStreamPairProcess = null;
+let gameStreamHostProcess = null;
 
 function mainWindow() {
   if (win && !win.isDestroyed()) return win;
@@ -275,13 +299,31 @@ function createWindow(file, options = {}) {
 
 
 function findFirstExistingPath(candidates) {
-  return candidates.find((candidate) => {
+  const pathEntries = String(process.env.PATH || '').split(path.delimiter).filter(Boolean);
+  const extensions = process.platform === 'win32'
+    ? String(process.env.PATHEXT || '.EXE;.CMD;.BAT;.COM').split(';').filter(Boolean)
+    : [''];
+  for (const candidate of candidates) {
     try {
-      return fs.existsSync(candidate);
+      if (fs.existsSync(candidate)) return candidate;
+      if (canSpawnShellCommand(candidate)) {
+        for (const entry of pathEntries) {
+          if (path.extname(candidate)) {
+            const resolved = path.join(entry, candidate);
+            if (fs.existsSync(resolved)) return resolved;
+          } else {
+            for (const ext of extensions) {
+              const resolved = path.join(entry, `${candidate}${ext}`);
+              if (fs.existsSync(resolved)) return resolved;
+            }
+          }
+        }
+      }
     } catch {
-      return false;
+      // ignore invalid candidate paths
     }
-  }) || null;
+  }
+  return null;
 }
 
 function nativeV2WinClientCandidates() {
@@ -301,6 +343,439 @@ function nativeV2MacHostCandidates() {
     path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'P2PRemoteMacHost.app'),
     path.join(__dirname, '..', 'native-v2', 'mac-host', '.build', 'P2P Native Mac Host.app'),
   ];
+}
+
+function moonlightExecutableCandidates() {
+  if (process.platform === 'win32') {
+    const programFiles = [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.LOCALAPPDATA]
+      .filter(Boolean);
+    return [
+      ...programFiles.map((base) => path.join(base, 'Moonlight Game Streaming', 'Moonlight.exe')),
+      path.join(gameStreamToolDir('moonlight'), 'Moonlight.exe'),
+      path.join(gameStreamToolDir('moonlight'), 'Moonlight Game Streaming', 'Moonlight.exe'),
+      'Moonlight.exe',
+      'moonlight.exe',
+    ];
+  }
+  if (process.platform === 'darwin') {
+    return [
+      '/Applications/Moonlight.app/Contents/MacOS/Moonlight',
+      'moonlight',
+    ];
+  }
+  return ['moonlight'];
+}
+
+function sunshineExecutableCandidates() {
+  if (process.platform === 'darwin') {
+    return [
+      path.join(gameStreamToolDir('sunshine'), 'Sunshine.app', 'Contents', 'MacOS', 'sunshine'),
+      path.join(gameStreamToolDir('sunshine'), 'Sunshine.app', 'Contents', 'MacOS', 'Sunshine'),
+      '/Applications/Sunshine.app/Contents/MacOS/sunshine',
+      '/Applications/Sunshine.app/Contents/MacOS/Sunshine',
+      '/opt/homebrew/bin/sunshine',
+      '/usr/local/bin/sunshine',
+      'sunshine',
+    ];
+  }
+  if (process.platform === 'win32') {
+    const programFiles = [process.env.ProgramFiles, process.env['ProgramFiles(x86)'], process.env.LOCALAPPDATA]
+      .filter(Boolean);
+    return [
+      path.join(gameStreamToolDir('sunshine'), 'sunshine.exe'),
+      path.join(gameStreamToolDir('sunshine'), 'Sunshine', 'sunshine.exe'),
+      ...programFiles.map((base) => path.join(base, 'Sunshine', 'sunshine.exe')),
+      'sunshine.exe',
+    ];
+  }
+  return ['/usr/bin/sunshine', '/usr/local/bin/sunshine', 'sunshine'];
+}
+
+function gameStreamDataDir() {
+  return path.join(app.getPath('userData'), 'game-stream');
+}
+
+function gameStreamToolsDir() {
+  return path.join(app.getPath('userData'), 'game-stream-tools');
+}
+
+function gameStreamToolDir(tool) {
+  return path.join(gameStreamToolsDir(), tool);
+}
+
+function gameStreamDownloadDir() {
+  return path.join(gameStreamToolsDir(), 'downloads');
+}
+
+function gameStreamSunshineConfigPath() {
+  return path.join(gameStreamDataDir(), 'sunshine.conf');
+}
+
+function gameStreamSunshineAppsPath() {
+  return path.join(gameStreamDataDir(), 'apps.json');
+}
+
+function normalizeGameStreamNumber(value, fallback, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(number)));
+}
+
+function normalizeMoonlightChoice(value, allowed, fallback) {
+  const text = String(value || fallback).trim();
+  return allowed.some((choice) => choice.toLowerCase() === text.toLowerCase()) ? text : fallback;
+}
+
+function gameStreamOptions(options = {}) {
+  return {
+    appName: String(options.appName || GAME_STREAM_DEFAULTS.appName),
+    width: normalizeGameStreamNumber(options.width, GAME_STREAM_DEFAULTS.width, 640, 7680),
+    height: normalizeGameStreamNumber(options.height, GAME_STREAM_DEFAULTS.height, 360, 4320),
+    fps: normalizeGameStreamNumber(options.fps, GAME_STREAM_DEFAULTS.fps, 30, 240),
+    bitrateKbps: normalizeGameStreamNumber(options.bitrateKbps || options.bitrate, GAME_STREAM_DEFAULTS.bitrateKbps, 500, 500_000),
+    videoCodec: normalizeMoonlightChoice(options.videoCodec, ['auto', 'H.264', 'HEVC', 'AV1'], GAME_STREAM_DEFAULTS.videoCodec),
+    videoDecoder: normalizeMoonlightChoice(options.videoDecoder, ['auto', 'software', 'hardware'], GAME_STREAM_DEFAULTS.videoDecoder),
+    displayMode: normalizeMoonlightChoice(options.displayMode, ['fullscreen', 'windowed', 'borderless'], GAME_STREAM_DEFAULTS.displayMode),
+    captureSystemKeys: normalizeMoonlightChoice(options.captureSystemKeys, ['never', 'fullscreen', 'always'], GAME_STREAM_DEFAULTS.captureSystemKeys),
+    absoluteMouse: options.absoluteMouse !== false,
+    framePacing: options.framePacing !== false,
+    gameOptimization: options.gameOptimization !== false,
+    performanceOverlay: options.performanceOverlay !== false,
+    quitAfter: options.quitAfter === true,
+  };
+}
+
+function ensureGameStreamSunshineFiles() {
+  const dataDir = gameStreamDataDir();
+  fs.mkdirSync(dataDir, { recursive: true });
+  const appsPath = gameStreamSunshineAppsPath();
+  const configPath = gameStreamSunshineConfigPath();
+  if (!fs.existsSync(appsPath)) {
+    fs.writeFileSync(appsPath, `${JSON.stringify({ apps: [{ name: GAME_STREAM_DEFAULTS.appName, 'image-path': 'desktop.png' }] }, null, 2)}\n`);
+  }
+  const lines = [
+    'sunshine_name = P2P Remote LAN Game Stream',
+    'min_log_level = info',
+    `file_apps = ${appsPath}`,
+    'lan_encryption_mode = 0',
+    'origin_web_ui_allowed = lan',
+    'vt_realtime = enabled',
+    'hevc_mode = 0',
+    'av1_mode = 0',
+    'fec_percentage = 20',
+    '',
+  ];
+  fs.writeFileSync(configPath, lines.join('\n'));
+  return { dataDir, appsPath, configPath };
+}
+
+function canSpawnShellCommand(candidate) {
+  return !candidate.includes('/') && !candidate.includes('\\') && !path.isAbsolute(candidate);
+}
+
+function spawnManagedProcess(executable, args, options = {}) {
+  return spawn(executable, args, {
+    cwd: options.cwd || (canSpawnShellCommand(executable) ? process.cwd() : path.dirname(executable)),
+    env: options.env || process.env,
+    windowsHide: Boolean(options.windowsHide),
+    shell: canSpawnShellCommand(executable),
+    stdio: ['ignore', 'pipe', 'pipe'],
+  });
+}
+
+function relayGameStreamProcessOutput(kind, proc, chunk) {
+  const text = chunk.toString('utf8');
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    sendToMainWindow('host-log', { level: 'game-stream', message: `${kind}: ${line}` });
+  }
+}
+
+function isPortOpen(host, port, timeoutMs = 600) {
+  return new Promise((resolve) => {
+    const socket = net.createConnection({ host, port });
+    let settled = false;
+    const finish = (ok) => {
+      if (settled) return;
+      settled = true;
+      socket.destroy();
+      resolve(ok);
+    };
+    socket.setTimeout(timeoutMs);
+    socket.once('connect', () => finish(true));
+    socket.once('timeout', () => finish(false));
+    socket.once('error', () => finish(false));
+  });
+}
+
+async function waitForPort(host, port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await isPortOpen(host, port)) return true;
+    await new Promise((resolve) => setTimeout(resolve, 300));
+  }
+  return false;
+}
+
+function gameStreamStatusPayload() {
+  const moonlightPath = findFirstExistingPath(moonlightExecutableCandidates());
+  const sunshinePath = findFirstExistingPath(sunshineExecutableCandidates());
+  return {
+    platform: process.platform,
+    downloads: GAME_STREAM_DOWNLOADS,
+    defaults: { ...GAME_STREAM_DEFAULTS },
+    install: gameStreamInstaller.installStatus(process.platform, gameStreamToolsDir(), gameStreamDownloadDir()),
+    moonlight: {
+      available: Boolean(moonlightPath),
+      path: moonlightPath,
+      running: Boolean(gameStreamClientProcess && !gameStreamClientProcess.killed),
+      pairing: Boolean(gameStreamPairProcess && !gameStreamPairProcess.killed),
+      pid: gameStreamClientProcess?.pid || null,
+    },
+    sunshine: {
+      available: Boolean(sunshinePath),
+      path: sunshinePath,
+      running: Boolean(gameStreamHostProcess && !gameStreamHostProcess.killed),
+      pid: gameStreamHostProcess?.pid || null,
+      configPath: gameStreamSunshineConfigPath(),
+      appsPath: gameStreamSunshineAppsPath(),
+      webUrl: 'https://localhost:47990/',
+    },
+  };
+}
+
+function broadcastGameStreamStatus(extra = {}) {
+  sendToMainWindow('game-stream-status', {
+    ...gameStreamStatusPayload(),
+    ...extra,
+  });
+}
+
+function emitGameStreamInstallProgress(payload) {
+  sendToMainWindow('game-stream-install-progress', payload);
+}
+
+async function installGameStreamTool(options = {}) {
+  const tool = options.tool === 'sunshine' ? 'sunshine' : 'moonlight';
+  const existingPath = findFirstExistingPath(tool === 'sunshine' ? sunshineExecutableCandidates() : moonlightExecutableCandidates());
+  if (existingPath && !options.force) {
+    return { ok: true, skipped: true, reason: 'already-installed', tool, path: existingPath, status: gameStreamStatusPayload() };
+  }
+  const result = await gameStreamInstaller.installTool({
+    platform: process.platform,
+    arch: process.arch,
+    tool,
+    mode: options.mode || (process.platform === 'win32' ? 'installer' : 'dmg'),
+    downloadDir: gameStreamDownloadDir(),
+    toolDir: gameStreamToolDir(tool),
+    emitProgress: emitGameStreamInstallProgress,
+    onOutput: (chunk) => relayGameStreamProcessOutput('install', null, chunk),
+  });
+  broadcastGameStreamStatus();
+  return { ...result, status: gameStreamStatusPayload() };
+}
+
+function stopGameStreamProcess(kind) {
+  const proc = kind === 'host'
+    ? gameStreamHostProcess
+    : (kind === 'pair' ? gameStreamPairProcess : gameStreamClientProcess);
+  if (!proc || proc.killed) return false;
+  try {
+    proc.kill();
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function attachGameStreamProcess(kind, proc) {
+  proc.stdout?.on('data', (chunk) => relayGameStreamProcessOutput(kind, proc, chunk));
+  proc.stderr?.on('data', (chunk) => relayGameStreamProcessOutput(kind, proc, chunk));
+  proc.once('exit', (code, signal) => {
+    sendToMainWindow('host-log', { level: 'info', message: `game-stream ${kind} exited code=${code ?? ''} signal=${signal ?? ''}` });
+    if (kind === 'host' && gameStreamHostProcess === proc) gameStreamHostProcess = null;
+    if (kind === 'client' && gameStreamClientProcess === proc) gameStreamClientProcess = null;
+    if (kind === 'pair' && gameStreamPairProcess === proc) gameStreamPairProcess = null;
+    broadcastGameStreamStatus();
+  });
+  proc.once('error', (err) => {
+    sendToMainWindow('host-log', { level: 'error', message: `game-stream ${kind} failed: ${err.message}` });
+    if (kind === 'host' && gameStreamHostProcess === proc) gameStreamHostProcess = null;
+    if (kind === 'client' && gameStreamClientProcess === proc) gameStreamClientProcess = null;
+    if (kind === 'pair' && gameStreamPairProcess === proc) gameStreamPairProcess = null;
+    broadcastGameStreamStatus({ error: err.message });
+  });
+}
+
+async function startGameStreamHost(options = {}) {
+  if (process.platform !== 'darwin' && process.platform !== 'win32' && process.platform !== 'linux') {
+    throw new Error('Sunshine host is only supported on desktop platforms');
+  }
+  const exePath = findFirstExistingPath(sunshineExecutableCandidates());
+  if (!exePath) {
+    throw new Error('未找到 Sunshine。请安装 Sunshine，或把 sunshine 加入 PATH。下载地址：https://github.com/LizardByte/Sunshine/releases/latest');
+  }
+  const webUrl = options.webHost ? `https://${options.webHost}:47990/` : 'https://localhost:47990/';
+  if (gameStreamHostProcess && !gameStreamHostProcess.killed) {
+    broadcastGameStreamStatus();
+    return {
+      ok: true,
+      alreadyRunning: true,
+      pid: gameStreamHostProcess.pid,
+      exePath,
+      webUrl,
+    };
+  }
+
+  const files = ensureGameStreamSunshineFiles();
+  const proc = spawnManagedProcess(exePath, [files.configPath], { cwd: files.dataDir });
+  gameStreamHostProcess = proc;
+  attachGameStreamProcess('host', proc);
+  sendToMainWindow('host-log', { level: 'info', message: `game-stream host starting Sunshine pid=${proc.pid} config=${files.configPath}` });
+  broadcastGameStreamStatus();
+
+  const ready = await waitForPort('127.0.0.1', 47990, normalizeGameStreamNumber(options.readyTimeoutMs, GAME_STREAM_HOST_READY_TIMEOUT_MS, 1000, 60_000));
+  if (!ready) {
+    throw new Error('Sunshine 已启动但 Web/API 端口 47990 未及时就绪。请检查 Sunshine 权限、防火墙或端口占用。');
+  }
+  return {
+    ok: true,
+    pid: proc.pid,
+    exePath,
+    configPath: files.configPath,
+    appsPath: files.appsPath,
+    webUrl,
+  };
+}
+
+function moonlightStreamArgs(hostIp, options = {}) {
+  const normalized = gameStreamOptions(options);
+  const args = [
+    'stream',
+    '--resolution', `${normalized.width}x${normalized.height}`,
+    '--fps', String(normalized.fps),
+    '--bitrate', String(normalized.bitrateKbps),
+    '--video-codec', normalized.videoCodec,
+    '--video-decoder', normalized.videoDecoder,
+    '--display-mode', normalized.displayMode,
+    '--capture-system-keys', normalized.captureSystemKeys,
+  ];
+  args.push(normalized.absoluteMouse ? '--absolute-mouse' : '--no-absolute-mouse');
+  args.push(normalized.framePacing ? '--frame-pacing' : '--no-frame-pacing');
+  args.push(normalized.gameOptimization ? '--game-optimization' : '--no-game-optimization');
+  args.push(normalized.performanceOverlay ? '--performance-overlay' : '--no-performance-overlay');
+  args.push(normalized.quitAfter ? '--quit-after' : '--no-quit-after');
+  args.push(String(hostIp), normalized.appName);
+  return args;
+}
+
+function startGameStreamClient(options = {}) {
+  if (process.platform !== 'win32' && process.platform !== 'darwin' && process.platform !== 'linux') {
+    throw new Error('Moonlight client is only supported on desktop platforms');
+  }
+  if (!options.hostIp) {
+    throw new Error('Moonlight needs the Sunshine host IP address');
+  }
+  const exePath = findFirstExistingPath(moonlightExecutableCandidates());
+  if (!exePath) {
+    throw new Error('未找到 Moonlight。请安装 Moonlight Qt，或把 Moonlight.exe 加入 PATH。下载地址：https://github.com/moonlight-stream/moonlight-qt/releases/latest');
+  }
+  if (gameStreamClientProcess && !gameStreamClientProcess.killed) stopGameStreamProcess('client');
+  const args = moonlightStreamArgs(options.hostIp, options);
+  const proc = spawnManagedProcess(exePath, args, { windowsHide: false });
+  gameStreamClientProcess = proc;
+  attachGameStreamProcess('client', proc);
+  sendToMainWindow('host-log', { level: 'info', message: `game-stream client started Moonlight pid=${proc.pid} host=${options.hostIp} app=${gameStreamOptions(options).appName}` });
+  broadcastGameStreamStatus();
+  return {
+    ok: true,
+    pid: proc.pid,
+    exePath,
+    args,
+    hostIp: String(options.hostIp),
+    ...gameStreamOptions(options),
+  };
+}
+
+function pairGameStreamClient(options = {}) {
+  if (!options.hostIp) throw new Error('Moonlight pairing needs the Sunshine host IP address');
+  const pin = String(options.pin || '').trim();
+  if (pin && !/^\d{4}$/.test(pin)) throw new Error('Moonlight pairing PIN must be 4 digits');
+  const exePath = findFirstExistingPath(moonlightExecutableCandidates());
+  if (!exePath) {
+    throw new Error('未找到 Moonlight。请先安装 Moonlight Qt。');
+  }
+  if (gameStreamPairProcess && !gameStreamPairProcess.killed) stopGameStreamProcess('pair');
+  const args = ['pair'];
+  if (pin) args.push('--pin', pin);
+  args.push(String(options.hostIp));
+  const proc = spawnManagedProcess(exePath, args, { windowsHide: false });
+  gameStreamPairProcess = proc;
+  attachGameStreamProcess('pair', proc);
+  sendToMainWindow('host-log', { level: 'info', message: `game-stream pairing started Moonlight pid=${proc.pid} host=${options.hostIp}${pin ? ` pin=${pin}` : ''}` });
+  broadcastGameStreamStatus();
+  return { ok: true, pid: proc.pid, exePath, args, hostIp: String(options.hostIp) };
+}
+
+function requestGameStreamRemoteHost(device, options = {}) {
+  return new Promise((resolve, reject) => {
+    if (!device || !device.address || !device.port || !device.pin) {
+      reject(new Error('Game stream remote host request needs discovered Mac address, port and PIN'));
+      return;
+    }
+    const requestId = crypto.randomUUID();
+    const url = `ws://${device.address}:${device.port}`;
+    const socket = new WebSocket(url);
+    let settled = false;
+    const finish = (err, result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        socket.close();
+      } catch {
+        // ignore close errors
+      }
+      if (err) reject(err);
+      else resolve(result);
+    };
+    const timer = setTimeout(() => {
+      finish(new Error(`Game stream remote host request timed out: ${url}`));
+    }, GAME_STREAM_REMOTE_HOST_TIMEOUT_MS);
+
+    socket.on('open', () => {
+      socket.send(JSON.stringify({ type: 'hello', pin: String(device.pin) }));
+    });
+    socket.on('message', (buf) => {
+      let message;
+      try {
+        message = JSON.parse(buf.toString('utf8'));
+      } catch {
+        finish(new Error('Game stream remote host returned invalid JSON'));
+        return;
+      }
+      if (message.type === 'hello-ok') {
+        socket.send(JSON.stringify({ type: 'game-stream-start-host', requestId, options }));
+        return;
+      }
+      if (message.type === 'game-stream-host-started' && message.requestId === requestId) {
+        finish(null, message.result || { ok: true });
+        return;
+      }
+      if (message.type === 'game-stream-host-error' && message.requestId === requestId) {
+        finish(new Error(message.error || 'Game stream remote host failed'));
+        return;
+      }
+      if (message.type === 'error') {
+        finish(new Error(message.error || 'Game stream remote host request failed'));
+      }
+    });
+    socket.on('error', (err) => finish(new Error(`Game stream remote host connection failed: ${err.message}`)));
+    socket.on('close', () => {
+      if (!settled) finish(new Error('Game stream remote host connection closed before response'));
+    });
+  });
 }
 
 function nativeV2ClientProfilePath() {
@@ -1075,6 +1550,23 @@ function startSignalServer() {
         return;
       }
 
+      if (msg.type === 'game-stream-start-host') {
+        const requestId = msg.requestId || null;
+        Promise.resolve()
+          .then(() => startGameStreamHost(msg.options || {}))
+          .then((result) => {
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({ type: 'game-stream-host-started', requestId, result }));
+            }
+          })
+          .catch((err) => {
+            if (socket.readyState === WebSocket.OPEN) {
+              socket.send(JSON.stringify({ type: 'game-stream-host-error', requestId, error: err.message || String(err) }));
+            }
+          });
+        return;
+      }
+
       // silently ignore unknown message types (e.g. stray ICE candidates from other tools)
 
     });
@@ -1176,6 +1668,44 @@ ipcMain.handle('refresh-devices', () => {
 
 
 ipcMain.handle('native-v2-status', () => nativeV2StatusPayload());
+
+ipcMain.handle('game-stream-status', () => gameStreamStatusPayload());
+
+ipcMain.handle('game-stream-install-status', () => gameStreamInstaller.installStatus(process.platform, gameStreamToolsDir(), gameStreamDownloadDir()));
+
+ipcMain.handle('game-stream-install-tool', (_event, options) => installGameStreamTool(options));
+
+ipcMain.handle('game-stream-start-host', (_event, options) => startGameStreamHost(options));
+
+ipcMain.handle('game-stream-stop-host', () => {
+  const stopped = stopGameStreamProcess('host');
+  broadcastGameStreamStatus();
+  return { ok: true, stopped };
+});
+
+ipcMain.handle('game-stream-start-client', (_event, options) => startGameStreamClient(options));
+
+ipcMain.handle('game-stream-stop-client', () => {
+  const stopped = stopGameStreamProcess('client');
+  broadcastGameStreamStatus();
+  return { ok: true, stopped };
+});
+
+ipcMain.handle('game-stream-pair-client', (_event, options) => pairGameStreamClient(options));
+
+ipcMain.handle('game-stream-request-remote-host', (_event, payload = {}) => {
+  return requestGameStreamRemoteHost(payload.device, payload.options);
+});
+
+ipcMain.handle('game-stream-open-sunshine', (_event, host) => {
+  const target = host ? String(host).replace(/^https?:\/\//i, '').replace(/\/$/, '') : 'localhost:47990';
+  return shell.openExternal(`https://${target.includes(':') ? target : `${target}:47990`}/`);
+});
+
+ipcMain.handle('game-stream-open-download', (_event, target) => {
+  const url = target === 'sunshine' ? GAME_STREAM_DOWNLOADS.sunshine : GAME_STREAM_DOWNLOADS.moonlight;
+  return shell.openExternal(url);
+});
 
 ipcMain.handle('native-v2-start-client', (_event, options) => startNativeV2Client(options));
 
@@ -1288,6 +1818,9 @@ app.on('window-all-closed', () => {
   }
   stopNativeV2Process('client');
   stopNativeV2Process('host');
+  stopGameStreamProcess('pair');
+  stopGameStreamProcess('client');
+  stopGameStreamProcess('host');
   if (process.platform !== 'darwin') app.quit();
 });
 
@@ -1295,4 +1828,7 @@ app.on('before-quit', () => {
   appIsQuitting = true;
   stopNativeV2Process('client');
   stopNativeV2Process('host');
+  stopGameStreamProcess('pair');
+  stopGameStreamProcess('client');
+  stopGameStreamProcess('host');
 });

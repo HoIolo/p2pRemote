@@ -24,7 +24,7 @@ inline constexpr int kMaxUdp = 1500;
 inline constexpr int kVideoHeaderBytes = sizeof(P2VideoHeader);
 inline constexpr int kMaxVideoFragmentPayload = 1440 - kVideoHeaderBytes;
 inline constexpr size_t kMinEncodedQueueDepth = 1;
-inline constexpr size_t kMaxEncodedQueueDepth = 6;
+inline constexpr size_t kMaxEncodedQueueDepth = 2;
 inline constexpr std::array<int, 5> kFpsPresets = {30, 45, 60, 90, 120};
 inline constexpr std::array<int, 5> kBitratePresetsMbps = {8, 12, 16, 24, 32};
 
@@ -192,6 +192,7 @@ extern std::unique_ptr<D3DRenderer> g_renderer;
 uint64_t QpcNow();
 uint64_t QpcDeltaUs(uint64_t start, uint64_t end);
 void RecordClientFrameDrop(uint64_t count = 1);
+void RecordDecodedFrameDrop(uint64_t count = 1);
 void RecordNetworkFrameDrop(uint64_t count = 1);
 void Log(const wchar_t* fmt, ...);
 

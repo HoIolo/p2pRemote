@@ -19,6 +19,11 @@ final class H264LowLatencyEncoder {
     private var pendingForcedKeyframe = false
     private var reportedFirstEncodedFrame = false
     private var currentBitrate: Int
+    private let inflightLock = NSLock()
+    private var inflightFrames = 0
+    private let maxInflightFrames = 1
+    private var droppedForBackpressure: UInt64 = 0
+    private var lastBackpressureLog = nowUs()
 
     init(width: Int, height: Int, fps: Int, bitrate: Int, keyframeSeconds: Int, onFrame: @escaping (Data, Bool, Bool, UInt64) -> Void) throws {
         self.width = Int32(width)
@@ -110,6 +115,39 @@ final class H264LowLatencyEncoder {
         logLine("[encoder] bitrate updated: \(clamped)")
     }
 
+    func canAcceptFrame() -> Bool {
+        inflightLock.lock()
+        let available = inflightFrames < maxInflightFrames
+        inflightLock.unlock()
+        return available
+    }
+
+    private func beginEncodeSlot() -> Bool {
+        inflightLock.lock()
+        defer { inflightLock.unlock() }
+        guard inflightFrames < maxInflightFrames else { return false }
+        inflightFrames += 1
+        return true
+    }
+
+    fileprivate func finishEncodeSlot() {
+        inflightLock.lock()
+        if inflightFrames > 0 {
+            inflightFrames -= 1
+        }
+        inflightLock.unlock()
+    }
+
+    private func recordBackpressureDrop() {
+        droppedForBackpressure &+= 1
+        let now = nowUs()
+        if now - lastBackpressureLog >= 1_000_000 {
+            logLine("[encoder] skipped stale frames while encoder busy: \(droppedForBackpressure)")
+            droppedForBackpressure = 0
+            lastBackpressureLog = now
+        }
+    }
+
     func reconfigure(width newWidth: Int, height newHeight: Int, fps newFps: Int, bitrate newBitrate: Int, keyframeSeconds newKeyframeSeconds: Int, reason: String = "profile changed") throws {
         let clampedWidth = Int32(max(640, newWidth))
         let clampedHeight = Int32(max(360, newHeight))
@@ -135,12 +173,20 @@ final class H264LowLatencyEncoder {
         reportedFirstEncodedFrame = false
         controlLock.unlock()
 
+        inflightLock.lock()
+        inflightFrames = 0
+        inflightLock.unlock()
+
         try createSession()
         logLine("[encoder] reconfigured: \(Int(clampedWidth))x\(Int(clampedHeight))@\(clampedFps) bitrate=\(clampedBitrate) reason=\(reason)")
     }
 
-    func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, forceKeyframe: Bool = false) {
-        guard let session else { return }
+    func encode(_ pixelBuffer: CVPixelBuffer, pts: CMTime, forceKeyframe: Bool = false) -> Bool {
+        guard let session else { return false }
+        guard beginEncodeSlot() else {
+            recordBackpressureDrop()
+            return false
+        }
         var flags = VTEncodeInfoFlags()
         let index = frameIndex
         frameIndex += 1
@@ -162,9 +208,17 @@ final class H264LowLatencyEncoder {
             infoFlagsOut: &flags
         )
         if status != noErr {
+            finishEncodeSlot()
             fputs("[encoder] encode failed: \(status)\n", stderr)
             fflush(stderr)
+            return false
         }
+        if flags.contains(.frameDropped) {
+            finishEncodeSlot()
+            recordBackpressureDrop()
+            return false
+        }
+        return true
     }
 
     fileprivate func handle(sampleBuffer: CMSampleBuffer) {
@@ -246,7 +300,9 @@ final class H264LowLatencyEncoder {
 }
 
 private let compressionCallback: VTCompressionOutputCallback = { refcon, _, status, _, sampleBuffer in
-    guard status == noErr, let refcon, let sampleBuffer else { return }
+    guard let refcon else { return }
     let encoder = Unmanaged<H264LowLatencyEncoder>.fromOpaque(refcon).takeUnretainedValue()
+    defer { encoder.finishEncodeSlot() }
+    guard status == noErr, let sampleBuffer else { return }
     encoder.handle(sampleBuffer: sampleBuffer)
 }

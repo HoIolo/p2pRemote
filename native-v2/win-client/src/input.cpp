@@ -88,8 +88,8 @@ uint16_t MacModifierMaskForCurrentWinKeys() {
   return mask;
 }
 
-void SendInputPacket(uint8_t kind, float x, float y, int32_t dx, int32_t dy, uint16_t button, uint16_t keyCode) {
-  if (g_inputSock == INVALID_SOCKET) return;
+bool SendInputPacket(uint8_t kind, float x, float y, int32_t dx, int32_t dy, uint16_t button, uint16_t keyCode) {
+  if (g_inputSock == INVALID_SOCKET) return false;
   P2InputPacket p{};
   memcpy(p.magic, "P2I2", 4);
   p.version = P2_VERSION;
@@ -97,7 +97,8 @@ void SendInputPacket(uint8_t kind, float x, float y, int32_t dx, int32_t dy, uin
   p.bytes = sizeof(P2InputPacket);
   p.seq = g_inputSeq.fetch_add(1);
   p.x = x; p.y = y; p.dx = dx; p.dy = dy; p.button = button; p.keyCode = keyCode;
-  sendto(g_inputSock, reinterpret_cast<const char*>(&p), sizeof(p), 0, reinterpret_cast<sockaddr*>(&g_inputAddr), sizeof(g_inputAddr));
+  int rc = sendto(g_inputSock, reinterpret_cast<const char*>(&p), sizeof(p), 0, reinterpret_cast<sockaddr*>(&g_inputAddr), sizeof(g_inputAddr));
+  return rc == sizeof(p);
 }
 
 bool InitInputSocket() {

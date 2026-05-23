@@ -164,12 +164,12 @@ struct MacHostMain {
             let output = ScreenCaptureOutput(
                 encoder: encoder,
                 shouldEncodeFrame: {
-                    // UDP path is latency sensitive: allow at most one encoded
-                    // frame waiting behind the one currently being sent.  This
-                    // mirrors Parsec-style latest-frame-wins behavior during
-                    // scroll/high-motion bursts.  TCP keeps the old behavior.
+                    // UDP path is latency sensitive: do not feed VideoToolbox
+                    // while a frame is already encoded or waiting to be sent.
+                    // This prefers a fresh capture sample over completing stale
+                    // work queued in the pipeline. TCP keeps the old behavior.
                     if let udpVideo {
-                        return !udpVideo.hasQueuedFrameForSend()
+                        return encoder.canAcceptFrame() && !udpVideo.hasQueuedFrameForSend()
                     }
                     return true
                 },

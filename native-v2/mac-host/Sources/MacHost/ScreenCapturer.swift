@@ -46,17 +46,15 @@ final class ScreenCaptureOutput: NSObject, SCStreamOutput {
         let pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer)
         let now = nowUs()
         let isFirstFrameForStream = !reportedFirstFrame
-        let forceKeyframe = isFirstFrameForStream || now - lastKeyframe >= 1_000_000
+        let forceKeyframe = isFirstFrameForStream
 
-        // Do not let high-motion scroll bursts build an encode/send backlog.
-        // If the UDP sender already has a newer frame queued while it is still
-        // transmitting the previous one, encoding more stale frames only burns
-        // VideoToolbox/GPU time and makes interaction feel delayed.  Keep one
-        // queued frame at most; the next ScreenCaptureKit sample will refresh it.
+        // Do not let high-motion bursts build any hidden encode/send backlog.
+        // Game-like remoting wants newest-frame-wins before VideoToolbox, not a
+        // queue of already-stale P-frames inside the encoder or UDP sender.
         // Never skip the first sample of a stream: startup/reconfigure readiness
         // and decoder recovery both depend on a real encoded frame, not a dropped
         // sample that merely arrived from ScreenCaptureKit.
-        if !isFirstFrameForStream && !shouldEncodeFrame() {
+        if !isFirstFrameForStream && (!shouldEncodeFrame() || !encoder.canAcceptFrame()) {
             skippedForBackpressure &+= 1
             if now - lastBackpressureLog >= 1_000_000 {
                 logLine("[capture] skipped stale frames for sender backpressure: \(skippedForBackpressure)")
@@ -86,7 +84,7 @@ final class ScreenCaptureOutput: NSObject, SCStreamOutput {
         }
 
         if forceKeyframe { lastKeyframe = now }
-        encoder.encode(pixelBuffer, pts: pts, forceKeyframe: forceKeyframe)
+        guard encoder.encode(pixelBuffer, pts: pts, forceKeyframe: forceKeyframe) else { return }
         frames += 1
         if frames % 300 == 0 {
             let elapsed = Double(nowUs() - started) / 1_000_000.0

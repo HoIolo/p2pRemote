@@ -29,39 +29,47 @@ final class NativeStats {
     private var lastFrameId: UInt64 = 0
     private var started = nowUs()
     private var lastLog = nowUs()
+    private var lastFrameAgeUs: UInt64 = 0
+    private var maxFrameAgeUs: UInt64 = 0
 
-    func recordFrame(frameId: UInt64, packets: UInt64, bytes: UInt64, errors: UInt64) {
+    func recordFrame(frameId: UInt64, packets: UInt64, bytes: UInt64, errors: UInt64, ptsUs: UInt64) {
         lock.lock()
         encodedFrames += 1
         sentPackets += packets
         sentBytes += bytes
         sendErrors += errors
         lastFrameId = frameId
+        let ageUs = nowUs() > ptsUs ? nowUs() - ptsUs : 0
+        lastFrameAgeUs = ageUs
+        maxFrameAgeUs = max(maxFrameAgeUs, ageUs)
         let now = nowUs()
         if now - lastLog >= 1_000_000 {
             let elapsed = Double(now - started) / 1_000_000.0
             let fps = Double(encodedFrames) / max(0.001, elapsed)
             let mbps = Double(sentBytes) * 8.0 / max(0.001, elapsed) / 1_000_000.0
-            logLine(String(format: "[video] encoded=%.1f fps sent=%.1f Mbps packets=%llu errors=%llu lastFrame=%llu",
-                           fps, mbps, sentPackets, sendErrors, lastFrameId))
+            logLine(String(format: "[video] encoded=%.1f fps sent=%.1f Mbps packets=%llu errors=%llu lastFrame=%llu age=%.1fms maxAge=%.1fms",
+                           fps, mbps, sentPackets, sendErrors, lastFrameId, Double(lastFrameAgeUs) / 1000.0, Double(maxFrameAgeUs) / 1000.0))
             lastLog = now
         }
         lock.unlock()
     }
 
-    func recordTransport(frameId: UInt64, packets: UInt64, bytes: UInt64, errors: UInt64) {
+    func recordTransport(frameId: UInt64, packets: UInt64, bytes: UInt64, errors: UInt64, ptsUs: UInt64) {
         lock.lock()
         sentPackets += packets
         sentBytes += bytes
         sendErrors += errors
         lastFrameId = frameId
+        let ageUs = nowUs() > ptsUs ? nowUs() - ptsUs : 0
+        lastFrameAgeUs = ageUs
+        maxFrameAgeUs = max(maxFrameAgeUs, ageUs)
         let now = nowUs()
         if now - lastLog >= 1_000_000 {
             let elapsed = Double(now - started) / 1_000_000.0
             let fps = Double(encodedFrames) / max(0.001, elapsed)
             let mbps = Double(sentBytes) * 8.0 / max(0.001, elapsed) / 1_000_000.0
-            logLine(String(format: "[video] encoded=%.1f fps sent=%.1f Mbps packets=%llu errors=%llu lastFrame=%llu",
-                           fps, mbps, sentPackets, sendErrors, lastFrameId))
+            logLine(String(format: "[video] encoded=%.1f fps sent=%.1f Mbps packets=%llu errors=%llu lastFrame=%llu age=%.1fms maxAge=%.1fms",
+                           fps, mbps, sentPackets, sendErrors, lastFrameId, Double(lastFrameAgeUs) / 1000.0, Double(maxFrameAgeUs) / 1000.0))
             lastLog = now
         }
         lock.unlock()
@@ -174,10 +182,11 @@ final class UdpVideoSender {
 
         var one: Int32 = 1
         setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, socklen_t(MemoryLayout<Int32>.size))
-        // Keep the kernel queue short.  A multi-megabyte UDP send buffer can
-        // hide >1s of stale video during scroll/high-motion bursts.  Low-latency
-        // streaming should drop old frames in user space, not buffer them.
-        var sndbuf: Int32 = 512 * 1024
+        // Keep the kernel queue short. A large UDP send buffer hides stale video
+        // as soon as a scroll/game burst produces more packets than the NIC can
+        // transmit immediately. Pace before send and keep only a small kernel
+        // cushion.
+        var sndbuf: Int32 = 128 * 1024
         setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, socklen_t(MemoryLayout<Int32>.size))
         var tos: Int32 = 0x10 // IPTOS_LOWDELAY
         setsockopt(fd, IPPROTO_IP, IP_TOS, &tos, socklen_t(MemoryLayout<Int32>.size))
@@ -263,21 +272,20 @@ final class UdpVideoSender {
         }
     }
 
-    private func paceAfterPacket(packetBytes: Int) {
+    private func waitForPacketSlot(packetBytes: Int) {
         let bitrate = currentTargetBitrate()
         let spacingUs = max(50, UInt64(packetBytes * 8 * 1_000_000 / bitrate))
         let now = nowUs()
         if nextPacketDueUs == 0 || nextPacketDueUs + 100_000 < now {
             nextPacketDueUs = now
         }
-        nextPacketDueUs &+= spacingUs
-        let afterSend = nowUs()
-        if nextPacketDueUs > afterSend {
-            let delay = min(UInt64(2_000), nextPacketDueUs - afterSend)
+        if nextPacketDueUs > now {
+            let delay = min(UInt64(2_000), nextPacketDueUs - now)
             if delay > 0 {
                 usleep(useconds_t(delay))
             }
         }
+        nextPacketDueUs = max(nextPacketDueUs, nowUs()) &+ spacingUs
     }
 
     private func sendFrameNow(_ item: QueuedFrame) {
@@ -288,7 +296,7 @@ final class UdpVideoSender {
         let ptsUs = item.ptsUs
 
         let fragCount = UInt16((frame.count + maxVideoFragmentPayload - 1) / maxVideoFragmentPayload)
-        let useFec = fragCount >= 3
+        let useFec = false
         let totalFragCount = fragCount + (useFec ? 1 : 0)
         var parity = Data(repeating: 0, count: maxVideoFragmentPayload)
         var parityLen = 0
@@ -312,6 +320,7 @@ final class UdpVideoSender {
             packet.appendU16LE(UInt16(payload.count))
             packet.appendU16LE(flags)
             packet.append(payload)
+            waitForPacketSlot(packetBytes: packet.count)
             packet.withUnsafeBytes { raw in
                 withUnsafePointer(to: &addr) { ptr in
                     ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { sa in
@@ -319,7 +328,6 @@ final class UdpVideoSender {
                         if rc >= 0 {
                             sentPackets += 1
                             sentBytes += UInt64(rc)
-                            paceAfterPacket(packetBytes: rc)
                         } else {
                             sendErrors += 1
                         }
@@ -330,12 +338,14 @@ final class UdpVideoSender {
 
         while offset < frame.count {
             let n = min(maxVideoFragmentPayload, frame.count - offset)
-            parityLen = max(parityLen, n)
-            frame.withUnsafeBytes { raw in
-                guard let src = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-                parity.withUnsafeMutableBytes { parityRaw in
-                    guard let dst = parityRaw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
-                    for i in 0..<n { dst[i] ^= src[offset + i] }
+            if useFec {
+                parityLen = max(parityLen, n)
+                frame.withUnsafeBytes { raw in
+                    guard let src = raw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                    parity.withUnsafeMutableBytes { parityRaw in
+                        guard let dst = parityRaw.baseAddress?.assumingMemoryBound(to: UInt8.self) else { return }
+                        for i in 0..<n { dst[i] ^= src[offset + i] }
+                    }
                 }
             }
             var flags: UInt16 = 0
@@ -354,7 +364,7 @@ final class UdpVideoSender {
             sendPacket(fragIndex: fragIndex, totalFragCount: totalFragCount, payload: Data(parity.prefix(parityLen)), flags: flags)
         }
 
-        NativeStats.shared.recordFrame(frameId: id, packets: sentPackets, bytes: sentBytes, errors: sendErrors)
+        NativeStats.shared.recordFrame(frameId: id, packets: sentPackets, bytes: sentBytes, errors: sendErrors, ptsUs: ptsUs)
     }
 }
 
@@ -474,6 +484,6 @@ final class TcpVideoServer {
         }
         clients = next
         lock.unlock()
-        NativeStats.shared.recordFrame(frameId: id, packets: sentClients, bytes: UInt64(packet.count) * sentClients, errors: 0)
+        NativeStats.shared.recordFrame(frameId: id, packets: sentClients, bytes: UInt64(packet.count) * sentClients, errors: 0, ptsUs: ptsUs)
     }
 }

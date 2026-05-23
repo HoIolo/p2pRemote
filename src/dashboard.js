@@ -23,6 +23,14 @@ const refreshPermissionStatusBtn = $('refreshPermissionStatus');
 const openSystemPrivacySettingsBtn = $('openSystemPrivacySettings');
 const manualAddBtn = $('manualAdd');
 const nativeV2StatusTextEl = $('nativeV2StatusText');
+const nativeV2ConnectBtn = $('nativeV2Connect');
+const gameStreamStatusTextEl = $('gameStreamStatusText');
+const gameStreamConnectBtn = $('gameStreamConnect');
+const gameStreamPairBtn = $('gameStreamPair');
+const gameStreamHostBtn = $('gameStreamHost');
+const gameStreamOpenSunshineBtn = $('gameStreamOpenSunshine');
+const gameStreamDownloadBtn = $('gameStreamDownload');
+const gameStreamInstallProgressEl = $('gameStreamInstallProgress');
 const logEl = $('log');
 
 
@@ -31,6 +39,9 @@ let selectedId = null;
 let nativeV2Status = null;
 let appInfo = null;
 let nativeV2Connecting = false;
+let gameStreamStatus = null;
+let gameStreamBusy = false;
+let gameStreamInstallBusy = false;
 let macPermissionStatus = {
   platform: 'unknown',
   screenCapture: 'unknown',
@@ -57,6 +68,10 @@ function clearLegacyDashboardControlProfile() {
 
 function setNativeV2StatusText(message) {
   if (nativeV2StatusTextEl) nativeV2StatusTextEl.textContent = message;
+}
+
+function setGameStreamStatusText(message) {
+  if (gameStreamStatusTextEl) gameStreamStatusTextEl.textContent = message;
 }
 
 function permissionGranted(status) {
@@ -137,6 +152,157 @@ function friendlyNativeV2Error(err, device) {
   if (raw.includes('还没有构建') || raw.includes('not built')) return raw;
   if (raw.includes('bad pin')) return 'PIN 校验失败，请刷新设备后重试。';
   return raw.replace(/^Error invoking remote method '[^']+': Error:\s*/i, '');
+}
+
+function friendlyGameStreamError(err) {
+  const raw = err?.message || String(err || 'Unknown error');
+  if (raw.includes('未找到 Sunshine')) return raw;
+  if (raw.includes('未找到 Moonlight')) return raw;
+  if (raw.includes('has not been paired') || raw.includes('not been paired')) {
+    return 'Moonlight 尚未与 Sunshine 配对。点击“配对”，在 Sunshine Web UI 的 PIN 页面输入 Moonlight 显示的 4 位 PIN。';
+  }
+  if (raw.includes('Failed to find application')) {
+    return 'Moonlight 找不到 Sunshine 的 Desktop 应用。请打开 Sunshine Web UI，确认 Applications 里存在 Desktop。';
+  }
+  if (raw.includes('timed out') || raw.includes('closed before response')) {
+    return '远端没有响应游戏串流启动请求。请确认对端 App 在线、PIN 正确、防火墙允许本程序通信。';
+  }
+  if (raw.includes('ECONNREFUSED') || raw.includes('connection failed')) {
+    return '无法连接远端控制通道。请刷新设备列表并确认对端 App 正在运行。';
+  }
+  if (raw.includes('bad pin')) return 'PIN 校验失败，请刷新设备后重试。';
+  return raw.replace(/^Error invoking remote method '[^']+': Error:\s*/i, '');
+}
+
+function setGameStreamBusy(busy, message) {
+  gameStreamBusy = busy;
+  if (message) setGameStreamStatusText(message);
+  document.body.classList.toggle('gameStreamConnecting', busy);
+  renderDevices();
+}
+
+function formatBytes(value) {
+  const bytes = Number(value || 0);
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / 1024 / 1024 / 1024).toFixed(1)} GB`;
+  if (bytes >= 1024 * 1024) return `${(bytes / 1024 / 1024).toFixed(1)} MB`;
+  if (bytes >= 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${bytes} B`;
+}
+
+function renderGameStreamInstallProgress(progress) {
+  if (!gameStreamInstallProgressEl || !progress) return;
+  const tool = progress.tool === 'sunshine' ? 'Sunshine' : 'Moonlight';
+  if (progress.phase === 'download') {
+    const total = Number(progress.total || 0);
+    gameStreamInstallProgressEl.textContent = total > 0
+      ? `${tool} 下载中：${formatBytes(progress.received)} / ${formatBytes(total)}`
+      : `${tool} 下载中：${formatBytes(progress.received)}`;
+    return;
+  }
+  const labels = {
+    start: `${tool} 准备下载...`,
+    extract: `${tool} 正在解压...`,
+    installer: `${tool} 正在运行安装器...`,
+    mount: `${tool} 正在挂载 DMG...`,
+    copy: `${tool} 正在复制到 Applications...`,
+    done: `${tool} 安装完成`,
+  };
+  gameStreamInstallProgressEl.textContent = labels[progress.phase] || `${tool} ${progress.phase || '处理中'}...`;
+}
+
+function requiredGameStreamToolStatus() {
+  if (gameStreamStatus?.platform === 'darwin') return gameStreamStatus.sunshine || {};
+  if (gameStreamStatus?.platform === 'win32') return gameStreamStatus.moonlight || {};
+  return { available: true };
+}
+
+function requiredGameStreamToolLabel() {
+  return gameStreamStatus?.platform === 'darwin' ? 'Sunshine' : 'Moonlight';
+}
+
+function isRequiredGameStreamToolInstalled() {
+  return Boolean(requiredGameStreamToolStatus().available);
+}
+
+
+async function installGameStreamComponent() {
+  if (gameStreamInstallBusy) return;
+  await refreshGameStreamStatus();
+  if (isRequiredGameStreamToolInstalled()) {
+    const label = requiredGameStreamToolLabel();
+    if (gameStreamInstallProgressEl) gameStreamInstallProgressEl.textContent = `${label} 已安装，无需重复安装。`;
+    setGameStreamStatusText(`${label} 已就绪，无需重复安装。`);
+    renderDevices();
+    return;
+  }
+  const isMac = gameStreamStatus?.platform === 'darwin';
+  const tool = isMac ? 'sunshine' : 'moonlight';
+  const mode = gameStreamStatus?.platform === 'win32' ? 'installer' : 'dmg';
+  gameStreamInstallBusy = true;
+  setGameStreamBusy(true, `正在安装 ${tool === 'sunshine' ? 'Sunshine' : 'Moonlight'}...`);
+  renderGameStreamInstallProgress({ phase: 'start', tool, mode });
+  try {
+    const result = await window.lanRemote.installGameStreamTool({ tool, mode });
+    updateGameStreamStatus(result.status);
+    renderGameStreamInstallProgress({ phase: 'done', tool, mode });
+    setGameStreamStatusText(`${tool === 'sunshine' ? 'Sunshine' : 'Moonlight'} 已安装；可以继续启动游戏模式。`);
+    log(`game-stream install completed: ${tool} ${mode}`);
+  } catch (err) {
+    const message = friendlyGameStreamError(err);
+    setGameStreamStatusText(`安装失败：${message}`);
+    if (gameStreamInstallProgressEl) gameStreamInstallProgressEl.textContent = `安装失败：${message}`;
+    log(`game-stream install failed: ${message}`);
+  } finally {
+    gameStreamInstallBusy = false;
+    setGameStreamBusy(false);
+  }
+}
+
+function updateGameStreamStatus(status) {
+  gameStreamStatus = status || gameStreamStatus;
+  renderDevices();
+  if (gameStreamBusy) return;
+  if (!gameStreamStatusTextEl || !gameStreamStatus) return;
+
+  const moonlight = gameStreamStatus.moonlight || {};
+  const sunshine = gameStreamStatus.sunshine || {};
+  const isWindows = gameStreamStatus.platform === 'win32';
+  const isMac = gameStreamStatus.platform === 'darwin';
+
+  if (isWindows) {
+    if (!moonlight.available) {
+      gameStreamStatusTextEl.textContent = '未找到 Moonlight：请安装 Moonlight Qt，或把 Moonlight.exe 加入 PATH。';
+    } else if (moonlight.running) {
+      gameStreamStatusTextEl.textContent = `Moonlight 游戏串流运行中，pid=${moonlight.pid}。`;
+    } else if (moonlight.pairing) {
+      gameStreamStatusTextEl.textContent = 'Moonlight 配对流程运行中；请在 Sunshine Web UI 输入显示的 4 位 PIN。';
+    } else {
+      gameStreamStatusTextEl.textContent = 'Moonlight 已就绪：优先使用 Sunshine/Moonlight 游戏模式，Native v2 作为 fallback。';
+    }
+    return;
+  }
+
+  if (isMac) {
+    if (!sunshine.available) {
+      gameStreamStatusTextEl.textContent = '未找到 Sunshine：请安装 Sunshine，或把 sunshine 加入 PATH。';
+    } else if (sunshine.running) {
+      gameStreamStatusTextEl.textContent = `Sunshine Host 运行中，pid=${sunshine.pid}；首次连接需在 Sunshine Web UI 配对 Moonlight。`;
+    } else {
+      gameStreamStatusTextEl.textContent = 'Sunshine 已就绪：点击启动 Host 后，用 Windows Moonlight 连接。';
+    }
+    return;
+  }
+
+  gameStreamStatusTextEl.textContent = '游戏串流模式需要 Sunshine Host 和 Moonlight 客户端。';
+}
+
+async function refreshGameStreamStatus() {
+  if (!window.lanRemote.getGameStreamStatus) return;
+  try {
+    updateGameStreamStatus(await window.lanRemote.getGameStreamStatus());
+  } catch (err) {
+    setGameStreamStatusText(`游戏串流状态检测失败：${err.message}`);
+  }
 }
 
 function setNativeV2Busy(busy, message) {
@@ -303,6 +469,43 @@ function nativeV2DisplayOptions(device) {
   };
 }
 
+function gameStreamFpsOptions(device) {
+  const defaults = gameStreamStatus?.defaults || {};
+  const displayFps = Number(device?.display?.displayFrequency || device?.displayFrequency || 0);
+  const fps = displayFps >= 30 ? displayFps : (defaults.fps || 60);
+  return Math.max(30, Math.min(120, Math.round(fps)));
+}
+
+function gameStreamClientOptions(device) {
+  const defaults = gameStreamStatus?.defaults || {};
+  const displayPixels = remoteDisplayPixelSize(device);
+  const display = displayPixels?.width && displayPixels?.height
+    ? scaleResolution(displayPixels.width, displayPixels.height, 1920)
+    : { width: defaults.width || 1920, height: defaults.height || 1080 };
+  const pixels = display.width * display.height;
+  const bitrateKbps = Math.max(Number(defaults.bitrateKbps || 30000), Math.round(autoBitrateForPixels(pixels, 12_000_000) / 1000));
+  return {
+    hostIp: device.address,
+    appName: defaults.appName || 'Desktop',
+    width: display.width,
+    height: display.height,
+    fps: gameStreamFpsOptions(device),
+    bitrateKbps,
+    videoCodec: defaults.videoCodec || 'HEVC',
+    videoDecoder: defaults.videoDecoder || 'hardware',
+    displayMode: defaults.displayMode || 'fullscreen',
+    captureSystemKeys: defaults.captureSystemKeys || 'always',
+    absoluteMouse: defaults.absoluteMouse !== false,
+    framePacing: true,
+    gameOptimization: true,
+    performanceOverlay: true,
+  };
+}
+
+function gameStreamRemoteHostOptions(device = selectedDevice()) {
+  return { readyTimeoutMs: 12_000, webHost: device?.address || '' };
+}
+
 function nativeV2ClientOptions(device) {
   const defaults = nativeV2Status?.defaults || {};
   const display = nativeV2DisplayOptions(device);
@@ -389,13 +592,25 @@ function renderDevices() {
   selectedStatusEl.textContent = selected ? '在线' : '等待设备';
   selectedStatusEl.className = selected ? 'pill online' : 'pill muted';
   previewImageEl.src = selected ? (selected.preview || defaultPreview(selected.platform)) : defaultPreview('win32');
-  enterDesktopBtn.disabled = !selected || nativeV2Connecting;
-  connectSelectedBtn.disabled = !selected || nativeV2Connecting;
-  const actionLabel = 'Native v2 极速';
+  const anyBusy = nativeV2Connecting || gameStreamBusy;
+  enterDesktopBtn.disabled = !selected || anyBusy;
+  connectSelectedBtn.disabled = !selected || anyBusy;
+  if (gameStreamConnectBtn) gameStreamConnectBtn.disabled = !selected || anyBusy;
+  if (nativeV2ConnectBtn) nativeV2ConnectBtn.disabled = !selected || anyBusy;
+  if (gameStreamPairBtn) gameStreamPairBtn.disabled = !selected || anyBusy || gameStreamStatus?.platform !== 'win32';
+  if (gameStreamHostBtn) gameStreamHostBtn.disabled = anyBusy || gameStreamStatus?.platform !== 'darwin';
+  if (gameStreamOpenSunshineBtn) gameStreamOpenSunshineBtn.disabled = gameStreamStatus?.platform !== 'darwin';
+  if (gameStreamDownloadBtn) {
+    const toolInstalled = isRequiredGameStreamToolInstalled();
+    gameStreamDownloadBtn.hidden = toolInstalled && !gameStreamInstallBusy;
+    gameStreamDownloadBtn.disabled = anyBusy || toolInstalled;
+    gameStreamDownloadBtn.textContent = gameStreamInstallBusy ? '安装中...' : `安装 ${requiredGameStreamToolLabel()}`;
+  }
+  const actionLabel = '游戏模式';
   const enterText = enterDesktopBtn.querySelector('span');
   const connectText = connectSelectedBtn.querySelector('span');
-  if (enterText) enterText.textContent = nativeV2Connecting ? '正在启动...' : (selected ? actionLabel : '进入桌面');
-  if (connectText) connectText.textContent = nativeV2Connecting ? '正在启动...' : actionLabel;
+  if (enterText) enterText.textContent = anyBusy ? '正在启动...' : (selected ? actionLabel : '进入桌面');
+  if (connectText) connectText.textContent = anyBusy ? '正在启动...' : actionLabel;
 
   for (const item of deviceListEl.querySelectorAll('.sideItem[data-id]')) {
     item.addEventListener('click', () => {
@@ -413,7 +628,7 @@ async function refreshDevices() {
 async function openSelected() {
   const device = selectedDevice();
   if (!device) return;
-  await openNativeV2Device(device);
+  await openGameStreamDevice(device);
 }
 
 async function openNativeV2Device(device) {
@@ -480,17 +695,117 @@ async function openNativeV2Device(device) {
   }
 }
 
-async function manualNativeV2Connect(address) {
+async function openGameStreamDevice(device) {
+  if (gameStreamBusy) {
+    log('game-stream start ignored: already connecting');
+    return;
+  }
+  setGameStreamBusy(true, `正在启动游戏模式：请等待 ${device.address} 的 Sunshine/Moonlight 就绪...`);
+  try {
+    await refreshGameStreamStatus();
+    if (gameStreamStatus?.platform === 'win32') {
+      if (!gameStreamStatus?.moonlight?.available) {
+        const message = 'Moonlight 未安装。请安装 Moonlight Qt 后重试。';
+        log(message);
+        setGameStreamStatusText(message);
+        return;
+      }
+      if (device.pin && device.port) {
+        setGameStreamStatusText(`正在请求 Mac 启动 Sunshine Host：${device.address}:${device.port}`);
+        await window.lanRemote.requestGameStreamRemoteHost(device, gameStreamRemoteHostOptions(device));
+        log(`Mac Sunshine host accepted start request: ${device.address}`);
+      } else {
+        log('manual game-stream: 请确认 Mac 端 Sunshine 已启动，并完成 Moonlight 配对。');
+      }
+      const options = gameStreamClientOptions(device);
+      setGameStreamStatusText(`正在启动 Moonlight：${options.width}x${options.height}@${options.fps} ${options.videoCodec} ${Math.round(options.bitrateKbps / 1000)}Mbps...`);
+      const result = await window.lanRemote.startGameStreamClient(options);
+      log(`Moonlight started pid=${result.pid}; host=${options.hostIp}; ${options.width}x${options.height}@${options.fps}; codec=${options.videoCodec}; bitrate=${options.bitrateKbps}Kbps`);
+      setGameStreamStatusText(`Moonlight 游戏模式已启动，pid=${result.pid}；如果提示未配对，请先点击“配对”。`);
+      return;
+    }
+
+    if (gameStreamStatus?.platform === 'darwin') {
+      if (!gameStreamStatus?.sunshine?.available) {
+        const message = 'Sunshine 未安装。请安装 Sunshine 后重试。';
+        log(message);
+        setGameStreamStatusText(message);
+        return;
+      }
+      const result = await window.lanRemote.startGameStreamHost(gameStreamRemoteHostOptions(device));
+      log(`Sunshine host started pid=${result.pid}; Web UI=${result.webUrl || 'https://localhost:47990/'}`);
+      setGameStreamStatusText(`Sunshine Host 已启动，pid=${result.pid}；Windows 端用 Moonlight 连接 ${appInfo?.device?.addresses?.[0] || '本机 IP'}。`);
+      return;
+    }
+
+    const message = '游戏模式当前面向 Windows Moonlight 客户端和 macOS Sunshine Host。';
+    log(message);
+    setGameStreamStatusText(message);
+  } catch (err) {
+    const message = friendlyGameStreamError(err);
+    log(`game-stream start failed: ${message}`);
+    setGameStreamStatusText(`游戏模式启动失败：${message}`);
+  } finally {
+    setGameStreamBusy(false);
+  }
+}
+
+async function pairGameStreamDevice(device) {
+  if (!device) return;
+  setGameStreamBusy(true, `正在启动 Moonlight 配对：${device.address}`);
+  try {
+    await refreshGameStreamStatus();
+    if (gameStreamStatus?.platform !== 'win32') {
+      setGameStreamStatusText('配对需要在 Windows Moonlight 客户端执行。');
+      return;
+    }
+    if (!gameStreamStatus?.moonlight?.available) {
+      setGameStreamStatusText('Moonlight 未安装。请安装 Moonlight Qt 后重试。');
+      return;
+    }
+    if (device.pin && device.port) {
+      await window.lanRemote.requestGameStreamRemoteHost(device, gameStreamRemoteHostOptions(device));
+      log(`Mac Sunshine host accepted start request for pairing: ${device.address}`);
+    }
+    const result = await window.lanRemote.pairGameStreamClient({ hostIp: device.address });
+    log(`Moonlight pairing started pid=${result.pid}; host=${device.address}`);
+    setGameStreamStatusText('Moonlight 配对已启动；请把 Moonlight 显示的 4 位 PIN 输入 Sunshine Web UI。');
+  } catch (err) {
+    const message = friendlyGameStreamError(err);
+    log(`game-stream pair failed: ${message}`);
+    setGameStreamStatusText(`游戏模式配对失败：${message}`);
+  } finally {
+    setGameStreamBusy(false);
+  }
+}
+
+async function startLocalGameStreamHost() {
+  setGameStreamBusy(true, '正在启动本机 Sunshine Host...');
+  try {
+    const result = await window.lanRemote.startGameStreamHost(gameStreamRemoteHostOptions());
+    log(`Sunshine host started pid=${result.pid}; Web UI=${result.webUrl || 'https://localhost:47990/'}`);
+    setGameStreamStatusText(`Sunshine Host 已启动，pid=${result.pid}。首次使用请打开 Sunshine Web UI 完成设置/配对。`);
+  } catch (err) {
+    const message = friendlyGameStreamError(err);
+    log(`Sunshine start failed: ${message}`);
+    setGameStreamStatusText(`Sunshine 启动失败：${message}`);
+  } finally {
+    setGameStreamBusy(false);
+  }
+}
+
+async function manualGameStreamConnect(address) {
   const device = {
-    id: `manual-native-v2-${address}-${Date.now()}`,
+    id: `manual-game-stream-${address}-${Date.now()}`,
     name: address,
-    platform: nativeV2Status?.platform === 'darwin' ? 'win32' : 'darwin',
+    platform: gameStreamStatus?.platform === 'darwin' ? 'win32' : 'darwin',
     address,
     port: 0,
     pin: '',
   };
-  await openNativeV2Device(device);
+  await openGameStreamDevice(device);
 }
+
 
 async function initApp() {
   localStorage.removeItem('p2p-remote-dashboard-connection-mode-v1');
@@ -511,6 +826,7 @@ async function initApp() {
   }
   await refreshMacPermissionStatus();
   await refreshNativeV2Status();
+  await refreshGameStreamStatus();
   await refreshDevices();
 }
 
@@ -568,14 +884,24 @@ accessibilityPermissionToggleBtn?.addEventListener('click', async () => {
 refreshPermissionStatusBtn?.addEventListener('click', refreshMacPermissionStatus);
 openSystemPrivacySettingsBtn?.addEventListener('click', () => window.lanRemote.openScreenCaptureSettings());
 manualAddBtn.addEventListener('click', async () => {
-  const endpoint = window.prompt(nativeV2Status?.platform === 'darwin'
-    ? '输入 Windows IP（Native v2 不使用 PIN）'
-    : '输入 Mac IP（Native v2 不使用 PIN）', '');
+  const endpoint = window.prompt(gameStreamStatus?.platform === 'darwin'
+    ? '输入 Windows IP（游戏模式会启动本机 Sunshine；Native v2 fallback 仍可用）'
+    : '输入 Mac IP（游戏模式使用 Sunshine/Moonlight）', '');
   if (!endpoint) return;
   const [address] = endpoint.trim().split(':');
   if (!address) return;
-  await manualNativeV2Connect(address);
+  await manualGameStreamConnect(address);
 });
+gameStreamConnectBtn?.addEventListener('click', async () => openGameStreamDevice(selectedDevice()));
+nativeV2ConnectBtn?.addEventListener('click', async () => openNativeV2Device(selectedDevice()));
+gameStreamPairBtn?.addEventListener('click', async () => pairGameStreamDevice(selectedDevice()));
+gameStreamHostBtn?.addEventListener('click', startLocalGameStreamHost);
+gameStreamOpenSunshineBtn?.addEventListener('click', () => {
+  const selected = selectedDevice();
+  const host = gameStreamStatus?.platform === 'darwin' ? 'localhost' : selected?.address;
+  window.lanRemote.openGameStreamSunshine?.(host);
+});
+gameStreamDownloadBtn?.addEventListener('click', installGameStreamComponent);
 
 window.lanRemote.onDevicesUpdated((list) => {
   devices = list;
@@ -583,6 +909,8 @@ window.lanRemote.onDevicesUpdated((list) => {
 });
 window.lanRemote.onHostLog((entry) => log(`${entry.level || 'info'}: ${entry.message}`));
 window.lanRemote.onNativeV2Status?.((status) => updateNativeV2Status(status));
+window.lanRemote.onGameStreamStatus?.((status) => updateGameStreamStatus(status));
+window.lanRemote.onGameStreamInstallProgress?.((progress) => renderGameStreamInstallProgress(progress));
 
 
 wireWindowControls();

@@ -379,9 +379,9 @@ class VideoReceiver {
 
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) return;
-    int rcvbuf = 8 * 1024 * 1024;
+    int rcvbuf = 256 * 1024;
     setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
-    DWORD timeoutMs = 100;
+    DWORD timeoutMs = 10;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
 
     sockaddr_in addr{};
@@ -418,6 +418,10 @@ class VideoReceiver {
     uint64_t newestFrameId = 0;
     bool reportedFirstPacket = false;
     bool reportedFirstCompleteFrame = false;
+    auto partialTtlUs = []() -> uint64_t {
+      const int fps = std::max(30, g_activeVideoFps.load(std::memory_order_relaxed));
+      return std::max<uint64_t>(16'000, 2'000'000ull / static_cast<uint64_t>(fps));
+    };
 
     while (g_running.load()) {
       int n = recv(s, reinterpret_cast<char*>(packet.data()), static_cast<int>(packet.size()), 0);
@@ -452,12 +456,12 @@ class VideoReceiver {
             static_cast<unsigned>(h->flags));
       }
 
-      if (newestFrameId && h->frameId + 12 < newestFrameId) continue;
+      if (newestFrameId && h->frameId + 2 < newestFrameId) continue;
       if (h->frameId > newestFrameId) {
         newestFrameId = h->frameId;
-        const uint64_t keepFrom = newestFrameId > 3 ? newestFrameId - 3 : 0;
+        const uint64_t keepFrom = newestFrameId > 1 ? newestFrameId - 1 : 0;
         for (auto it = partials.begin(); it != partials.end();) {
-          if (it->first < keepFrom) {
+          if (it->first < keepFrom || QpcDeltaUs(it->second.firstQpc, now) > partialTtlUs()) {
             it = partials.erase(it);
             RecordNetworkFrameDrop();
           } else {
@@ -466,10 +470,10 @@ class VideoReceiver {
         }
       }
 
-      if (partials.size() > 8) {
-        uint64_t keepFrom = newestFrameId > 8 ? newestFrameId - 8 : 0;
+      if (partials.size() > 4) {
+        uint64_t keepFrom = newestFrameId > 1 ? newestFrameId - 1 : 0;
         for (auto it = partials.begin(); it != partials.end();) {
-          if (it->first < keepFrom || QpcDeltaUs(it->second.firstQpc, now) > 120'000) {
+          if (it->first < keepFrom || QpcDeltaUs(it->second.firstQpc, now) > partialTtlUs()) {
             it = partials.erase(it);
             RecordNetworkFrameDrop();
           } else {
@@ -519,6 +523,10 @@ class VideoReceiver {
       bool frameReady = false;
       if (partial.dataReceived == partial.dataFragCount) {
         frameReady = true;
+      } else if (newestFrameId > h->frameId + 1 || QpcDeltaUs(partial.firstQpc, now) > partialTtlUs()) {
+        partials.erase(h->frameId);
+        RecordNetworkFrameDrop();
+        continue;
       } else if (partial.hasFec) {
         uint16_t missingIndex = 0xffff;
         uint16_t missingCount = 0;
@@ -760,9 +768,10 @@ class MfDecoder {
     hr = mft_->ProcessInput(0, sample.Get(), 0);
     if (hr == MF_E_NOTACCEPTING) {
       DecodedFrame drained;
-      const DecodeStatus drainStatus = DrainOne(drained, encoded);
-      if (drainStatus == DecodeStatus::Error) return DecodeStatus::Error;
-      if (drainStatus == DecodeStatus::Frame) {
+      for (;;) {
+        const DecodeStatus drainStatus = DrainOne(drained, encoded);
+        if (drainStatus == DecodeStatus::NeedMoreInput) break;
+        if (drainStatus == DecodeStatus::Error) return DecodeStatus::Error;
         last = std::move(drained);
         gotFrame = true;
       }
@@ -782,7 +791,7 @@ class MfDecoder {
       return DecodeStatus::Error;
     }
 
-    for (int i = 0; i < 4; ++i) {
+    for (;;) {
       DecodedFrame one;
       const DecodeStatus status = DrainOne(one, encoded);
       if (status == DecodeStatus::NeedMoreInput) break;
@@ -1377,9 +1386,12 @@ void DecoderThread() {
       std::unique_lock lk(g_encodedMu);
       g_encodedCv.wait(lk, [] { return !g_running.load() || !g_encodedQueue.empty(); });
       if (!g_running.load()) break;
-      encoded = std::move(g_encodedQueue.front());
-      g_encodedQueue.pop_front();
-      g_encodedQueueDepthNow.store(static_cast<uint32_t>(g_encodedQueue.size()), std::memory_order_relaxed);
+      encoded = std::move(g_encodedQueue.back());
+      if (g_encodedQueue.size() > 1) {
+        RecordClientFrameDrop(static_cast<uint64_t>(g_encodedQueue.size() - 1));
+      }
+      g_encodedQueue.clear();
+      g_encodedQueueDepthNow.store(0, std::memory_order_relaxed);
     }
     DecodedFrame frame;
     const DecodeStatus status = decoder->Decode(encoded, frame);
@@ -1440,7 +1452,7 @@ void RenderThread() {
 
       frame = std::move(g_decodedQueue.back());
       if (g_decodedQueue.size() > 1) {
-        g_renderFramesDropped.fetch_add(static_cast<uint64_t>(g_decodedQueue.size() - 1), std::memory_order_relaxed);
+        RecordDecodedFrameDrop(static_cast<uint64_t>(g_decodedQueue.size() - 1));
       }
       g_decodedQueue.clear();
       g_decodedQueueDepthNow.store(0, std::memory_order_relaxed);
@@ -1506,7 +1518,7 @@ void EnterVideoRecovery(const wchar_t* reason) {
   {
     std::lock_guard lk(g_decodedMu);
     if (!g_decodedQueue.empty()) {
-      g_renderFramesDropped.fetch_add(static_cast<uint64_t>(g_decodedQueue.size()), std::memory_order_relaxed);
+      RecordDecodedFrameDrop(static_cast<uint64_t>(g_decodedQueue.size()));
       g_decodedQueue.clear();
       g_decodedQueueDepthNow.store(0, std::memory_order_relaxed);
     }
@@ -1518,6 +1530,11 @@ void EnterVideoRecovery(const wchar_t* reason) {
   if (last && QpcDeltaUs(last, now) < 120'000) return;
   g_lastKeyframeRequestQpc.store(now, std::memory_order_relaxed);
   g_keyframeRequests.fetch_add(1, std::memory_order_relaxed);
-  SendInputPacket(P2_INPUT_REQUEST_KEYFRAME, 0, 0, 0, 0, 0, 0);
+  bool sent = false;
+  for (int i = 0; i < 3; ++i) {
+    sent = SendInputPacket(P2_INPUT_REQUEST_KEYFRAME, 0, 0, 0, 0, 0, 0) || sent;
+    if (i < 2) Sleep(5);
+  }
   Log(L"requested keyframe recovery: %s", reason ? reason : L"unknown");
+  if (!sent) Log(L"keyframe request send failed: %s", reason ? reason : L"unknown");
 }

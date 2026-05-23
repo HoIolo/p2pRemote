@@ -91,6 +91,12 @@ void RecordClientFrameDrop(uint64_t count) {
   g_clientFramesDropped.fetch_add(count, std::memory_order_relaxed);
 }
 
+void RecordDecodedFrameDrop(uint64_t count) {
+  g_framesDropped.fetch_add(count, std::memory_order_relaxed);
+  g_clientFramesDropped.fetch_add(count, std::memory_order_relaxed);
+  g_renderFramesDropped.fetch_add(count, std::memory_order_relaxed);
+}
+
 void RecordNetworkFrameDrop(uint64_t count) {
   g_framesDropped.fetch_add(count, std::memory_order_relaxed);
   g_networkFramesDropped.fetch_add(count, std::memory_order_relaxed);
@@ -256,12 +262,7 @@ int DefaultBitrateForPixels(int width, int height, int fallback) {
 }
 
 size_t EncodedQueueDepthTarget() {
-  size_t target = 1;
-  const uint64_t lastProfileApply = g_lastProfileApplyQpc.load(std::memory_order_relaxed);
-  const uint64_t now = QpcNow();
-  if (lastProfileApply && QpcDeltaUs(lastProfileApply, now) < 2'500'000) {
-    target += 1;
-  }
+  size_t target = kMinEncodedQueueDepth;
   target = std::max(kMinEncodedQueueDepth, target);
   target = std::min(kMaxEncodedQueueDepth, target);
   g_encodedQueueTargetNow.store(static_cast<uint32_t>(target), std::memory_order_relaxed);
@@ -282,7 +283,7 @@ void PushDecoded(DecodedFrame&& frame) {
     const size_t queueTarget = DecodedQueueDepthTarget();
     while (g_decodedQueue.size() >= queueTarget) {
       g_decodedQueue.pop_front();
-      g_renderFramesDropped.fetch_add(1, std::memory_order_relaxed);
+      RecordDecodedFrameDrop();
     }
     g_decodedQueue.emplace_back(std::move(frame));
     g_decodedQueueDepthNow.store(static_cast<uint32_t>(g_decodedQueue.size()), std::memory_order_relaxed);
@@ -536,9 +537,7 @@ void ClearPendingVideoQueues() {
   {
     std::lock_guard lk(g_encodedMu);
     if (!g_encodedQueue.empty()) {
-      const uint64_t count = static_cast<uint64_t>(g_encodedQueue.size());
-      g_framesDropped.fetch_add(count, std::memory_order_relaxed);
-      g_clientFramesDropped.fetch_add(count, std::memory_order_relaxed);
+      RecordClientFrameDrop(static_cast<uint64_t>(g_encodedQueue.size()));
       g_encodedQueue.clear();
       g_encodedQueueDepthNow.store(0, std::memory_order_relaxed);
     }
@@ -546,7 +545,7 @@ void ClearPendingVideoQueues() {
   {
     std::lock_guard lk(g_decodedMu);
     if (!g_decodedQueue.empty()) {
-      g_renderFramesDropped.fetch_add(static_cast<uint64_t>(g_decodedQueue.size()), std::memory_order_relaxed);
+      RecordDecodedFrameDrop(static_cast<uint64_t>(g_decodedQueue.size()));
       g_decodedQueue.clear();
       g_decodedQueueDepthNow.store(0, std::memory_order_relaxed);
     }

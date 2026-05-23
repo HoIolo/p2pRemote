@@ -81,9 +81,24 @@
         <h2>快速启动</h2>
         <div id="quickGrid" class="quickGrid">
           <button id="manualAdd" class="quickAdd"><svg class="quickIcon" aria-hidden="true"><use href="assets/icons.svg#icon-plus"></use></svg><span>手动连接</span></button>
-          <div class="nativeHint">
-            <b>Native v2 极限链路</b>
+          <div class="streamHint">
+            <b>极速游戏模式（Sunshine / Moonlight）</b>
+            <span id="gameStreamStatusText">正在检测 Sunshine / Moonlight...</span>
+            <div class="streamActions">
+              <button id="gameStreamConnect" class="miniAction" type="button" disabled>启动游戏模式</button>
+              <button id="gameStreamPair" class="miniAction" type="button" disabled>配对</button>
+              <button id="gameStreamHost" class="miniAction" type="button" disabled>启动 Host</button>
+              <button id="gameStreamOpenSunshine" class="miniAction" type="button" disabled>Sunshine Web</button>
+              <button id="gameStreamDownload" class="miniAction" type="button">安装组件</button>
+            </div>
+            <small id="gameStreamInstallProgress" class="installProgress"></small>
+          </div>
+          <div class="nativeHint fallbackHint">
+            <b>Native v2 fallback</b>
             <span id="nativeV2StatusText">正在检测 native-v2...</span>
+            <div class="streamActions">
+              <button id="nativeV2Connect" class="miniAction" type="button" disabled>启动 Native v2</button>
+            </div>
           </div>
         </div>
 
