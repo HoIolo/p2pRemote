@@ -150,6 +150,10 @@ struct MacHostMain {
                     Task {
                         await gRuntime?.updateBitrate(bitrate, reason: "windows adaptive control")
                     }
+                },
+                onClientTimeout: {
+                    logLine("[control] client disconnected (timeout), stopping host")
+                    exit(0)
                 }
             )
             gRuntime = NativeHostRuntime(

@@ -10,6 +10,7 @@ let p2InputRequestKeyframe: UInt8 = 7
 let p2InputSetVideoProfile: UInt8 = 8
 let p2InputSetVideoBitrate: UInt8 = 9
 let p2InputText: UInt8 = 10
+let p2InputHeartbeat: UInt8 = 11
 let p2FlagKeyframe: UInt16 = 1 << 0
 let p2FlagConfig: UInt16 = 1 << 1
 let p2FlagFec: UInt16 = 1 << 2

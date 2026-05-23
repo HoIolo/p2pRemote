@@ -83,8 +83,8 @@ final class H264LowLatencyEncoder {
 
     private func setDataRateLimits(bitrate: Int) {
         guard bitrate > 0 else { return }
-        let burstBytes = max(1, bitrate * 3 / 8 / 10)
-        let limits: [Any] = [burstBytes as NSNumber, 0.1 as NSNumber]
+        let bytesPerSecond = max(1, bitrate * 2 / 8)
+        let limits: [Any] = [bytesPerSecond as NSNumber, 1.0 as NSNumber]
         set(kVTCompressionPropertyKey_DataRateLimits, limits as CFArray)
     }
 

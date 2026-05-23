@@ -9,21 +9,28 @@ final class InputReceiver {
     private let onKeyframeRequest: () -> Void
     private let onVideoProfileRequest: (Int, Int, Int, Int) -> Void
     private let onBitrateRequest: (Int) -> Void
+    private let onClientTimeout: () -> Void
     private let queue = DispatchQueue(label: "p2p.native.input", qos: .userInteractive)
+    private let timeoutQueue = DispatchQueue(label: "p2p.native.input.timeout")
     private var running = true
     private var downButtons = Set<Int>()
+    private var lastPacketTime: UInt64 = 0
+    private var clientConnected = false
+    private static let timeoutUs: UInt64 = 10_000_000
 
     init(
         port: UInt16,
         displayBounds: CGRect,
         onKeyframeRequest: @escaping () -> Void = {},
         onVideoProfileRequest: @escaping (Int, Int, Int, Int) -> Void = { _, _, _, _ in },
-        onBitrateRequest: @escaping (Int) -> Void = { _ in }
+        onBitrateRequest: @escaping (Int) -> Void = { _ in },
+        onClientTimeout: @escaping () -> Void = {}
     ) throws {
         self.displayBounds = displayBounds
         self.onKeyframeRequest = onKeyframeRequest
         self.onVideoProfileRequest = onVideoProfileRequest
         self.onBitrateRequest = onBitrateRequest
+        self.onClientTimeout = onClientTimeout
         fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { throw POSIXError(.ENOTSOCK) }
 
@@ -56,6 +63,26 @@ final class InputReceiver {
         queue.async { [weak self] in
             self?.loop()
         }
+        startTimeoutMonitor()
+    }
+
+    private func startTimeoutMonitor() {
+        timeoutQueue.async { [weak self] in
+            while true {
+                Thread.sleep(forTimeInterval: 2.0)
+                guard let self, self.running else { return }
+                let last = self.lastPacketTime
+                if last == 0 { continue }
+                let now = nowUs()
+                if now - last > Self.timeoutUs {
+                    if self.clientConnected {
+                        self.clientConnected = false
+                        logLine("[input] client timeout, no packets for \(Self.timeoutUs / 1_000_000)s")
+                        self.onClientTimeout()
+                    }
+                }
+            }
+        }
     }
 
     private func loop() {
@@ -63,6 +90,11 @@ final class InputReceiver {
         while running {
             let n = recv(fd, &buf, buf.count, 0)
             if n >= p2InputPacketBytes {
+                lastPacketTime = nowUs()
+                if !clientConnected {
+                    clientConnected = true
+                    logLine("[input] client connected (first packet received)")
+                }
                 handle(Array(buf[0..<n]))
             }
         }

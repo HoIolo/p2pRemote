@@ -2594,6 +2594,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       SetTimer(hwnd, 1, 500, nullptr);
       return 0;
     case WM_TIMER: {
+      SendInputPacket(P2_INPUT_HEARTBEAT, 0, 0, 0, 0, 0, 0);
       static uint64_t lastFrames = 0;
       static uint64_t lastComplete = 0;
       static uint64_t lastPackets = 0;
