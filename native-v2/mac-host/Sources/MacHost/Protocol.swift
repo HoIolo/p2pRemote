@@ -140,14 +140,11 @@ func readU32LE(_ bytes: [UInt8], _ offset: Int) -> UInt32 {
 }
 
 func readU64LE(_ bytes: [UInt8], _ offset: Int) -> UInt64 {
-    UInt64(bytes[offset]) |
-    (UInt64(bytes[offset + 1]) << 8) |
-    (UInt64(bytes[offset + 2]) << 16) |
-    (UInt64(bytes[offset + 3]) << 24) |
-    (UInt64(bytes[offset + 4]) << 32) |
-    (UInt64(bytes[offset + 5]) << 40) |
-    (UInt64(bytes[offset + 6]) << 48) |
-    (UInt64(bytes[offset + 7]) << 56)
+    var value: UInt64 = 0
+    for index in 0..<8 {
+        value |= UInt64(bytes[offset + index]) << (index * 8)
+    }
+    return value
 }
 
 func readI32LE(_ bytes: [UInt8], _ offset: Int) -> Int32 {
@@ -358,7 +355,7 @@ final class UdpVideoSender {
                                 message.msg_name = UnsafeMutableRawPointer(mutating: sa)
                                 message.msg_namelen = socklen_t(MemoryLayout<sockaddr_in>.size)
                                 message.msg_iov = iovPtr.baseAddress
-                                message.msg_iovlen = iovPtr.count
+                                message.msg_iovlen = numericCast(iovPtr.count)
                                 let rc = sendmsg(fd, &message, 0)
                                 if rc >= 0 {
                                     sentPackets += 1
