@@ -1024,13 +1024,13 @@ static std::string GstPipelineDescription(HWND hwnd) {
   desc += "udpsrc port=" + std::to_string(g_cfg.videoPort);
   desc += " buffer-size=8388608 ";
   desc += " caps=\"application/x-rtp,media=video,encoding-name=H264,payload=96,clock-rate=90000\" ";
-  desc += "! rtpjitterbuffer latency=30 faststart-min-packets=1 drop-on-latency=true do-lost=false mode=2 max-dropout-time=15 max-misorder-time=10 ";
+  desc += "! rtpjitterbuffer latency=16 faststart-min-packets=1 drop-on-latency=true do-lost=false mode=2 max-dropout-time=20 max-misorder-time=20 ";
   desc += "! rtph264depay request-keyframe=true wait-for-keyframe=true ";
   desc += "! h264parse config-interval=-1 disable-passthrough=true ";
-  desc += "! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=upstream ";
+  desc += "! queue max-size-buffers=1 max-size-time=0 max-size-bytes=0 leaky=downstream ";
   desc += "! d3d11h264dec discard-corrupted-frames=true automatic-request-sync-points=true qos=true ";
-  desc += "! queue max-size-buffers=2 max-size-time=0 max-size-bytes=0 leaky=upstream ";
-  desc += "! d3d11videosink name=videosink sync=true async=false qos=true max-lateness=15000000 force-aspect-ratio=false";
+  desc += "! queue max-size-buffers=1 max-size-time=0 max-size-bytes=0 leaky=downstream ";
+  desc += "! d3d11videosink name=videosink sync=false async=false qos=true max-lateness=8000000 force-aspect-ratio=false";
   return desc;
 }
 

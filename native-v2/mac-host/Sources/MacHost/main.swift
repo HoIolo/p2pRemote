@@ -29,6 +29,7 @@ final actor NativeHostRuntime {
     let encoder: H264LowLatencyEncoder
     let udpVideo: UdpVideoSender?
     let tcpVideo: TcpVideoServer?
+    let gstVideo: GStreamerVideoSender?
     let input: InputReceiver
     private var cfg: NativeHostConfig
     private var lastStatsLogUs: UInt64 = 0
@@ -41,6 +42,7 @@ final actor NativeHostRuntime {
         encoder: H264LowLatencyEncoder,
         udpVideo: UdpVideoSender?,
         tcpVideo: TcpVideoServer?,
+        gstVideo: GStreamerVideoSender?,
         input: InputReceiver
     ) {
         self.cfg = cfg
@@ -48,18 +50,32 @@ final actor NativeHostRuntime {
         self.encoder = encoder
         self.udpVideo = udpVideo
         self.tcpVideo = tcpVideo
+        self.gstVideo = gstVideo
         self.input = input
     }
 
     func requestKeyframe(reason: String) {
         logLine("[control] keyframe request: \(reason)")
-        encoder.requestKeyframe(reason: reason)
+        if let gstVideo {
+            gstVideo.requestKeyframe()
+        } else {
+            encoder.requestKeyframe(reason: reason)
+        }
     }
 
     func updateBitrate(_ bitrate: Int, reason: String) {
-        encoder.updateBitrate(bitrate, reason: reason)
-        udpVideo?.updateTargetBitrate(bitrate)
-        cfg.bitrate = bitrate
+        let clamped = max(2_000_000, min(200_000_000, bitrate))
+        if let gstVideo {
+            do {
+                try gstVideo.updateBitrate(clamped)
+            } catch {
+                logLine("[gst] bitrate update failed: \(error)")
+            }
+        } else {
+            encoder.updateBitrate(clamped, reason: reason)
+            udpVideo?.updateTargetBitrate(clamped)
+        }
+        cfg.bitrate = clamped
     }
 
     func handleClientStats(networkDropped: UInt64, clientDropped: UInt64, jitterMs: Int, latencyMs: Int, trouble: Bool) {
@@ -118,6 +134,15 @@ final actor NativeHostRuntime {
         let started = nowUs()
         logLine("[control] live profile reconfigure start: \(cfg.width)x\(cfg.height)@\(cfg.fps) -> \(nextCfg.width)x\(nextCfg.height)@\(nextCfg.fps) bitrate=\(nextCfg.bitrate)")
         do {
+            if let gstVideo {
+                try gstVideo.reconfigure(width: nextCfg.width, height: nextCfg.height, fps: nextCfg.fps, bitrateMbps: max(1, nextCfg.bitrate / 1_000_000))
+                cfg = nextCfg
+                requestKeyframe(reason: "profile changed")
+                let elapsedMs = Double(nowUs() - started) / 1000.0
+                logLine(String(format: "[control] gst profile reconfigure done: %dx%d@%d bitrate=%d elapsed=%.0f ms",
+                               nextCfg.width, nextCfg.height, nextCfg.fps, nextCfg.bitrate, elapsedMs))
+                return
+            }
             await capturer.stop()
             try encoder.reconfigure(
                 width: nextCfg.width,
@@ -141,6 +166,7 @@ final actor NativeHostRuntime {
     }
 
     func stopForExit() async {
+        gstVideo?.stop()
         await capturer.stop()
     }
 }
@@ -184,9 +210,13 @@ struct MacHostMain {
         logLine("client=\(cfg.clientIP):\(cfg.videoPort), input=0.0.0.0:\(cfg.inputPort), video=\(cfg.width)x\(cfg.height)@\(cfg.fps), bitrate=\(cfg.bitrate), transport=\(cfg.transport), captureMode=\(cfg.captureMode), hideHostCursor=\(cfg.hideHostCursor)")
 
         do {
+            let gstVideo: GStreamerVideoSender? = cfg.transport == "gst" ? GStreamerVideoSender(cfg: cfg) : nil
             let udpVideo = cfg.transport == "udp" ? try UdpVideoSender(clientIP: cfg.clientIP, port: cfg.videoPort, fps: cfg.fps, bitrate: cfg.bitrate) : nil
             let tcpVideo = cfg.transport == "tcp" ? try TcpVideoServer(port: cfg.videoPort) : nil
             tcpVideo?.start()
+            if let gstVideo {
+                try gstVideo.start()
+            }
             let encoder = try H264LowLatencyEncoder(
                 width: cfg.width,
                 height: cfg.height,
@@ -196,14 +226,17 @@ struct MacHostMain {
             ) { frame, keyframe, configIncluded, ptsUs in
                 if let udpVideo {
                     udpVideo.sendFrame(frame, keyframe: keyframe, configIncluded: configIncluded, ptsUs: ptsUs)
-                } else {
-                    tcpVideo?.sendFrame(frame, keyframe: keyframe, configIncluded: configIncluded, ptsUs: ptsUs)
+                } else if let tcpVideo {
+                    tcpVideo.sendFrame(frame, keyframe: keyframe, configIncluded: configIncluded, ptsUs: ptsUs)
                 }
             }
             let capturerRef = RefBox<ScreenCapturer?>(nil)
             let output = ScreenCaptureOutput(
                 encoder: encoder,
                 shouldEncodeFrame: {
+                    if gstVideo != nil {
+                        return false
+                    }
                     // UDP path is latency sensitive: do not feed VideoToolbox
                     // while a frame is already encoded or waiting to be sent.
                     // This prefers a fresh capture sample over completing stale
@@ -219,7 +252,7 @@ struct MacHostMain {
             )
             let capturer = ScreenCapturer(cfg: cfg, output: output)
             capturerRef.value = capturer
-            let displayBounds = try await capturer.start()
+            let displayBounds = gstVideo == nil ? try await capturer.start() : try await mainDisplayBounds()
 
             let input = try InputReceiver(
                 port: cfg.inputPort,
@@ -255,10 +288,11 @@ struct MacHostMain {
                 encoder: encoder,
                 udpVideo: udpVideo,
                 tcpVideo: tcpVideo,
+                gstVideo: gstVideo,
                 input: input
             )
             input.start()
-            logLine("[ready] native VideoToolbox sender and input receiver running")
+            logLine(gstVideo == nil ? "[ready] native VideoToolbox sender and input receiver running" : "[ready] GStreamer RTP sender and input receiver running")
             logLine("[ready] host streaming. Press Ctrl+C to stop.")
         } catch {
             fputs("[fatal] \(error)\n", stderr)

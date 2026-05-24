@@ -14,7 +14,7 @@ final class GStreamerVideoSender {
     }
 
     func start() throws {
-        let gstLaunch = resolveGstLaunch()
+        let gstLaunch = try resolveGstLaunch()
         let args = makeArgs()
         logLine("[gst] launching \(gstLaunch) \(args.joined(separator: " "))")
 
@@ -103,7 +103,7 @@ final class GStreamerVideoSender {
             "vtenc_h264_hw", "realtime=true", "allow-frame-reordering=false", "max-keyframe-interval=\(keyintFrames)", "bitrate=\(bitrateKbps)", "!",
             "h264parse", "config-interval=-1", "!",
             "rtph264pay", "pt=96", "mtu=1200", "config-interval=-1", "aggregate-mode=zero-latency", "!",
-            "udpsink", "host=\(cfg.clientIP)", "port=\(cfg.videoPort)", "sync=false", "async=false"
+            "udpsink", "host=\(cfg.clientIP)", "port=\(cfg.videoPort)", "sync=false", "async=false", "qos=true", "buffer-size=8388608"
         ]
     }
 
@@ -124,7 +124,7 @@ final class GStreamerVideoSender {
         return env
     }
 
-    private func resolveGstLaunch() -> String {
+    private func resolveGstLaunch() throws -> String {
         let candidates = [
             ProcessInfo.processInfo.environment["GST_LAUNCH_1_0"],
             "/opt/homebrew/bin/gst-launch-1.0",
@@ -135,6 +135,6 @@ final class GStreamerVideoSender {
         for candidate in candidates where access(candidate, X_OK) == 0 {
             return candidate
         }
-        return "gst-launch-1.0"
+        throw NSError(domain: "P2PNativeGStreamer", code: 1, userInfo: [NSLocalizedDescriptionKey: "gst-launch-1.0 not found. Install GStreamer on macOS before using --transport gst."])
     }
 }

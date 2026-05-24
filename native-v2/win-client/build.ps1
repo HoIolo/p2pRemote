@@ -20,3 +20,10 @@ if (!(Test-Path $outputExe)) {
 New-Item -ItemType Directory -Force -Path ..\dist\win-client | Out-Null
 Copy-Item $outputExe ..\dist\win-client\ -Force
 Write-Host "built: native-v2\dist\win-client\p2p-native-win-client.exe"
+$gstOutputExe = Join-Path $PSScriptRoot 'build\Release\p2p-native-win-client-gst.exe'
+if (Test-Path $gstOutputExe) {
+  Copy-Item $gstOutputExe ..\dist\win-client\ -Force
+  Write-Host "built: native-v2\dist\win-client\p2p-native-win-client-gst.exe"
+} else {
+  Write-Host "skipped: optional GStreamer client was not built (GStreamer dev files not found)"
+}

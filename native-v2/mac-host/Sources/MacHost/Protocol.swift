@@ -108,7 +108,7 @@ struct NativeHostConfig {
         if let v = popValue("--fps"), let n = Int(v) { cfg.fps = n }
         if let v = popValue("--bitrate"), let n = Int(v) { cfg.bitrate = n }
         if let v = popValue("--keyint"), let n = Int(v) { cfg.keyframeSeconds = n }
-        if let v = popValue("--transport") { cfg.transport = v.lowercased() == "tcp" ? "tcp" : "udp" }
+        if let v = popValue("--transport") { cfg.transport = v.lowercased() == "tcp" ? "tcp" : (v.lowercased() == "gst" ? "gst" : "udp") }
         if let v = popValue("--capture-mode") { cfg.captureMode = v.lowercased() == "fit" ? "fit" : "fill" }
         if args.contains("--show-host-cursor") { cfg.hideHostCursor = false }
         return cfg

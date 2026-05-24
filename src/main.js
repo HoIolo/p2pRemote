@@ -341,6 +341,16 @@ function nativeV2WinClientCandidates() {
   ];
 }
 
+function nativeV2WinGstClientCandidates() {
+  return [
+    path.join(process.resourcesPath || '', 'native-v2', 'win-client', 'p2p-native-win-client-gst.exe'),
+    path.join(__dirname, '..', 'native-v2', 'win-client', 'build', 'Release', 'p2p-native-win-client-gst.exe'),
+    path.join(__dirname, '..', 'native-v2', 'win-client', 'build', 'RelWithDebInfo', 'p2p-native-win-client-gst.exe'),
+    path.join(__dirname, '..', 'native-v2', 'win-client', 'build', 'Debug', 'p2p-native-win-client-gst.exe'),
+    path.join(__dirname, '..', 'native-v2', 'dist', 'win-client', 'p2p-native-win-client-gst.exe'),
+  ];
+}
+
 function nativeV2MacHostCandidates() {
   return [
     path.join(process.resourcesPath || '', 'native-v2', 'mac-host', 'P2PRemoteMacHost.app'),
@@ -1263,6 +1273,7 @@ function readNativeV2ClientProfile(profileFile = nativeV2ClientProfilePath()) {
       height: Number(parsed.height) || undefined,
       fps: Number(parsed.fps) || undefined,
       bitrate: Number(parsed.bitrate) || undefined,
+      transport: parsed.transport === 'gst' ? 'gst' : (parsed.transport === 'tcp' ? 'tcp' : (parsed.transport === 'udp' ? 'udp' : undefined)),
       profileVersion: Number(parsed.profileVersion) || 0,
     };
     if (!profile.profileVersion && profile.width && profile.height && Math.max(profile.width, profile.height) > 2560) {
@@ -1287,6 +1298,7 @@ function writeNativeV2ClientProfile(profileFile = nativeV2ClientProfilePath(), p
     height: Number(profile.height) || 1080,
     fps: Number(profile.fps) || 60,
     bitrate: Number(profile.bitrate) || 30_000_000,
+    transport: profile.transport === 'gst' ? 'gst' : (profile.transport === 'tcp' ? 'tcp' : 'udp'),
   };
   fs.mkdirSync(path.dirname(profileFile), { recursive: true });
   fs.writeFileSync(profileFile, JSON.stringify(payload, null, 2));
@@ -1299,6 +1311,7 @@ function nativeV2ClientProfileSignature(profile = {}) {
     height: Number(profile.height) || 0,
     fps: Number(profile.fps) || 0,
     bitrate: Number(profile.bitrate) || 0,
+    transport: profile.transport === 'gst' ? 'gst' : (profile.transport === 'tcp' ? 'tcp' : (profile.transport === 'udp' ? 'udp' : '')),
   });
 }
 
@@ -1322,7 +1335,7 @@ async function processNativeV2ClientProfileChange(profile) {
     height: normalizeNativeV2Number(profile.height, nativeV2ClientLastOptions?.height || 1080, 360, 4320),
     fps: normalizeNativeV2Number(profile.fps, nativeV2ClientLastOptions?.fps || 60, 30, 240),
     bitrate: normalizeNativeV2Number(profile.bitrate, nativeV2ClientLastOptions?.bitrate || 30_000_000, 1_000_000, 200_000_000),
-    transport: 'udp',
+    transport: profile.transport === 'gst' ? 'gst' : (nativeV2ClientLastOptions?.transport || 'udp'),
   };
   if (nativeV2ClientLastOptions) {
     nativeV2ClientLastOptions = {
@@ -1389,8 +1402,10 @@ function nativeV2StatusPayload() {
   return {
     platform: process.platform,
     winClient: {
-      available: Boolean(findFirstExistingPath(nativeV2WinClientCandidates())),
+      available: Boolean(findFirstExistingPath(nativeV2WinClientCandidates()) || findFirstExistingPath(nativeV2WinGstClientCandidates())),
       path: findFirstExistingPath(nativeV2WinClientCandidates()),
+      gstAvailable: Boolean(findFirstExistingPath(nativeV2WinGstClientCandidates())),
+      gstPath: findFirstExistingPath(nativeV2WinGstClientCandidates()),
       running: Boolean(nativeV2ClientProcess && !nativeV2ClientProcess.killed),
       pid: nativeV2ClientProcess?.pid || null,
     },
@@ -1408,7 +1423,7 @@ function nativeV2StatusPayload() {
       fps: Number(savedClientProfile.fps) || 60,
       bitrate: Number(savedClientProfile.bitrate) || 30_000_000,
       keyint: 1,
-      transport: 'udp',
+      transport: findFirstExistingPath(nativeV2WinGstClientCandidates()) ? 'gst' : 'udp',
     },
   };
 }
@@ -1429,7 +1444,7 @@ async function restartNativeV2RemoteHostForClientProfile(profile) {
     height: Number(profile.height) || saved.options.height,
     fps: Number(profile.fps) || saved.options.fps,
     bitrate: Number(profile.bitrate) || saved.options.bitrate,
-    transport: profile.transport === 'udp' ? 'udp' : (saved.options.transport === 'udp' ? 'udp' : 'tcp'),
+    transport: profile.transport === 'gst' ? 'gst' : (profile.transport === 'udp' ? 'udp' : (saved.options.transport === 'gst' ? 'gst' : (saved.options.transport === 'udp' ? 'udp' : 'tcp'))),
   };
   sendToMainWindow('host-log', {
     level: 'info',
@@ -1470,9 +1485,9 @@ function nativeV2HostReadyResult(options, exePath, args, pid) {
   const fps = normalizeNativeV2Number(options.fps, 60, 30, 240);
   const bitrate = normalizeNativeV2Number(options.bitrate, 30_000_000, 1_000_000, 200_000_000);
   const keyint = normalizeNativeV2Number(options.keyint, 1, 1, 300);
-  const requestedTransport = options.transport === 'tcp' ? 'tcp' : 'udp';
+  const requestedTransport = options.transport === 'tcp' ? 'tcp' : (options.transport === 'gst' ? 'gst' : 'udp');
   const allowUdpVideo = options.allowUdpVideo !== false && process.env.P2P_NATIVE_V2_DISABLE_UDP !== '1';
-  const transport = requestedTransport === 'udp' && allowUdpVideo ? 'udp' : 'tcp';
+  const transport = requestedTransport === 'gst' ? 'gst' : (requestedTransport === 'udp' && allowUdpVideo ? 'udp' : 'tcp');
   return {
     ok: true,
     pid,
@@ -1537,7 +1552,9 @@ function startNativeV2Client(options = {}) {
     stopNativeV2Process('client');
   }
 
-  const exePath = findFirstExistingPath(nativeV2WinClientCandidates());
+  const requestedTransport = options.transport === 'gst' ? 'gst' : 'udp';
+  const gstExePath = requestedTransport === 'gst' ? findFirstExistingPath(nativeV2WinGstClientCandidates()) : null;
+  const exePath = gstExePath || findFirstExistingPath(nativeV2WinClientCandidates());
   if (!exePath) {
     throw new Error('Native v2 Windows client is not built yet. Run npm run v2:win:build first, or use an installer that includes native-v2.');
   }
@@ -1548,9 +1565,9 @@ function startNativeV2Client(options = {}) {
   const height = normalizeNativeV2Number(options.height, 1080, 360, 4320);
   const fps = normalizeNativeV2Number(options.fps, 60, 30, 240);
   const bitrate = normalizeNativeV2Number(options.bitrate, 30_000_000, 0, 200_000_000);
-  const transport = 'udp';
+  const transport = gstExePath ? 'gst' : 'udp';
   const profileFile = String(options.profileFile || nativeV2ClientProfilePath());
-  writeNativeV2ClientProfile(profileFile, { width, height, fps, bitrate });
+  writeNativeV2ClientProfile(profileFile, { width, height, fps, bitrate, transport });
   const args = [
     '--host-ip', String(options.hostIp),
     '--host-name', String(options.hostName || 'Remote Device'),
@@ -1732,8 +1749,8 @@ async function startNativeV2Host(options = {}) {
   const fps = normalizeNativeV2Number(options.fps, 60, 30, 240);
   const bitrate = normalizeNativeV2Number(options.bitrate, 30_000_000, 1_000_000, 200_000_000);
   const keyint = normalizeNativeV2Number(options.keyint, 1, 1, 300);
-  const requestedTransport = options.transport === 'tcp' ? 'tcp' : 'udp';
-  const transport = requestedTransport === 'udp' && allowUdpVideo ? 'udp' : 'tcp';
+  const requestedTransport = options.transport === 'tcp' ? 'tcp' : (options.transport === 'gst' ? 'gst' : 'udp');
+  const transport = requestedTransport === 'gst' ? 'gst' : (requestedTransport === 'udp' && allowUdpVideo ? 'udp' : 'tcp');
   const captureMode = options.captureMode === 'fit' ? 'fit' : 'fill';
   const showHostCursor = options.showHostCursor === true;
   const args = [

@@ -9,6 +9,10 @@ VIDEO_PORT="${VIDEO_PORT:-45000}"
 INPUT_PORT="${INPUT_PORT:-45001}"
 TRANSPORT="${TRANSPORT:-udp}"
 CAPTURE_MODE="${CAPTURE_MODE:-fill}"
+if [[ "$TRANSPORT" != "udp" && "$TRANSPORT" != "tcp" && "$TRANSPORT" != "gst" ]]; then
+  echo "TRANSPORT must be udp, tcp, or gst" >&2
+  exit 2
+fi
 SHOW_HOST_CURSOR="${SHOW_HOST_CURSOR:-0}"
 
 EXTRA_ARGS=()

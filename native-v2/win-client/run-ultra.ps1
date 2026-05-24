@@ -8,14 +8,17 @@ param(
   [int]$Bitrate = 30000000,
   [int]$VideoPort = 45000,
   [int]$InputPort = 45001,
-  [ValidateSet('tcp','udp')][string]$Transport = 'udp',
+  [ValidateSet('tcp','udp','gst')][string]$Transport = 'udp',
   [switch]$NoFullscreen
 )
 $ErrorActionPreference = 'Stop'
 Set-Location $PSScriptRoot
-$exe = '.\build\Release\p2p-native-win-client.exe'
+$exe = if ($Transport -eq 'gst') { '.\build\Release\p2p-native-win-client-gst.exe' } else { '.\build\Release\p2p-native-win-client.exe' }
 if (!(Test-Path $exe)) {
   .\build.ps1
+}
+if ($Transport -eq 'gst' -and !(Test-Path $exe)) {
+  throw "GStreamer client was not built. Install GStreamer MSVC x86_64 development files and set GSTREAMER_1_0_ROOT_MSVC_X86_64, or use -Transport udp."
 }
 $args = @(
   '--host-ip', $HostIp,

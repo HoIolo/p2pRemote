@@ -564,7 +564,7 @@ function nativeV2ClientOptions(device) {
   const defaults = nativeV2Status?.defaults || {};
   const fps = nativeV2FpsOptions(device);
   const display = nativeV2DisplayOptions(device, fps);
-  const transport = defaults.transport || 'udp';
+  const transport = defaults.transport === 'gst' ? 'gst' : (defaults.transport || 'udp');
   return {
     hostIp: device.address,
     hostName: device.name,
@@ -587,7 +587,7 @@ function nativeV2HostOptions(device) {
   const clientIp = appInfo?.device?.addresses?.[0] || '';
   const fps = nativeV2FpsOptions(device);
   const display = nativeV2DisplayOptions(device, fps);
-  const transport = defaults.transport || 'udp';
+  const transport = defaults.transport === 'gst' ? 'gst' : (defaults.transport || 'udp');
   return {
     clientIp: nativeV2Status?.platform === 'win32' ? clientIp : device.address,
     videoPort: defaults.videoPort || 45000,
