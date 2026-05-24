@@ -334,7 +334,7 @@ final class InputReceiver {
 
     private func postText(codeUnit: UInt16, modifiers: UInt16) {
         guard codeUnit >= 0x20, codeUnit != 0x7f else { return }
-        var chars = [UniChar(codeUnit)]
+        let chars = [UniChar(codeUnit)]
         guard let down = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: true),
               let up = CGEvent(keyboardEventSource: eventSource, virtualKey: 0, keyDown: false) else { return }
         let eventFlags = flags(from: modifiers)
