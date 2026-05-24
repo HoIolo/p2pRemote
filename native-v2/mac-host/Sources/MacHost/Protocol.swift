@@ -11,6 +11,7 @@ let p2InputSetVideoProfile: UInt8 = 8
 let p2InputSetVideoBitrate: UInt8 = 9
 let p2InputText: UInt8 = 10
 let p2InputHeartbeat: UInt8 = 11
+let p2InputClientStats: UInt8 = 12
 let p2FlagKeyframe: UInt16 = 1 << 0
 let p2FlagConfig: UInt16 = 1 << 1
 let p2FlagFec: UInt16 = 1 << 2
@@ -132,6 +133,17 @@ func readU16LE(_ bytes: [UInt8], _ offset: Int) -> UInt16 {
 
 func readU32LE(_ bytes: [UInt8], _ offset: Int) -> UInt32 {
     UInt32(bytes[offset]) | (UInt32(bytes[offset + 1]) << 8) | (UInt32(bytes[offset + 2]) << 16) | (UInt32(bytes[offset + 3]) << 24)
+}
+
+func readU64LE(_ bytes: [UInt8], _ offset: Int) -> UInt64 {
+    UInt64(bytes[offset]) |
+    (UInt64(bytes[offset + 1]) << 8) |
+    (UInt64(bytes[offset + 2]) << 16) |
+    (UInt64(bytes[offset + 3]) << 24) |
+    (UInt64(bytes[offset + 4]) << 32) |
+    (UInt64(bytes[offset + 5]) << 40) |
+    (UInt64(bytes[offset + 6]) << 48) |
+    (UInt64(bytes[offset + 7]) << 56)
 }
 
 func readI32LE(_ bytes: [UInt8], _ offset: Int) -> Int32 {
@@ -302,7 +314,7 @@ final class UdpVideoSender {
         let ptsUs = item.ptsUs
 
         let fragCount = UInt16((frame.count + maxVideoFragmentPayload - 1) / maxVideoFragmentPayload)
-        let useFec = false
+        let useFec = fragCount > 1
         let totalFragCount = fragCount + (useFec ? 1 : 0)
         var parity = Data(repeating: 0, count: maxVideoFragmentPayload)
         var parityLen = 0

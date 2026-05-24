@@ -65,6 +65,8 @@ std::atomic<uint32_t> g_encodedQueueTargetNow{0};
 std::atomic<uint32_t> g_decodedQueueDepthNow{0};
 std::atomic<uint32_t> g_decodedQueueTargetNow{4};
 std::atomic<uint64_t> g_renderFramesDropped{0};
+std::atomic<uint64_t> g_fecRecoveredFrames{0};
+std::atomic<uint64_t> g_lastClientStatsQpc{0};
 std::atomic<uint64_t> g_lastProfileApplyQpc{0};
 uint64_t g_startedQpc = 0;
 std::wstring g_localIp = L"-";

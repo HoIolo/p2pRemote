@@ -24,6 +24,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       return 0;
     case WM_TIMER: {
       SendInputPacket(P2_INPUT_HEARTBEAT, 0, 0, 0, 0, 0, 0);
+      MaybeSendClientStats(false);
       static uint64_t lastFrames = 0;
       static uint64_t lastComplete = 0;
       static uint64_t lastPackets = 0;
@@ -77,6 +78,9 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       stats.decodedQueueDepth = g_decodedQueueDepthNow.load(std::memory_order_relaxed);
       stats.decodedQueueTarget = g_decodedQueueTargetNow.load(std::memory_order_relaxed);
       stats.renderDropped = g_renderFramesDropped.load(std::memory_order_relaxed);
+      stats.fecRecovered = g_fecRecoveredFrames.load(std::memory_order_relaxed);
+      stats.keyframeRequests = g_keyframeRequests.load(std::memory_order_relaxed);
+      stats.adaptiveBitrate = g_currentBitrate.load(std::memory_order_relaxed);
       const uint64_t clientDroppedDelta = clientDropped >= lastClientDropped ? (clientDropped - lastClientDropped) : clientDropped;
       const uint64_t networkDroppedDelta = networkDropped >= lastNetworkDropped ? (networkDropped - lastNetworkDropped) : networkDropped;
       // completeDelta is computed before rolling lastComplete forward, otherwise drop % is always wrong.

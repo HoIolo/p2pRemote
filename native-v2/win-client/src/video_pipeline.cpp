@@ -444,6 +444,7 @@ class VideoReceiver {
       const uint64_t now = QpcNow();
       g_packetsRx.fetch_add(1, std::memory_order_relaxed);
       g_bytesRx.fetch_add(static_cast<uint64_t>(n), std::memory_order_relaxed);
+      MaybeSendClientStats(false);
       g_lastPacketQpc.store(now, std::memory_order_relaxed);
       if (!reportedFirstPacket) {
         reportedFirstPacket = true;
@@ -525,6 +526,7 @@ class VideoReceiver {
         frameReady = true;
       } else if (newestFrameId > h->frameId + 1 || QpcDeltaUs(partial.firstQpc, now) > partialTtlUs()) {
         partials.erase(h->frameId);
+        MaybeRequestKeyframeRecovery(L"udp frame expired");
         RecordNetworkFrameDrop();
         continue;
       } else if (partial.hasFec) {
@@ -555,6 +557,7 @@ class VideoReceiver {
           memcpy(partial.bytes.data() + off, recovered.data(), recovered.size());
           partial.got[missingIndex] = 1;
           ++partial.dataReceived;
+          g_fecRecoveredFrames.fetch_add(1, std::memory_order_relaxed);
           frameReady = true;
         }
       }
@@ -569,6 +572,7 @@ class VideoReceiver {
         PushEncoded(std::move(out));
         g_framesComplete.fetch_add(1, std::memory_order_relaxed);
         g_lastCompleteQpc.store(QpcNow(), std::memory_order_relaxed);
+        MaybeSendClientStats(false);
         if (!reportedFirstCompleteFrame) {
           reportedFirstCompleteFrame = true;
           Log(L"UDP first complete frame id=%llu bytes=%u frags=%u dataFrags=%u keyframe=%d",
@@ -1536,17 +1540,5 @@ void EnterVideoRecovery(const wchar_t* reason) {
     }
   }
 
-  if (!g_cfg.udpVideo) return;
-  const uint64_t now = QpcNow();
-  const uint64_t last = g_lastKeyframeRequestQpc.load(std::memory_order_relaxed);
-  if (last && QpcDeltaUs(last, now) < 120'000) return;
-  g_lastKeyframeRequestQpc.store(now, std::memory_order_relaxed);
-  g_keyframeRequests.fetch_add(1, std::memory_order_relaxed);
-  bool sent = false;
-  for (int i = 0; i < 3; ++i) {
-    sent = SendInputPacket(P2_INPUT_REQUEST_KEYFRAME, 0, 0, 0, 0, 0, 0) || sent;
-    if (i < 2) Sleep(5);
-  }
-  Log(L"requested keyframe recovery: %s", reason ? reason : L"unknown");
-  if (!sent) Log(L"keyframe request send failed: %s", reason ? reason : L"unknown");
+  MaybeRequestKeyframeRecovery(reason);
 }

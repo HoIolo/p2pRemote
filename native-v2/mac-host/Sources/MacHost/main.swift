@@ -31,6 +31,9 @@ final actor NativeHostRuntime {
     let tcpVideo: TcpVideoServer?
     let input: InputReceiver
     private var cfg: NativeHostConfig
+    private var lastStatsLogUs: UInt64 = 0
+    private var lastAdaptiveChangeUs: UInt64 = 0
+    private var stableStatsCount: UInt32 = 0
 
     init(
         cfg: NativeHostConfig,
@@ -57,6 +60,39 @@ final actor NativeHostRuntime {
         encoder.updateBitrate(bitrate, reason: reason)
         udpVideo?.updateTargetBitrate(bitrate)
         cfg.bitrate = bitrate
+    }
+
+    func handleClientStats(networkDropped: UInt64, clientDropped: UInt64, jitterMs: Int, latencyMs: Int, trouble: Bool) {
+        let now = nowUs()
+        let fps = max(30, cfg.fps)
+        let frameMs = max(1, 1000 / fps)
+        let overloaded = trouble || jitterMs > frameMs || latencyMs > frameMs * 4
+        if now - lastStatsLogUs >= 1_000_000 {
+            logLine("[feedback] drops net=\(networkDropped) client=\(clientDropped) jitter=\(jitterMs)ms latency=\(latencyMs)ms trouble=\(trouble) bitrate=\(cfg.bitrate)")
+            lastStatsLogUs = now
+        }
+        if overloaded {
+            stableStatsCount = 0
+            if now - lastAdaptiveChangeUs >= 1_500_000 {
+                let next = max(8_000_000, cfg.bitrate * 85 / 100)
+                if next < cfg.bitrate {
+                    updateBitrate(next, reason: "client feedback congestion")
+                    lastAdaptiveChangeUs = now
+                }
+            }
+        } else if jitterMs <= max(2, frameMs / 2) && latencyMs <= frameMs * 3 {
+            stableStatsCount &+= 1
+            if stableStatsCount >= 12 && now - lastAdaptiveChangeUs >= 4_000_000 {
+                let next = min(80_000_000, cfg.bitrate * 105 / 100)
+                if next > cfg.bitrate {
+                    updateBitrate(next, reason: "client feedback stable")
+                    lastAdaptiveChangeUs = now
+                }
+                stableStatsCount = 0
+            }
+        } else {
+            stableStatsCount = 0
+        }
     }
 
     func reconfigureVideo(width: Int, height: Int, fps: Int, bitrateMbps: Int) async {
@@ -197,6 +233,11 @@ struct MacHostMain {
                 onBitrateRequest: { bitrate in
                     Task {
                         await gRuntime?.updateBitrate(bitrate, reason: "windows adaptive control")
+                    }
+                },
+                onClientStats: { networkDropped, clientDropped, jitterMs, latencyMs, trouble in
+                    Task {
+                        await gRuntime?.handleClientStats(networkDropped: networkDropped, clientDropped: clientDropped, jitterMs: jitterMs, latencyMs: latencyMs, trouble: trouble)
                     }
                 },
                 onClientTimeout: {

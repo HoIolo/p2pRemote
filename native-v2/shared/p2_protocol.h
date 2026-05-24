@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 #include <cstdint>
 
 #pragma pack(push, 1)
@@ -65,4 +65,5 @@ enum P2InputKind : uint8_t {
   P2_INPUT_SET_VIDEO_BITRATE = 9,
   P2_INPUT_TEXT = 10,
   P2_INPUT_HEARTBEAT = 11,
+  P2_INPUT_CLIENT_STATS = 12,
 };

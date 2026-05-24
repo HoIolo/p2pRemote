@@ -10,6 +10,7 @@ final class InputReceiver {
     private let onKeyframeRequest: () -> Void
     private let onVideoProfileRequest: (Int, Int, Int, Int) -> Void
     private let onBitrateRequest: (Int) -> Void
+    private let onClientStats: (UInt64, UInt64, Int, Int, Bool) -> Void
     private let onClientTimeout: () -> Void
     private let queue = DispatchQueue(label: "p2p.native.input", qos: .userInteractive)
     private let timeoutQueue = DispatchQueue(label: "p2p.native.input.timeout")
@@ -26,6 +27,7 @@ final class InputReceiver {
         onKeyframeRequest: @escaping () -> Void = {},
         onVideoProfileRequest: @escaping (Int, Int, Int, Int) -> Void = { _, _, _, _ in },
         onBitrateRequest: @escaping (Int) -> Void = { _ in },
+        onClientStats: @escaping (UInt64, UInt64, Int, Int, Bool) -> Void = { _, _, _, _, _ in },
         onClientTimeout: @escaping () -> Void = {}
     ) throws {
         self.displayBounds = displayBounds
@@ -33,6 +35,7 @@ final class InputReceiver {
         self.onKeyframeRequest = onKeyframeRequest
         self.onVideoProfileRequest = onVideoProfileRequest
         self.onBitrateRequest = onBitrateRequest
+        self.onClientStats = onClientStats
         self.onClientTimeout = onClientTimeout
         fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)
         guard fd >= 0 else { throw POSIXError(.ENOTSOCK) }
@@ -179,7 +182,7 @@ final class InputReceiver {
             if kind == p2InputHeartbeat {
                 continue
             }
-            if kind == p2InputRequestKeyframe || kind == p2InputSetVideoProfile || kind == p2InputSetVideoBitrate {
+            if kind == p2InputRequestKeyframe || kind == p2InputSetVideoProfile || kind == p2InputSetVideoBitrate || kind == p2InputClientStats {
                 flushWheel()
                 flushMove()
                 handle(packet)
@@ -244,6 +247,14 @@ final class InputReceiver {
         case p2InputSetVideoBitrate:
             let bitrate = max(2_000_000, Int(dx))
             onBitrateRequest(bitrate)
+        case p2InputClientStats:
+            let networkDropped = UInt64(UInt32(bitPattern: dx))
+            let clientDropped = UInt64(UInt32(bitPattern: dy))
+            let jitterMs = Int(button)
+            let rawLatency = Int(readU16LE(bytes, 30))
+            let trouble = (rawLatency & 0x8000) != 0
+            let latencyMs = rawLatency & 0x7fff
+            onClientStats(networkDropped, clientDropped, jitterMs, latencyMs, trouble)
         default:
             return
         }

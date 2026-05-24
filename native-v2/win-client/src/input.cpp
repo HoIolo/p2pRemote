@@ -101,12 +101,56 @@ bool SendInputPacket(uint8_t kind, float x, float y, int32_t dx, int32_t dy, uin
   return rc == sizeof(p);
 }
 
+void MaybeSendClientStats(bool force) {
+  if (g_inputSock == INVALID_SOCKET || !g_cfg.udpVideo) return;
+  const uint64_t now = QpcNow();
+  const uint64_t last = g_lastClientStatsQpc.load(std::memory_order_relaxed);
+  if (!force && last && QpcDeltaUs(last, now) < 500'000) return;
+  g_lastClientStatsQpc.store(now, std::memory_order_relaxed);
+
+  const int fps = std::max(1, g_activeVideoFps.load(std::memory_order_relaxed));
+  const int jitterMs = static_cast<int>(std::min<uint64_t>(65'535, g_presentJitterUs.load(std::memory_order_relaxed) / 1000));
+  const uint64_t latencyUs = std::max(g_lastRxToPresentUs.load(std::memory_order_relaxed),
+                                      g_maxRxToPresentUs.load(std::memory_order_relaxed));
+  const int latencyMs = static_cast<int>(std::min<uint64_t>(65'535, latencyUs / 1000));
+  const int expectedFrameMs = std::max(1, 1000 / fps);
+  const int trouble = (g_encodedQueueDepthNow.load(std::memory_order_relaxed) > 1 ||
+                       g_decodedQueueDepthNow.load(std::memory_order_relaxed) > 1 ||
+                       jitterMs > expectedFrameMs ||
+                       latencyMs > expectedFrameMs * 4) ? 1 : 0;
+
+  SendInputPacket(P2_INPUT_CLIENT_STATS,
+                  0,
+                  0,
+                  static_cast<int32_t>(g_networkFramesDropped.load(std::memory_order_relaxed) & 0x7fffffff),
+                  static_cast<int32_t>(g_clientFramesDropped.load(std::memory_order_relaxed) & 0x7fffffff),
+                  static_cast<uint16_t>(std::clamp(jitterMs, 0, 65'535)),
+                  static_cast<uint16_t>(std::clamp(latencyMs | (trouble << 15), 0, 65'535)));
+}
+
+void MaybeRequestKeyframeRecovery(const wchar_t* reason) {
+  if (!g_cfg.udpVideo) return;
+  const uint64_t now = QpcNow();
+  const uint64_t last = g_lastKeyframeRequestQpc.load(std::memory_order_relaxed);
+  if (last && QpcDeltaUs(last, now) < 120'000) return;
+  g_lastKeyframeRequestQpc.store(now, std::memory_order_relaxed);
+  g_keyframeRequests.fetch_add(1, std::memory_order_relaxed);
+  bool sent = false;
+  for (int i = 0; i < 3; ++i) {
+    sent = SendInputPacket(P2_INPUT_REQUEST_KEYFRAME, 0, 0, 0, 0, 0, 0) || sent;
+    if (i < 2) Sleep(5);
+  }
+  Log(L"requested keyframe recovery: %s", reason ? reason : L"unknown");
+  if (!sent) Log(L"keyframe request send failed: %s", reason ? reason : L"unknown");
+  MaybeSendClientStats(true);
+}
+
 bool InitInputSocket() {
   g_inputSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (g_inputSock == INVALID_SOCKET) return false;
   u_long nonBlocking = 1;
   ioctlsocket(g_inputSock, FIONBIO, &nonBlocking);
-  int sndbuf = 64 * 1024;
+  int sndbuf = 256 * 1024;
   setsockopt(g_inputSock, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&sndbuf), sizeof(sndbuf));
   int tos = 0x10; // IPTOS_LOWDELAY
   setsockopt(g_inputSock, IPPROTO_IP, IP_TOS, reinterpret_cast<const char*>(&tos), sizeof(tos));

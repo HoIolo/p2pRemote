@@ -26,7 +26,7 @@ inline constexpr int kMaxVideoFragmentPayload = 1440 - kVideoHeaderBytes;
 inline constexpr size_t kMinEncodedQueueDepth = 1;
 inline constexpr size_t kMaxEncodedQueueDepth = 2;
 inline constexpr std::array<int, 5> kFpsPresets = {30, 45, 60, 90, 120};
-inline constexpr std::array<int, 5> kBitratePresetsMbps = {8, 12, 16, 24, 32};
+inline constexpr std::array<int, 5> kBitratePresetsMbps = {12, 20, 30, 50, 80};
 
 struct Config {
   std::wstring hostIp = L"127.0.0.1";
@@ -47,7 +47,7 @@ struct VideoProfile {
   int width = 1920;
   int height = 1080;
   int fps = 60;
-  int bitrate = 28'000'000;
+  int bitrate = 30'000'000;
 };
 
 struct ResolutionPreset {
@@ -122,6 +122,9 @@ struct NativeUiStats {
   uint32_t decodedQueueDepth = 0;
   uint32_t decodedQueueTarget = 0;
   uint64_t renderDropped = 0;
+  uint64_t fecRecovered = 0;
+  uint64_t keyframeRequests = 0;
+  int adaptiveBitrate = 0;
 };
 
 class D3DRenderer;
@@ -180,6 +183,8 @@ extern std::atomic<uint32_t> g_encodedQueueTargetNow;
 extern std::atomic<uint32_t> g_decodedQueueDepthNow;
 extern std::atomic<uint32_t> g_decodedQueueTargetNow;
 extern std::atomic<uint64_t> g_renderFramesDropped;
+extern std::atomic<uint64_t> g_fecRecoveredFrames;
+extern std::atomic<uint64_t> g_lastClientStatsQpc;
 extern std::atomic<uint64_t> g_lastProfileApplyQpc;
 extern uint64_t g_startedQpc;
 extern std::wstring g_localIp;
@@ -199,6 +204,8 @@ uint64_t QpcDeltaUs(uint64_t start, uint64_t end);
 void RecordClientFrameDrop(uint64_t count = 1);
 void RecordDecodedFrameDrop(uint64_t count = 1);
 void RecordNetworkFrameDrop(uint64_t count = 1);
+void MaybeSendClientStats(bool force);
+void MaybeRequestKeyframeRecovery(const wchar_t* reason);
 void Log(const wchar_t* fmt, ...);
 
 Config ParseArgs();

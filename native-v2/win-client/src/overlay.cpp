@@ -15,7 +15,7 @@ static constexpr int kToolbarHeight = 48;
 static constexpr int kMenuWidth = 360;
 static constexpr int kMenuHeight = 390;
 static constexpr int kStatsWidth = 430;
-static constexpr int kStatsHeight = 640;
+static constexpr int kStatsHeight = 708;
 static constexpr wchar_t kNativeClientVersion[] = L"native v2 0.1.0";
 
 static LRESULT CALLBACK OverlayWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp);
@@ -550,20 +550,22 @@ static void DrawStats(HDC hdc, RECT rc) {
   DrawStatsRow(hdc, 396, L"被控端系统:", PlatformLabel(g_cfg.hostPlatform));
 
   DrawStatsSeparator(hdc, 434);
-  DrawStatsRow(hdc, 448, L"当前发送码率:", FormatBitrate(g_currentBitrate.load(std::memory_order_relaxed)));
-  DrawStatsRow(hdc, 472, L"编码队列:", std::to_wstring(stats.queueDepth) + L" / " + std::to_wstring(stats.queueTarget) + L" 帧");
-  DrawStatsRow(hdc, 496, L"显示队列:", std::to_wstring(stats.decodedQueueDepth) + L" / " + std::to_wstring(stats.decodedQueueTarget) + L" 帧");
-  DrawStatsRow(hdc, 520, L"显示丢旧帧:", std::to_wstring(stats.renderDropped));
-  DrawStatsRow(hdc, 544, L"编解码器:", L"H.264 / Media Foundation");
-  DrawStatsRow(hdc, 568, L"编码模式:", stats.gpuFrames > 0 ? L"硬编 / 硬解" : L"硬编 / 硬解优先");
-  DrawStatsRow(hdc, 592, L"采集方式:", g_cfg.hostPlatform == L"win32" ? L"DXGI" : L"ScreenCaptureKit");
+  DrawStatsRow(hdc, 448, L"当前发送码率:", FormatBitrate(stats.adaptiveBitrate > 0 ? stats.adaptiveBitrate : g_currentBitrate.load(std::memory_order_relaxed)));
+  DrawStatsRow(hdc, 472, L"FEC 恢复帧:", std::to_wstring(stats.fecRecovered));
+  DrawStatsRow(hdc, 496, L"关键帧请求:", std::to_wstring(stats.keyframeRequests));
+  DrawStatsRow(hdc, 520, L"编码队列:", std::to_wstring(stats.queueDepth) + L" / " + std::to_wstring(stats.queueTarget) + L" 帧");
+  DrawStatsRow(hdc, 544, L"显示队列:", std::to_wstring(stats.decodedQueueDepth) + L" / " + std::to_wstring(stats.decodedQueueTarget) + L" 帧");
+  DrawStatsRow(hdc, 568, L"显示丢旧帧:", std::to_wstring(stats.renderDropped));
+  DrawStatsRow(hdc, 592, L"编解码器:", L"H.264 / Media Foundation");
+  DrawStatsRow(hdc, 616, L"编码模式:", stats.gpuFrames > 0 ? L"硬编 / 硬解" : L"硬编 / 硬解优先");
+  DrawStatsRow(hdc, 640, L"采集方式:", g_cfg.hostPlatform == L"win32" ? L"DXGI" : L"ScreenCaptureKit");
   wchar_t target[128];
   swprintf_s(target, L"%dx%d @ %d fps / %d Mbps",
              activeProfile.width,
              activeProfile.height,
              activeProfile.fps,
              std::max(1, (activeProfile.bitrate + 500'000) / 1'000'000));
-  DrawStatsRow(hdc, 616, L"目标档位:", target);
+  DrawStatsRow(hdc, 664, L"目标档位:", target);
 }
 
 static void HandleToolbarClick(int x, int y) {
