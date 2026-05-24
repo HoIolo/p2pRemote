@@ -1,5 +1,6 @@
 #include <windows.h>
 #include <windowsx.h>
+#include <imm.h>
 #include <shellapi.h>
 #include <mmsystem.h>
 #include <winsock2.h>
@@ -1112,6 +1113,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       DragAcceptFiles(hwnd, FALSE);
       SetFocus(hwnd);
       SetTimer(hwnd, 1, 500, nullptr);
+      ImmAssociateContext(hwnd, nullptr);
       return 0;
     case WM_TIMER: {
       static uint64_t lastFrames = 0;
@@ -1192,6 +1194,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       SendInputPacket(P2_INPUT_WHEEL, x, y, 0, -GET_WHEEL_DELTA_WPARAM(wp), 0, 0);
       return 0;
     }
+    case WM_SETFOCUS:
+      ImmAssociateContext(hwnd, nullptr);
+      return 0;
+
     case WM_KEYDOWN: case WM_SYSKEYDOWN: {
       if (wp == VK_F11) {
         ToggleNativeFullscreen();
@@ -1201,23 +1207,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HideNativePopups();
         return 0;
       }
-      if (!IsModifierVirtualKey(wp) && !HasNonTextModifierDown() && IsTextVirtualKey(wp)) return 0;
+
       uint16_t mac = WinToMacKey(wp, lp);
       if (mac != 0xffff) SendInputPacket(P2_INPUT_KEY_DOWN, 0, 0, 0, 0, 0, mac);
       return 0;
     }
     case WM_KEYUP: case WM_SYSKEYUP: {
-      if (!IsModifierVirtualKey(wp) && !HasNonTextModifierDown() && IsTextVirtualKey(wp)) return 0;
+
       uint16_t mac = WinToMacKey(wp, lp);
       if (mac != 0xffff) SendInputPacket(P2_INPUT_KEY_UP, 0, 0, 0, 0, 0, mac);
       return 0;
     }
-    case WM_CHAR: {
-      if (wp >= 0x20 && wp != 0x7f) {
-        SendInputPacket(P2_INPUT_TEXT, 0, 0, 0, 0, MacModifierMaskForCurrentWinKeys(), static_cast<uint16_t>(wp & 0xffff));
-      }
+    case WM_CHAR:
+    case WM_IME_CHAR:
+    case WM_IME_COMPOSITION:
       return 0;
-    }
     case WM_PAINT: {
       PAINTSTRUCT ps;
       HDC hdc = BeginPaint(hwnd, &ps);

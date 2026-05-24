@@ -1734,6 +1734,8 @@ async function startNativeV2Host(options = {}) {
   const keyint = normalizeNativeV2Number(options.keyint, 1, 1, 300);
   const requestedTransport = options.transport === 'tcp' ? 'tcp' : 'udp';
   const transport = requestedTransport === 'udp' && allowUdpVideo ? 'udp' : 'tcp';
+  const captureMode = options.captureMode === 'fit' ? 'fit' : 'fill';
+  const showHostCursor = options.showHostCursor === true;
   const args = [
     '--client-ip', String(options.clientIp),
     '--video-port', String(videoPort),
@@ -1744,7 +1746,9 @@ async function startNativeV2Host(options = {}) {
     '--bitrate', String(bitrate),
     '--keyint', String(keyint),
     '--transport', transport,
+    '--capture-mode', captureMode,
   ];
+  if (showHostCursor) args.push('--show-host-cursor');
 
   // Spawn the binary directly from the .app bundle path.
   // Screen recording permission is inherited from the parent Electron process.

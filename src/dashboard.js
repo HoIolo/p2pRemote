@@ -483,12 +483,18 @@ function localDisplayPixelSize() {
 
 function nativeV2FpsOptions(device) {
   const defaults = nativeV2Status?.defaults || {};
-  const displayFps = Number(device?.display?.displayFrequency || device?.displayFrequency || 0);
+  const displayFps = Number(
+    appInfo?.device?.display?.displayFrequency ||
+    appInfo?.device?.displayFrequency ||
+    device?.display?.displayFrequency ||
+    device?.displayFrequency ||
+    0
+  );
   const fps = displayFps >= 30 ? displayFps : (defaults.fps || 60);
-  return Math.max(30, Math.min(60, Math.round(fps)));
+  return Math.max(30, Math.min(120, Math.round(fps)));
 }
 
-function nativeV2DisplayOptions(device) {
+function nativeV2DisplayOptions(device, fps = nativeV2FpsOptions(device)) {
   const defaults = nativeV2Status?.defaults || {};
   const displayPixels = localDisplayPixelSize() || remoteDisplayPixelSize(device);
   if (!displayPixels?.width || !displayPixels?.height) {
@@ -505,7 +511,9 @@ function nativeV2DisplayOptions(device) {
   const sourceHeight = clampEven(displayPixels.height, defaults.height || 1080);
   const scaled = scaleResolution(sourceWidth, sourceHeight, 2560);
   const pixels = scaled.width * scaled.height;
-  const bitrate = autoBitrateForPixels(pixels, defaults.bitrate || 30_000_000);
+  const baseBitrate = autoBitrateForPixels(pixels, defaults.bitrate || 30_000_000);
+  const fpsScale = Math.max(1, Math.min(2, fps / 60));
+  const bitrate = Math.min(80_000_000, Math.round(baseBitrate * fpsScale));
 
   return {
     width: scaled.width,
@@ -513,6 +521,7 @@ function nativeV2DisplayOptions(device) {
     bitrate,
   };
 }
+
 
 function gameStreamFpsOptions(device) {
   const defaults = gameStreamStatus?.defaults || {};
@@ -553,7 +562,8 @@ function gameStreamRemoteHostOptions(device = selectedDevice()) {
 
 function nativeV2ClientOptions(device) {
   const defaults = nativeV2Status?.defaults || {};
-  const display = nativeV2DisplayOptions(device);
+  const fps = nativeV2FpsOptions(device);
+  const display = nativeV2DisplayOptions(device, fps);
   const transport = defaults.transport || 'udp';
   return {
     hostIp: device.address,
@@ -563,17 +573,20 @@ function nativeV2ClientOptions(device) {
     inputPort: defaults.inputPort || 45001,
     width: display.width,
     height: display.height,
-    fps: nativeV2FpsOptions(device),
+    fps,
     bitrate: display.bitrate,
     fullscreen: true,
     transport,
+    captureMode: 'fill',
+    showHostCursor: false,
   };
 }
 
 function nativeV2HostOptions(device) {
   const defaults = nativeV2Status?.defaults || {};
   const clientIp = appInfo?.device?.addresses?.[0] || '';
-  const display = nativeV2DisplayOptions(device);
+  const fps = nativeV2FpsOptions(device);
+  const display = nativeV2DisplayOptions(device, fps);
   const transport = defaults.transport || 'udp';
   return {
     clientIp: nativeV2Status?.platform === 'win32' ? clientIp : device.address,
@@ -581,20 +594,23 @@ function nativeV2HostOptions(device) {
     inputPort: defaults.inputPort || 45001,
     width: display.width,
     height: display.height,
-    fps: nativeV2FpsOptions(device),
+    fps,
     bitrate: display.bitrate,
     keyint: defaults.keyint || 1,
     transport,
+    captureMode: 'fill',
+    showHostCursor: false,
   };
 }
 
 function nativeV2MacHostCommand(device, routeAddress = '') {
   const defaults = nativeV2Status?.defaults || {};
   const clientIp = routeAddress || appInfo?.device?.addresses?.[0] || '<Windows_IP>';
-  const display = nativeV2DisplayOptions(device);
+  const fps = nativeV2FpsOptions(device);
+  const display = nativeV2DisplayOptions(device, fps);
   return [
     'cd native-v2/mac-host',
-    `CLIENT_IP=${clientIp} VIDEO_PORT=${defaults.videoPort || 45000} INPUT_PORT=${defaults.inputPort || 45001} WIDTH=${display.width} HEIGHT=${display.height} FPS=${nativeV2FpsOptions(device)} BITRATE=${display.bitrate} TRANSPORT=${defaults.transport || 'udp'} ./run-ultra.sh`,
+    `CLIENT_IP=${clientIp} VIDEO_PORT=${defaults.videoPort || 45000} INPUT_PORT=${defaults.inputPort || 45001} WIDTH=${display.width} HEIGHT=${display.height} FPS=${fps} BITRATE=${display.bitrate} TRANSPORT=${defaults.transport || 'udp'} CAPTURE_MODE=fill SHOW_HOST_CURSOR=0 ./run-ultra.sh`,
   ].join('\n');
 }
 

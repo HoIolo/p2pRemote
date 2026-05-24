@@ -5,6 +5,7 @@
 #include "renderer.h"
 
 #include <windowsx.h>
+#include <imm.h>
 
 #include <algorithm>
 
@@ -21,6 +22,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_CREATE:
       SetFocus(hwnd);
       SetTimer(hwnd, 1, 500, nullptr);
+      ImmAssociateContext(hwnd, nullptr);
       return 0;
     case WM_TIMER: {
       SendInputPacket(P2_INPUT_HEARTBEAT, 0, 0, 0, 0, 0, 0);
@@ -133,7 +135,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       }
       return 0;
     case WM_SETCURSOR:
-      if (LOWORD(lp) == HTCLIENT && g_framesPresented.load(std::memory_order_relaxed) > 0) {
+      if (LOWORD(lp) == HTCLIENT) {
+        // The Mac host cursor is excluded from capture.  Keep the Windows cursor
+        // visible locally so pointer motion feels immediate instead of waiting
+        // for capture + encode + network + decode feedback.
         SetCursor(LoadCursor(nullptr, IDC_ARROW));
         return TRUE;
       }
@@ -166,6 +171,10 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
       SendInputPacket(P2_INPUT_WHEEL, x, y, 0, -GET_WHEEL_DELTA_WPARAM(wp), 0, 0);
       return 0;
     }
+    case WM_SETFOCUS:
+      ImmAssociateContext(hwnd, nullptr);
+      return 0;
+
     case WM_KEYDOWN: case WM_SYSKEYDOWN: {
       if (wp == VK_F11) {
         ToggleNativeFullscreen();
@@ -175,23 +184,25 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         HideNativePopups();
         return 0;
       }
-      if (!IsModifierVirtualKey(wp) && !HasNonTextModifierDown() && IsTextVirtualKey(wp)) return 0;
+
       uint16_t mac = VkToMacKeyCode(wp, lp);
       if (mac != 0xffff) SendInputPacket(P2_INPUT_KEY_DOWN, 0, 0, 0, 0, 0, mac);
       return 0;
     }
     case WM_KEYUP: case WM_SYSKEYUP: {
-      if (!IsModifierVirtualKey(wp) && !HasNonTextModifierDown() && IsTextVirtualKey(wp)) return 0;
+
       uint16_t mac = VkToMacKeyCode(wp, lp);
       if (mac != 0xffff) SendInputPacket(P2_INPUT_KEY_UP, 0, 0, 0, 0, 0, mac);
       return 0;
     }
-    case WM_CHAR: {
-      if (wp >= 0x20 && wp != 0x7f) {
-        SendInputPacket(P2_INPUT_TEXT, 0, 0, 0, 0, MacModifierMaskForCurrentWinKeys(), static_cast<uint16_t>(wp & 0xffff));
-      }
+    case WM_CHAR:
+    case WM_IME_CHAR:
+    case WM_IME_COMPOSITION:
+      // Desktop remoting must let the Mac own IME composition.  Do not inject
+      // Windows-composed Unicode text here; physical key down/up events above
+      // are forwarded so the focused macOS input method opens its own candidate
+      // UI and composes remotely.
       return 0;
-    }
     case WM_PAINT: {
       PAINTSTRUCT ps{};
       HDC hdc = BeginPaint(hwnd, &ps);

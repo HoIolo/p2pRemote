@@ -10,6 +10,7 @@
 #include <mferror.h>
 #include <wmcodecdsp.h>
 #include <codecapi.h>
+#include <avrt.h>
 
 #include <algorithm>
 #include <array>
@@ -19,6 +20,25 @@
 #include <unordered_map>
 #include <utility>
 #include <vector>
+
+class MmcssThreadBoost {
+ public:
+  explicit MmcssThreadBoost(const wchar_t* taskName = L"Games") {
+    DWORD taskIndex = 0;
+    handle_ = AvSetMmThreadCharacteristicsW(taskName, &taskIndex);
+    if (handle_) AvSetMmThreadPriority(handle_, AVRT_PRIORITY_CRITICAL);
+  }
+
+  ~MmcssThreadBoost() {
+    if (handle_) AvRevertMmThreadCharacteristics(handle_);
+  }
+
+  MmcssThreadBoost(const MmcssThreadBoost&) = delete;
+  MmcssThreadBoost& operator=(const MmcssThreadBoost&) = delete;
+
+ private:
+  HANDLE handle_ = nullptr;
+};
 
 static const wchar_t* HrName(HRESULT hr) {
   switch (hr) {
@@ -376,11 +396,15 @@ class VideoReceiver {
   void operator()() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     SetThreadDescription(GetCurrentThread(), L"P2P UDP video receiver");
+    MmcssThreadBoost mmcss;
 
     SOCKET s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (s == INVALID_SOCKET) return;
-    int rcvbuf = 256 * 1024;
+    int rcvbuf = 8 * 1024 * 1024;
     setsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&rcvbuf), sizeof(rcvbuf));
+    int actualRcvbuf = rcvbuf;
+    int actualRcvbufLen = sizeof(actualRcvbuf);
+    getsockopt(s, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<char*>(&actualRcvbuf), &actualRcvbufLen);
     DWORD timeoutMs = 10;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeoutMs), sizeof(timeoutMs));
 
@@ -393,7 +417,7 @@ class VideoReceiver {
       MessageBoxW(nullptr, L"Failed to bind video UDP port", L"P2P Native", MB_ICONERROR);
       return;
     }
-    Log(L"UDP video receiver bound on 0.0.0.0:%u fragmentPayload=%d", port_, kMaxVideoFragmentPayload);
+    Log(L"UDP video receiver bound on 0.0.0.0:%u fragmentPayload=%d rcvbuf=%d partialTtlMin=30ms", port_, kMaxVideoFragmentPayload, actualRcvbuf);
 
     struct PartialFrame {
       uint32_t frameBytes = 0;
@@ -420,7 +444,7 @@ class VideoReceiver {
     bool reportedFirstCompleteFrame = false;
     auto partialTtlUs = []() -> uint64_t {
       const int fps = std::max(30, g_activeVideoFps.load(std::memory_order_relaxed));
-      return std::max<uint64_t>(16'000, 2'000'000ull / static_cast<uint64_t>(fps));
+      return std::max<uint64_t>(30'000, 2'000'000ull / static_cast<uint64_t>(fps));
     };
 
     while (g_running.load()) {
@@ -599,6 +623,7 @@ class TcpVideoReceiver {
   void operator()() {
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
     SetThreadDescription(GetCurrentThread(), L"P2P TCP video receiver");
+    MmcssThreadBoost mmcss;
 
     while (g_running.load()) {
       SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
@@ -1328,6 +1353,7 @@ class MfDecoder {
 void DecoderThread() {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   SetThreadDescription(GetCurrentThread(), L"P2P H264 decode");
+  MmcssThreadBoost mmcss(L"Playback");
   CoInitializeEx(nullptr, COINIT_MULTITHREADED);
   MFStartup(MF_VERSION, MFSTARTUP_LITE);
   auto sharedDeviceAvailableNow = [&]() -> bool {
@@ -1433,6 +1459,7 @@ void DecoderThread() {
 void RenderThread() {
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
   SetThreadDescription(GetCurrentThread(), L"P2P video present");
+  MmcssThreadBoost mmcss;
   uint32_t gpuPresentFailStreak = 0;
 
   while (g_running.load()) {

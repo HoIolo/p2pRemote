@@ -87,6 +87,8 @@ struct NativeHostConfig {
     var bitrate: Int = 30_000_000
     var keyframeSeconds: Int = 1
     var transport: String = "udp"
+    var captureMode: String = "fill"
+    var hideHostCursor: Bool = true
 
     static func parse() -> NativeHostConfig {
         var cfg = NativeHostConfig()
@@ -107,6 +109,8 @@ struct NativeHostConfig {
         if let v = popValue("--bitrate"), let n = Int(v) { cfg.bitrate = n }
         if let v = popValue("--keyint"), let n = Int(v) { cfg.keyframeSeconds = n }
         if let v = popValue("--transport") { cfg.transport = v.lowercased() == "tcp" ? "tcp" : "udp" }
+        if let v = popValue("--capture-mode") { cfg.captureMode = v.lowercased() == "fit" ? "fit" : "fill" }
+        if args.contains("--show-host-cursor") { cfg.hideHostCursor = false }
         return cfg
     }
 }

@@ -139,6 +139,10 @@ final actor NativeHostRuntime {
             logLine("[control] live profile reconfigure failed: \(error)")
         }
     }
+
+    func stopForExit() async {
+        await capturer.stop()
+    }
 }
 
 @available(macOS 13.0, *)
@@ -177,7 +181,7 @@ struct MacHostMain {
     private static func run() async {
         let cfg = NativeHostConfig.parse()
         logLine("P2P Native v2 Mac Host")
-        logLine("client=\(cfg.clientIP):\(cfg.videoPort), input=0.0.0.0:\(cfg.inputPort), video=\(cfg.width)x\(cfg.height)@\(cfg.fps), bitrate=\(cfg.bitrate), transport=\(cfg.transport)")
+        logLine("client=\(cfg.clientIP):\(cfg.videoPort), input=0.0.0.0:\(cfg.inputPort), video=\(cfg.width)x\(cfg.height)@\(cfg.fps), bitrate=\(cfg.bitrate), transport=\(cfg.transport), captureMode=\(cfg.captureMode), hideHostCursor=\(cfg.hideHostCursor)")
 
         do {
             let udpVideo = cfg.transport == "udp" ? try UdpVideoSender(clientIP: cfg.clientIP, port: cfg.videoPort, fps: cfg.fps, bitrate: cfg.bitrate) : nil

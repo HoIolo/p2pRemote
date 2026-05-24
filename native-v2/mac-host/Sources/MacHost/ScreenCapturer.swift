@@ -111,6 +111,7 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
     private var currentPixelFormat: OSType = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
     private var sawFirstFrame = false
     private var firstFrameContinuation: CheckedContinuation<Bool, Never>?
+    private var hostCursorHidden = false
 
     init(cfg: NativeHostConfig, output: ScreenCaptureOutput) {
         self.cfg = cfg
@@ -170,17 +171,50 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
             try? await stream.stopCapture()
             self.stream = nil
         }
+        if hostCursorHidden {
+            CGDisplayShowCursor(selectedDisplayId)
+            hostCursorHidden = false
+        }
+    }
+
+    private func captureSourceRect(for bounds: CGRect) -> CGRect {
+        guard cfg.captureMode == "fill", cfg.width > 0, cfg.height > 0, bounds.width > 0, bounds.height > 0 else {
+            return bounds
+        }
+        let targetAspect = CGFloat(cfg.width) / CGFloat(cfg.height)
+        let sourceAspect = bounds.width / bounds.height
+        if abs(Double(targetAspect - sourceAspect)) < 0.001 {
+            return bounds
+        }
+        if sourceAspect > targetAspect {
+            let width = bounds.height * targetAspect
+            return CGRect(x: (bounds.width - width) / 2.0,
+                          y: 0,
+                          width: width,
+                          height: bounds.height)
+        }
+        let height = bounds.width / targetAspect
+        return CGRect(x: 0,
+                      y: (bounds.height - height) / 2.0,
+                      width: bounds.width,
+                      height: height)
     }
 
     private func startStream(display: SCDisplay, mainId: CGDirectDisplayID, pixelFormat: OSType) async throws {
         if let oldStream = stream {
             try? await oldStream.stopCapture()
         }
+        if hostCursorHidden {
+            CGDisplayShowCursor(selectedDisplayId)
+            hostCursorHidden = false
+        }
         resetFirstFrameState()
         output.resetFirstFrameReport()
 
         let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
         let streamCfg = SCStreamConfiguration()
+        let sourceRect = captureSourceRect(for: selectedBounds)
+        streamCfg.sourceRect = sourceRect
         streamCfg.width = cfg.width
         streamCfg.height = cfg.height
         streamCfg.minimumFrameInterval = CMTime(value: 1, timescale: CMTimeScale(cfg.fps))
@@ -195,6 +229,10 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
         // streamers such as Parsec: video is for pixels, cursor feedback is
         // client-local.
         streamCfg.showsCursor = false
+        if cfg.hideHostCursor {
+            CGDisplayHideCursor(selectedDisplayId)
+            hostCursorHidden = true
+        }
         streamCfg.capturesAudio = false
         streamCfg.pixelFormat = pixelFormat
         streamCfg.colorSpaceName = CGColorSpace.sRGB
@@ -205,6 +243,7 @@ final class ScreenCapturer: NSObject, SCStreamDelegate {
         stream = newStream
         currentPixelFormat = pixelFormat
         logLine("[capture] selected display=\(display.displayID) main=\(mainId) bounds=\(Int(selectedBounds.width))x\(Int(selectedBounds.height)) stream=\(cfg.width)x\(cfg.height)@\(cfg.fps) pixelFormat=\(pixelFormatName(pixelFormat))")
+        logLine("[capture] sourceRect(local)=\(Int(sourceRect.origin.x)),\(Int(sourceRect.origin.y)) \(Int(sourceRect.width))x\(Int(sourceRect.height)) mode=\(cfg.captureMode) hideHostCursor=\(cfg.hideHostCursor)")
     }
 
     private func armFirstFrameWatchdog() {

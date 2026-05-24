@@ -37,4 +37,6 @@ target_link_libraries(p2p-native-win-client PRIVATE
   gdi32
   winmm
   dwmapi
+  imm32
+  avrt
 )

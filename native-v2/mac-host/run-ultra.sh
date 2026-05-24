@@ -8,6 +8,13 @@ BITRATE="${BITRATE:-30000000}"
 VIDEO_PORT="${VIDEO_PORT:-45000}"
 INPUT_PORT="${INPUT_PORT:-45001}"
 TRANSPORT="${TRANSPORT:-udp}"
+CAPTURE_MODE="${CAPTURE_MODE:-fill}"
+SHOW_HOST_CURSOR="${SHOW_HOST_CURSOR:-0}"
+
+EXTRA_ARGS=()
+if [[ "$SHOW_HOST_CURSOR" == "1" || "$SHOW_HOST_CURSOR" == "true" ]]; then
+  EXTRA_ARGS+=(--show-host-cursor)
+fi
 cd "$(dirname "$0")"
 
 APP_DIR="../dist/mac-host/P2PRemoteMacHost.app"
@@ -26,4 +33,6 @@ exec "$BIN" \
   --fps "$FPS" \
   --bitrate "$BITRATE" \
   --keyint 2 \
-  --transport "$TRANSPORT"
+  --transport "$TRANSPORT" \
+  --capture-mode "$CAPTURE_MODE" \
+  "${EXTRA_ARGS[@]}"
